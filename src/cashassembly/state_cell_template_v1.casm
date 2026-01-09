@@ -1,0 +1,134 @@
+// src/cashassembly/state_cell_template_v1.casm
+//
+// State Cell Template v1
+//
+// Exposes hooks:
+//   - readStateIn    (id 10)
+//   - assertStateOut (id 11)
+//   - runStateCell   (id 12)
+//
+// Contract using this template MUST define:
+//   - computeStateOut (id 0x14 / 20)
+//
+// Invariants enforced:
+//   - input[0] token category+capability MUST be NFT-with-capability (33 bytes)
+//   - input[0] capability byte MUST be 1 ("mutable")
+//   - output[0] token category+capability MUST equal input[0] category+capability
+//   - output[0] token commitment MUST equal computed state_out
+//
+// Stack conventions (required by runStateCell):
+//   - main stack at entry: [ unlockData... ]
+//   - altstack at entry:  [ ]
+//
+// After readStateIn (id 10):
+//   - main stack unchanged (unlockData preserved)
+//   - altstack = [ inCatCap33_normalized, state_in ]
+//     where:
+//       - inCatCap33_normalized = REVERSEBYTES(cat32) || 0x01
+//       - state_in is the 32-byte input token commitment
+//
+// computeStateOut (id 0x14) MUST:
+//   - consume whatever it needs from main (unlockData)
+//   - consume state_in from altstack (top)
+//   - leave exactly:
+//       main: [ state_out ]
+//       alt : [ inCatCap33_normalized ]
+//
+// assertStateOut (id 11) checks:
+//   - output[0] cat+cap (normalized) == inCatCap33_normalized
+//   - output[0] commitment == state_out
+//
+// ------------------------------------------------------------
+// readStateIn()  (id 10)
+// alt: [ inCatCap33 (as returned by OP_UTXOTOKENCATEGORY), state_in ]
+// ------------------------------------------------------------
+<
+  OP_0
+  OP_UTXOTOKENCATEGORY                 // [ ... inCatCap33 ]
+
+  OP_SIZE
+  <0x21>
+  OP_EQUALVERIFY                       // [ ... inCatCap33 ]
+
+  // Verify cap byte == 1, but KEEP the original 33-byte item.
+  OP_DUP                               // [ ... inCatCap33 inCatCap33 ]
+  <0x20>
+  OP_SPLIT                             // [ ... inCatCap33 cat32 capByte ]
+  OP_1
+  OP_EQUALVERIFY                       // [ ... inCatCap33 cat32 ]
+  OP_DROP                              // [ ... inCatCap33 ]
+
+  OP_TOALTSTACK                        // alt: [ inCatCap33 ]
+
+  OP_0
+  OP_UTXOTOKENCOMMITMENT               // [ ... commitment ]
+  OP_SIZE
+  <0x20>
+  OP_EQUALVERIFY                       // [ ... commitment32 ]
+  OP_TOALTSTACK                        // alt: [ inCatCap33, state_in ]
+>
+OP_10
+OP_DEFINE
+
+
+// ------------------------------------------------------------
+// assertStateOut(state_out)  (id 11)
+// compares full 33-byte cat+cap blobs
+// ------------------------------------------------------------
+<
+  OP_0
+  OP_OUTPUTTOKENCATEGORY               // [ state_out outCatCap33 ]
+
+  OP_SIZE
+  <0x21>
+  OP_EQUALVERIFY                       // [ state_out outCatCap33 ]
+
+  // Verify cap byte == 1, but KEEP the original 33-byte item.
+  OP_DUP                               // [ state_out outCatCap33 outCatCap33 ]
+  <0x20>
+  OP_SPLIT                             // [ state_out outCatCap33 outCat32 capByte ]
+  OP_1
+  OP_EQUALVERIFY                       // [ state_out outCatCap33 outCat32 ]
+  OP_DROP                              // [ state_out outCatCap33 ]
+
+  OP_FROMALTSTACK                      // [ state_out outCatCap33 inCatCap33 ]
+  OP_EQUALVERIFY                       // [ state_out ]
+
+  OP_0
+  OP_OUTPUTTOKENCOMMITMENT             // [ state_out outCommitment ]
+  OP_SWAP
+  OP_EQUALVERIFY                       // [ ]
+
+  OP_1
+>
+OP_11
+OP_DEFINE
+
+// ------------------------------------------------------------
+// runStateCell()  (id 12)
+//
+// calls:
+//   - readStateIn()        (id 10)
+//   - computeStateOut(...) (id 0x14)  -- provided by covenant
+//   - assertStateOut(...)  (id 11)
+//
+// strict:
+//   computeStateOut MUST leave exactly one item on main: [ state_out ]
+// ------------------------------------------------------------
+<
+  OP_10
+  OP_INVOKE
+
+  <0x14>
+  OP_INVOKE
+
+  // strict: computeStateOut must leave exactly one item (state_out)
+  OP_DEPTH
+  OP_1
+  OP_NUMEQUALVERIFY
+
+  OP_11
+  OP_INVOKE
+>
+OP_12
+OP_DEFINE

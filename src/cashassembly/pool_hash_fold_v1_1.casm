@@ -1,0 +1,164 @@
+// src/cashassembly/pool_hash_fold_v1_1.casm
+//
+// Pool Hash Fold v1.1 (pool-only; concatenated with state_cell_template_v1.casm)
+//
+// Unlocking pushes (in this exact order):
+//   1) limbs...        (each limb is arbitrary bytes; MINIMALDATA in tests)
+//   2) noteHash32      (32 bytes)
+//   3) proofBlob32     (32 bytes) -- *only* length-checked and dropped here
+//
+// This file defines:
+//   - hashChunk       (id 2)
+//   - computeStateOut (id 0x14)
+// then runs:
+//   - template runStateCell (id 12)
+//
+// Stack contract entering computeStateOut (enforced by template):
+//   main: [ limbs... noteHash32 ]
+//   alt : [ inCatCap33_normalized, state_in ]
+//
+// where inCatCap33_normalized is:
+//   REVERSEBYTES(category32) || 0x01
+// matching the test helper computeHashFoldV11().
+//
+// computeStateOut must leave:
+//   main: [ state_out ]
+//   alt : [ inCatCap33_normalized ]
+//
+// ------------------------------------------------------------
+// hashChunk (id 2)
+//
+// acc' = HASH256(acc || item)
+// expects: main [ ... acc item ]
+// leaves:  main [ ... acc' ]
+// ------------------------------------------------------------
+<
+  OP_CAT
+  OP_HASH256
+>
+OP_2
+OP_DEFINE
+
+// ------------------------------------------------------------
+// computeStateOut (id 0x14)
+//
+// Implements the same transition as JS computeHashFoldV11():
+//
+//   inCatCap33 = REVERSEBYTES(category32) || 0x01
+//
+//   h0 = H(state_in || state_in)
+//   h1 = H(h0 || state_in)
+//   h2 = H(h1 || inCatCap33)
+//   h3 = H(h2 || noteHash32)
+//   then fold limbs LIFO:
+//     for each limb (from top-of-stack down):
+//       h = H(h || limb)
+//
+// where H = HASH256.
+//
+// Expects:
+//   main: [ limbs... noteHash32 ]
+//   alt : [ inCatCap33_normalized, state_in ]
+//
+// Leaves:
+//   main: [ state_out ]
+//   alt : [ inCatCap33_normalized ]
+// ------------------------------------------------------------
+<
+  // bound total fold items on main stack (limbs + noteHash)
+  // tests use <= 64 here
+  OP_DEPTH
+  <0x40>
+  OP_LESSTHANOREQUAL
+  OP_VERIFY
+
+  // noteHash32 must be 32 bytes (top item)
+  OP_SIZE
+  <0x20>
+  OP_EQUALVERIFY
+
+  // -------- pre-hash chain (matches computeHashFoldV11) --------
+
+  // pop state_in from alt (alt top is state_in)
+  OP_FROMALTSTACK                    // [ limbs... noteHash32 state_in ]
+
+  // h0 = H(state_in || state_in), preserving one copy of state_in
+  OP_DUP
+  OP_DUP
+  OP_CAT
+  OP_HASH256                         // [ limbs... noteHash32 state_in h0 ]
+
+  // h1 = H(h0 || state_in)
+  OP_SWAP                            // [ limbs... noteHash32 h0 state_in ]
+  OP_2
+  OP_INVOKE                          // [ limbs... noteHash32 h1 ]
+
+  // h2 = H(h1 || inCatCap33_normalized)
+  OP_FROMALTSTACK                    // [ limbs... noteHash32 h1 inCatCap33 ]
+  OP_DUP
+  OP_TOALTSTACK                      // restore inCatCap33 on alt for template (alt: [inCatCap33])
+  OP_2
+  OP_INVOKE                          // [ limbs... noteHash32 h2 ]
+
+  // h3 = H(h2 || noteHash32)
+  OP_SWAP                            // [ limbs... h2 noteHash32 ]
+  OP_2
+  OP_INVOKE                          // [ limbs... h3 ]
+
+  // seed accumulator on alt (alt: [inCatCap33, acc])
+  OP_TOALTSTACK
+
+  // -------- fold limbs (LIFO) --------
+  //
+  // While there are items on main (limbs), do:
+  //   acc = H(acc || limb)
+  //
+  OP_BEGIN
+    OP_DEPTH
+    OP_NOT
+    OP_DUP
+    OP_IF
+      // depth == 0 -> exit; leave 1 for OP_UNTIL termination
+    OP_ELSE
+      OP_DROP
+
+      // pop acc from alt
+      OP_FROMALTSTACK
+
+      // reorder: [ ... acc limb ]
+      OP_SWAP
+
+      // acc = HASH256(acc || limb)
+      OP_2
+      OP_INVOKE
+
+      // push new acc back to alt (alt: [inCatCap33, acc])
+      OP_TOALTSTACK
+
+      <0>
+    OP_ENDIF
+  OP_UNTIL
+
+  // final acc to main, leaving inCatCap33 on alt
+  OP_FROMALTSTACK
+>
+<0x14>
+OP_DEFINE
+
+// ------------------------------------------------------------
+// main program
+//
+// proofBlob32 is on top of the unlocking stack (after limbs and noteHash32).
+// We require it's 32 bytes, then drop it.
+// Then we invoke template runStateCell (id 12), which:
+//   - reads input token metadata into alt
+//   - calls computeStateOut (0x14) above
+//   - asserts output token invariants
+// ------------------------------------------------------------
+OP_SIZE
+<0x20>
+OP_EQUALVERIFY
+OP_DROP
+
+OP_12
+OP_INVOKE

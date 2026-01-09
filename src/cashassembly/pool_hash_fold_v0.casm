@@ -1,0 +1,53 @@
+// FhashChunk: acc' = HASH256(acc || limb)
+<
+  OP_CAT
+  OP_HASH256
+>
+OP_2
+OP_DEFINE
+
+// Unlocking must push:
+//   <limb0> <limb1> ... <limbN-1> <oldCommit> <expectedNewCommit>
+//
+// main at entry: limb0 ... limbN-1 oldCommit expectedNewCommit
+// alt at entry:  (empty)
+
+// Move expectedNewCommit and oldCommit to altstack.
+OP_TOALTSTACK        // alt: [expectedNewCommit]
+OP_TOALTSTACK        // alt: [expectedNewCommit, oldCommit]
+
+// Loop: while main has limbs, fold into acc.
+OP_BEGIN
+  OP_DEPTH
+  <0>
+  OP_NUMEQUAL        // cond = (depth == 0)
+  OP_DUP
+  OP_IF
+    // depth == 0 → exit (cond = 1)
+  OP_ELSE
+    OP_DROP          // drop 0
+
+    // alt: [..., expectedNewCommit, acc]
+    // main: ... limb_{k-1}
+    OP_FROMALTSTACK  // main: ... limb acc
+                     // alt:  [..., expectedNewCommit]
+    OP_SWAP          // main: ... acc limb
+
+    OP_2
+    OP_INVOKE        // main: ... acc' = H(acc || limb)
+
+    OP_TOALTSTACK    // alt: [..., expectedNewCommit, acc']
+                     // main: ... remaining limbs
+
+    <0>              // keep looping
+  OP_ENDIF
+OP_UNTIL
+
+// After loop:
+//   main: (empty)
+//   alt:  [expectedNewCommit, finalAcc]
+OP_FROMALTSTACK      // main: finalAcc
+OP_FROMALTSTACK      // main: finalAcc expectedNewCommit
+OP_SWAP              // main: expectedNewCommit finalAcc
+OP_EQUALVERIFY       // abort if mismatch
+OP_1

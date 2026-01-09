@@ -1,0 +1,14 @@
+{
+  "name": "bch-stealth-demo",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "yarn workspaces foreach -A -pt run build",
+    "clean": "yarn workspaces foreach -A -pt run clean",
+    "typecheck": "yarn workspaces foreach -A -pt run typecheck"
+  },
+  "packageManager": "yarn@4.12.0"
+}

@@ -1,0 +1,515 @@
+// Proof-Blob ABI v0 covenant verifier (PBv0)
+// Strict parsing, chunk-hashable folds, 3-pass implementation.
+//
+// Unlocking pushes (exact order):
+//   1) expected_coreHash  (32 bytes)
+//   2) proofBlobBytes     (bytes)
+//   3) expected_proofHash (32 bytes)
+//
+// Hash policy:
+//   HASH256(x)                 = OP_HASH256
+//   TaggedHash4(tag4, payload) = HASH256(tag4 || 0x00 || payload)
+//
+// ABI v0 wire format:
+//   magic        = "PBv0" (0x50427630)
+//   domain_tag4  = 4 bytes printable ASCII (0x20..0x7e)
+//   sectionCount = u8 (0..64)
+//   section      = type:u8 (1..4), len:u16le (<=8192), bytes[len]
+//
+// Chunk-hash rules:
+//   leaf      = HASH256(typeByte || lenU16le || sectionBytes)
+//   proofHash = fold( TaggedHash4("PBv0", domain4||sectionCountU8), leaf_i over ALL sections )
+//   coreHash  = fold( TaggedHash4(domain4, coreCountU8),            leaf_j over CORE sections only (type==1) )
+//
+// Loop policy:
+//   Uses CHIP-2021-05 OP_BEGIN ... OP_UNTIL (done-flag is consumed by OP_UNTIL).
+//   OP_UNTIL exits on nonzero, continues on 0.  [oai_citation:0‡loops.md](file-service://file-FKuTsdbtttY4fi7f39zGNy)
+//
+// Limits (spec-aligned):
+//   MAX_SECTIONS      = 64
+//   MAX_SECTION_BYTES = 8192  (lenNum < 8193)
+
+////////////////////////////////////////////////////////////////////////////////
+// 0) Prepare 3-pass parsing: park 2 extra blob copies on altstack
+////////////////////////////////////////////////////////////////////////////////
+//
+// Initial stack: [ expected_coreHash, proofBlob, expected_proofHash ]
+//
+OP_SWAP                           // [ expected_coreHash, expected_proofHash, proofBlob ]
+OP_DUP OP_DUP                     // [ expected_coreHash, expected_proofHash, blob1, blob2, blob3 ]
+OP_TOALTSTACK                     // alt: [ blob3 ]
+OP_TOALTSTACK                     // alt: [ blob3, blob2 ]
+// stack: [ expected_coreHash, expected_proofHash, blob1 ]
+
+////////////////////////////////////////////////////////////////////////////////
+// PASS 1: strict parse + verify proofHash (NO persistent altstack usage)
+// Leaves: [ expected_coreHash ]
+////////////////////////////////////////////////////////////////////////////////
+//
+// PASS1 loop invariant:
+//   [ expected_coreHash, expected_proofHash, proofAcc, remaining, rest ]
+// (rest is on top)
+//
+
+//////////////////////
+// PASS1 header parse
+//////////////////////
+
+// magic: "PBv0"
+OP_4 OP_SPLIT
+OP_SWAP OP_PUSHBYTES_4 0x50427630 OP_EQUALVERIFY      // [ ec, ep, rest1 ]
+
+// domain4 (keep) + validate on duplicate
+OP_4 OP_SPLIT                                          // [ ec, ep, domain4, rest2 ]
+OP_OVER                                                 // [ ec, ep, domain4, rest2, domain4copy ]
+
+// validate 4 printable ASCII bytes in domain4copy (repeat 4x)
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_SIZE OP_0 OP_NUMEQUALVERIFY
+OP_DROP                                                  // drop empty remainder of domain4copy
+
+// sectionCount byte -> remainingNum
+OP_1 OP_SPLIT                                             // [ ec, ep, domain4, countByte, rest3 ]
+OP_OVER OP_BIN2NUM                                        // [ ec, ep, domain4, countByte, rest3, remaining ]
+OP_DUP OP_PUSHBYTES_1 0x41 OP_LESSTHAN OP_VERIFY           // remaining < 65
+
+// Build proofAcc = TaggedHash4("PBv0", domain4||countByte)
+// Current: [ ec, ep, domain4, countByte, rest3, remaining ]
+OP_2SWAP                                                  // [ ec, ep, rest3, remaining, domain4, countByte ]
+OP_CAT                                                    // payload = domain4||countByte
+// stack: [ ec, ep, rest3, remaining, payload ]
+
+OP_PUSHBYTES_4 0x50427630                                  // tag = "PBv0"
+OP_PUSHBYTES_1 0x00
+OP_CAT                                                    // tag||0x00
+OP_SWAP OP_CAT                                            // (tag||0x00)||payload
+OP_HASH256                                                // proofAcc
+// stack: [ ec, ep, rest3, remaining, proofAcc ]
+
+// Reorder to PASS1 loop invariant: [ ec, ep, proofAcc, remaining, rest ]
+OP_SWAP                                                   // [ ec, ep, rest3, proofAcc, remaining ]
+OP_ROT                                                    // [ ec, ep, proofAcc, remaining, rest3 ]
+
+// If remaining == 0: require rest empty and proofAcc == expected_proofHash
+OP_OVER OP_0 OP_NUMEQUAL
+OP_IF
+  OP_SWAP OP_DROP                                         // drop remaining -> [ ec, ep, proofAcc, rest ]
+  OP_SIZE OP_0 OP_NUMEQUALVERIFY
+  OP_DROP                                                 // [ ec, ep, proofAcc ]
+  OP_EQUALVERIFY                                          // proofAcc == expected_proofHash, leaves [ ec ]
+OP_ELSE
+
+  //////////////////////
+  // PASS1 fold loop
+  //////////////////////
+  OP_BEGIN
+    // rest must have at least 3 bytes (type + len16)
+    OP_SIZE OP_3 OP_LESSTHAN OP_NOT OP_VERIFY
+
+    // typeByte | restA
+    OP_1 OP_SPLIT                                         // [ ec, ep, acc, remaining, typeByte, restA ]
+
+    // validate typeByte in [1..4]
+    OP_OVER OP_BIN2NUM
+    OP_DUP OP_1 OP_GREATERTHANOREQUAL OP_VERIFY
+    OP_DUP OP_4 OP_LESSTHANOREQUAL OP_VERIFY
+    OP_DROP                                               // back to [ ..., typeByte, restA ]
+
+    // lenBytes | restB   (split restA)
+    OP_2 OP_SPLIT                                         // [ ec, ep, acc, remaining, typeByte, lenBytes, restB ]
+
+    // lenNum, bounds: lenNum < 8193 (0x2001)
+    OP_OVER OP_BIN2NUM                                    // [ ..., typeByte, lenBytes, restB, lenNum ]
+    OP_DUP OP_PUSHBYTES_2 0x0120 OP_LESSTHAN OP_VERIFY     // lenNum < 0x2001
+
+    // guard: lenNum <= |restB|
+    //
+    // stack: ... typeByte lenBytes restB lenNum
+    OP_OVER OP_SIZE                 // ... typeByte lenBytes restB lenNum restB size
+    OP_ROT OP_SWAP                  // ... typeByte lenBytes restB restB lenNum size
+    OP_LESSTHANOREQUAL OP_VERIFY    // verifies lenNum <= size, consumes lenNum+size
+    OP_DROP                         // drop dup restB
+    // stack: ... typeByte lenBytes restB
+
+    // re-create lenNum for OP_SPLIT
+    OP_OVER OP_BIN2NUM                                    // [ ..., typeByte, lenBytes, restB, lenNum ]
+
+    // sectionBytes | restC
+    OP_SPLIT                                              // [ ec, ep, acc, remaining, typeByte, lenBytes, sectionBytes, restC ]
+
+    // leaf = HASH256(typeByte || lenBytes || sectionBytes)
+    // Use altstack to avoid stack drift (alt already has [blob3, blob2] below; we push/pop above it)
+    OP_TOALTSTACK                                         // alt: [..., restC ]
+    OP_CAT                                                // lenBytes||sectionBytes
+    OP_CAT                                                // typeByte||lenBytes||sectionBytes
+    OP_HASH256                                            // leaf
+    OP_FROMALTSTACK                                       // restC
+    // stack: [ ec, ep, acc, remaining, leaf, restC ]
+
+    // newAcc = HASH256(acc || leaf), preserving remaining and restC deterministically
+    OP_TOALTSTACK                                         // alt: [..., restC ]
+    OP_SWAP                                               // [ ec, ep, acc, leaf, remaining ]
+    OP_TOALTSTACK                                         // alt: [..., restC, remaining ]
+    // stack: [ ec, ep, acc, leaf ]
+    OP_CAT OP_HASH256                                     // [ ec, ep, newAcc ]
+    OP_FROMALTSTACK                                       // remaining
+    OP_FROMALTSTACK                                       // restC
+    // stack: [ ec, ep, newAcc, remaining, restC ]
+
+    // decrement remaining
+    OP_SWAP                                               // [ ec, ep, newAcc, restC, remaining ]
+    OP_1 OP_SUB                                           // remaining'
+    OP_SWAP                                               // [ ec, ep, newAcc, remaining', restC ]
+
+    // done flag: remaining' == 0
+    OP_OVER OP_0 OP_NUMEQUAL                              // [ ec, ep, newAcc, remaining', restC, done ]
+  OP_UNTIL
+
+  // finalize PASS1: [ ec, ep, proofAcc, 0, restFinal ] (done consumed)
+  OP_SWAP OP_DROP                                         // drop remaining(0) -> [ ec, ep, proofAcc, restFinal ]
+  OP_SIZE OP_0 OP_NUMEQUALVERIFY
+  OP_DROP                                                 // [ ec, ep, proofAcc ]
+  OP_EQUALVERIFY                                          // proofAcc == expected_proofHash, leaves [ ec ]
+OP_ENDIF
+
+////////////////////////////////////////////////////////////////////////////////
+// PASS 2: strict parse + count core sections (type==1)
+// Uses altstack only for coreCount (blob3 is parked below it)
+// Leaves: [ expected_coreHash ]
+////////////////////////////////////////////////////////////////////////////////
+
+// bring blob2 back
+OP_FROMALTSTACK                                         // [ ec, blob2 ]
+// alt: [ blob3 ]
+
+// magic: "PBv0"
+OP_4 OP_SPLIT
+OP_SWAP OP_PUSHBYTES_4 0x50427630 OP_EQUALVERIFY        // [ ec, rest1 ]
+
+// domain4 (validate on duplicate), then DROP it (pass2 doesn’t need it)
+OP_4 OP_SPLIT                                           // [ ec, domain4, rest2 ]
+OP_OVER                                                  // [ ec, domain4, rest2, domain4copy ]
+
+// validate 4 printable ASCII bytes in domain4copy (repeat 4x)
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_SIZE OP_0 OP_NUMEQUALVERIFY
+OP_DROP                                                  // drop empty remainder of domain4copy
+
+OP_SWAP OP_DROP                                          // drop domain4 -> [ ec, rest2 ]
+
+// sectionCount
+OP_1 OP_SPLIT                                            // [ ec, countByte, rest3 ]
+OP_OVER OP_BIN2NUM                                       // [ ec, countByte, rest3, remaining ]
+OP_DUP OP_PUSHBYTES_1 0x41 OP_LESSTHAN OP_VERIFY          // remaining < 65
+
+// drop countByte; keep [ ec, remaining, rest3 ]
+// starting stack: [ ec, countByte, rest3, remaining ]
+OP_ROT                                                   // [ ec, rest3, remaining, countByte ]
+OP_DROP                                                  // [ ec, rest3, remaining ]
+OP_SWAP                                                  // [ ec, remaining, rest3 ]
+
+// init coreCount = 0 on altstack (alt becomes [ blob3, coreCount ])
+OP_0 OP_TOALTSTACK
+
+// If remaining == 0: require rest empty and finish
+OP_OVER OP_0 OP_NUMEQUAL
+OP_IF
+  OP_SWAP OP_DROP                                        // drop remaining -> [ ec, rest3 ]
+  OP_SIZE OP_0 OP_NUMEQUALVERIFY
+  OP_DROP                                                // [ ec ]
+OP_ELSE
+  // PASS2 loop invariant:
+  //   stack: [ ec, remaining, rest ]
+  //   alt:   [ blob3, coreCount ]
+  OP_BEGIN
+    OP_SIZE OP_3 OP_LESSTHAN OP_NOT OP_VERIFY
+
+    // typeByte | restA
+    OP_1 OP_SPLIT                                        // [ ec, remaining, typeByte, restA ]
+
+    // validate typeByte in [1..4]
+    OP_OVER OP_BIN2NUM
+    OP_DUP OP_1 OP_GREATERTHANOREQUAL OP_VERIFY
+    OP_DUP OP_4 OP_LESSTHANOREQUAL OP_VERIFY
+    OP_DROP
+
+    // isCore = (typeByte == 0x01)  (IMPORTANT: use OP_1, not OP_PUSHBYTES_1 0x01)
+    OP_SWAP                                              // [ ec, remaining, restA, typeByte ]
+    OP_DUP OP_1 OP_EQUAL                                 // [ ec, remaining, restA, typeByte, isCore ]
+    OP_SWAP OP_DROP                                      // drop typeByte -> [ ec, remaining, restA, isCore ]
+
+    // lenBytes | restB
+    OP_SWAP                                              // [ ec, remaining, isCore, restA ]
+    OP_2 OP_SPLIT                                        // [ ec, remaining, isCore, lenBytes, restB ]
+
+    // lenNum bounds: lenNum < 8193
+    OP_OVER OP_BIN2NUM
+    OP_DUP OP_PUSHBYTES_2 0x0120 OP_LESSTHAN OP_VERIFY
+    OP_DROP                                              // drop lenNum after check
+
+    // guard: lenNum <= |restB|  (FIXED ROTATION)
+    OP_OVER OP_BIN2NUM                                   // [ ec, remaining, isCore, lenBytes, restB, lenNum ]
+    OP_OVER OP_SIZE                                      // [ ..., restB, lenNum, restB, size ]
+    OP_ROT OP_SWAP                                       // [ ..., restB, restB, lenNum, size ]
+    OP_LESSTHANOREQUAL OP_VERIFY                          // checks lenNum <= size
+    OP_DROP                                              // drop dup restB
+    // stack: [ ec, remaining, isCore, lenBytes, restB ]
+
+    // split sectionBytes | restC
+    OP_OVER OP_BIN2NUM                                   // lenNum again
+    OP_SPLIT                                             // [ ec, remaining, isCore, lenBytes, sectionBytes, restC ]
+
+    // drop lenBytes + sectionBytes
+    OP_SWAP OP_DROP                                      // drop sectionBytes -> [ ec, remaining, isCore, lenBytes, restC ]
+    OP_SWAP OP_DROP                                      // drop lenBytes    -> [ ec, remaining, isCore, restC ]
+
+    // update coreCount on altstack
+    OP_FROMALTSTACK                                      // [ ec, remaining, isCore, restC, coreCount ]
+    OP_SWAP                                              // [ ec, remaining, isCore, coreCount, restC ]
+    OP_ROT                                               // [ ec, remaining, coreCount, restC, isCore ]
+    OP_IF
+      // increment coreCount (not restC)
+      OP_SWAP
+      OP_1ADD
+      OP_SWAP
+    OP_ENDIF
+    // park coreCount back to altstack; keep restC on stack
+    OP_SWAP
+    OP_TOALTSTACK                                        // alt: [ blob3, coreCount' ]
+    // stack: [ ec, remaining, restC ]
+
+    // decrement remaining
+    OP_SWAP
+    OP_1 OP_SUB
+    OP_SWAP                                              // [ ec, remaining', restC ]
+
+    // done flag
+    OP_OVER OP_0 OP_NUMEQUAL                             // [ ec, remaining', restC, done ]
+  OP_UNTIL
+
+  // after loop: [ ec, 0, restFinal ]
+  OP_SWAP OP_DROP
+  OP_SIZE OP_0 OP_NUMEQUALVERIFY
+  OP_DROP                                                // [ ec ]
+OP_ENDIF
+
+// PASS 2 end:
+// stack: [ ec ]
+// alt:   [ blob3, coreCount ]   (coreCount on top)
+// stack: [ ec ]
+// alt:   [ blob3, coreCount ]   (coreCount on top)
+
+////////////////////////////////////////////////////////////////////////////////
+// PASS 3: strict parse + compute coreHash (fold only core sections, type==1)
+// Leaves clean stack with OP_1
+////////////////////////////////////////////////////////////////////////////////
+//
+// PASS3 loop invariant:
+//   [ expected_coreHash, coreAcc, remaining, rest ]
+// (rest is on top)
+//
+
+// bring coreCount and blob3 back
+OP_FROMALTSTACK                                         // [ ec, coreCount ]
+OP_FROMALTSTACK                                         // [ ec, coreCount, blob3 ]
+// alt: [ ]
+
+//////////////////////
+// PASS3 header parse
+//////////////////////
+
+// magic: "PBv0"
+OP_4 OP_SPLIT
+OP_SWAP OP_PUSHBYTES_4 0x50427630 OP_EQUALVERIFY        // [ ec, coreCount, rest1 ]
+
+// domain4 (keep) + validate on duplicate
+OP_4 OP_SPLIT                                           // [ ec, coreCount, domain4, rest2 ]
+OP_OVER                                                  // [ ..., domain4, rest2, domain4copy ]
+
+// validate 4 printable ASCII bytes in domain4copy (repeat 4x)
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_1 OP_SPLIT OP_SWAP OP_BIN2NUM
+OP_DUP OP_PUSHBYTES_1 0x20 OP_GREATERTHANOREQUAL OP_VERIFY
+OP_DUP OP_PUSHBYTES_1 0x7f OP_LESSTHAN OP_VERIFY
+OP_DROP
+OP_SIZE OP_0 OP_NUMEQUALVERIFY
+OP_DROP                                                  // drop empty remainder of domain4copy
+
+// sectionCount
+OP_1 OP_SPLIT                                            // [ ec, coreCount, domain4, countByte, rest3 ]
+OP_OVER OP_BIN2NUM                                       // [ ..., countByte, rest3, remaining ]
+OP_DUP OP_PUSHBYTES_1 0x41 OP_LESSTHAN OP_VERIFY          // remaining < 65
+
+// drop countByte; keep [ ec, coreCount, domain4, remaining, rest3 ]
+OP_SWAP
+OP_ROT
+OP_DROP
+
+// ---- seed coreAcc = TaggedHash4(domain4, coreCountU8) ----
+// TaggedHash4(domain4, coreCountU8) = HASH256(domain4 || 0x00 || coreCountU8)
+//
+// current stack before this block:
+//   [ ec, coreCount, domain4, remaining, rest3 ]    (rest3 on top)
+
+// Move domain4+coreCount into position above remaining/rest3
+OP_2SWAP                         // [ ec, remaining, rest3, coreCount, domain4 ]
+OP_SWAP                          // [ ec, remaining, rest3, domain4, coreCount ]
+OP_1 OP_NUM2BIN                  // [ ec, remaining, rest3, domain4, coreCountU8 ]
+
+// IMPORTANT: build domain4||0x00 first (not coreCountU8||0x00)
+OP_SWAP                          // [ ec, remaining, rest3, coreCountU8, domain4 ]
+OP_PUSHBYTES_1 0x00
+OP_CAT                           // [ ec, remaining, rest3, coreCountU8, domain4||0x00 ]
+OP_SWAP OP_CAT                   // [ ec, remaining, rest3, (domain4||0x00)||coreCountU8 ]
+OP_HASH256                       // [ ec, remaining, rest3, coreAcc ]
+
+// reorder to PASS3 loop invariant: [ ec, coreAcc, remaining, rest ]
+OP_SWAP
+OP_ROT
+OP_SWAP
+
+// If remaining == 0: require rest empty and coreAcc == expected_coreHash
+// At this point you already have the PASS3 invariant established:
+//   [ ec, coreAcc, remaining, rest ]
+// (rest is on top)
+
+OP_OVER OP_0 OP_NUMEQUAL
+OP_IF
+  // remaining == 0: require rest empty, verify coreAcc == ec, leave truthy
+  OP_SWAP OP_DROP                    // [ ec, coreAcc, rest ]
+  OP_SIZE OP_0 OP_NUMEQUALVERIFY
+  OP_DROP                            // [ ec, coreAcc ]
+  OP_EQUALVERIFY                     // consumes both, leaves []
+OP_ELSE
+  //////////////////////
+  // PASS3 fold loop
+  //////////////////////
+  OP_BEGIN
+    // invariant at top: [ ec, coreAcc, remaining, rest ]
+    OP_SIZE OP_3 OP_LESSTHAN OP_NOT OP_VERIFY
+
+    // typeByte | restA
+    OP_1 OP_SPLIT                    // [ ec, coreAcc, remaining, typeByte, restA ]
+
+    // validate typeByte in [1..4]
+    OP_OVER OP_BIN2NUM
+    OP_DUP OP_1 OP_GREATERTHANOREQUAL OP_VERIFY
+    OP_DUP OP_4 OP_LESSTHANOREQUAL OP_VERIFY
+    OP_DROP                          // [ ec, coreAcc, remaining, typeByte, restA ]
+
+    // isCore = (typeByte == 0x01), park it
+    OP_OVER OP_1 OP_EQUAL
+    OP_TOALTSTACK                    // alt: [ isCore ]
+    // stack: [ ec, coreAcc, remaining, typeByte, restA ]
+
+    // lenBytes | restB
+    OP_2 OP_SPLIT                    // [ ec, coreAcc, remaining, typeByte, lenBytes, restB ]
+
+    // lenNum bounds: lenNum < 8193 (0x2001)
+    OP_OVER OP_BIN2NUM
+    OP_DUP OP_PUSHBYTES_2 0x0120 OP_LESSTHAN OP_VERIFY
+    OP_DROP
+
+    // guard: lenNum <= |restB|  (same fixed rotation as PASS1/PASS2)
+    OP_OVER OP_BIN2NUM               // ... restB lenNum
+    OP_OVER OP_SIZE                  // ... restB lenNum restB size
+    OP_ROT OP_SWAP                   // ... restB restB lenNum size
+    OP_LESSTHANOREQUAL OP_VERIFY
+    OP_DROP                          // drop dup restB
+    // stack: [ ec, coreAcc, remaining, typeByte, lenBytes, restB ]
+
+    // sectionBytes | restC
+    OP_OVER OP_BIN2NUM
+    OP_SPLIT                         // [ ec, coreAcc, remaining, typeByte, lenBytes, sectionBytes, restC ]
+
+    // Park restC above isCore
+    OP_TOALTSTACK                    // alt: [ isCore, restC ]
+    // stack: [ ec, coreAcc, remaining, typeByte, lenBytes, sectionBytes ]
+
+    // leaf = HASH256(typeByte||lenBytes||sectionBytes)
+    OP_CAT
+    OP_CAT
+    OP_HASH256                       // [ ec, coreAcc, remaining, leaf ]
+
+    // restore restC and isCore
+    OP_FROMALTSTACK                  // restC   (alt: [ isCore ])
+    OP_FROMALTSTACK                  // isCore  (alt: [ ])
+    // stack: [ ec, coreAcc, remaining, leaf, restC, isCore ]
+
+    // conditional fold:
+    //  - if core: coreAcc = HASH256(coreAcc || leaf)
+    //  - else:    drop leaf
+    OP_IF
+      // stack entering IF (after isCore consumed): [ ec, coreAcc, remaining, leaf, restC ]
+      OP_TOALTSTACK                  // alt: [ restC ]
+      OP_SWAP                        // [ ec, coreAcc, leaf, remaining ]
+      OP_TOALTSTACK                  // alt: [ restC, remaining ]
+      OP_CAT OP_HASH256              // [ ec, newCoreAcc ]
+      OP_FROMALTSTACK                // remaining
+      OP_FROMALTSTACK                // restC
+      // stack: [ ec, newCoreAcc, remaining, restC ]
+    OP_ELSE
+      // stack entering ELSE (after isCore consumed): [ ec, coreAcc, remaining, leaf, restC ]
+      OP_SWAP OP_DROP                // drop leaf, keep restC
+      // stack: [ ec, coreAcc, remaining, restC ]
+    OP_ENDIF
+
+    // decrement remaining
+    OP_SWAP                          // [ ec, coreAcc, restC, remaining ]
+    OP_1 OP_SUB                      // remaining'
+    OP_SWAP                          // [ ec, coreAcc, remaining', restC ]
+
+    // done flag
+    OP_OVER OP_0 OP_NUMEQUAL         // [ ec, coreAcc, remaining', restC, done ]
+  OP_UNTIL
+
+  // finalizer: [ ec, coreAcc, 0, restFinal ]
+  OP_SWAP OP_DROP                    // drop remaining(0) -> [ ec, coreAcc, restFinal ]
+  OP_SIZE OP_0 OP_NUMEQUALVERIFY
+  OP_DROP                            // [ ec, coreAcc ]
+  OP_EQUALVERIFY                     // consumes both, leaves []
+OP_ENDIF
+
+// Success: clean truthy
+OP_1

@@ -1,0 +1,59 @@
+// FhashChunk: acc' = HASH256(acc || limb)
+<
+  OP_CAT
+  OP_HASH256
+>
+OP_2
+OP_DEFINE
+
+// Unlocking must push only:
+//   <limb0> <limb1> ... <limbN-1>
+//
+// main at entry: limb0 ... limbN-1
+// alt at entry:  (empty)
+
+// Step A: load oldCommit from this input's NFT commitment
+<0>
+OP_UTXOTOKENCOMMITMENT   // main: limb0 ... limbN-1 oldCommit
+OP_TOALTSTACK            // alt: [oldCommit = acc0]
+                         // main: limb0 ... limbN-1
+
+// Step B: fold all limbs into acc
+OP_BEGIN
+  OP_DEPTH
+  <0>
+  OP_NUMEQUAL            // cond = (depth == 0)
+  OP_DUP
+  OP_IF
+    // depth == 0 → exit
+  OP_ELSE
+    OP_DROP              // drop 0
+
+    // alt: [acc]
+    // main: ... limb_{k-1}
+    OP_FROMALTSTACK      // main: ... limb acc
+                         // alt:  (empty)
+    OP_SWAP              // main: ... acc limb
+
+    OP_2
+    OP_INVOKE            // main: ... acc' = HASH256(acc || limb)
+
+    OP_TOALTSTACK        // alt: [acc']
+                         // main: ... remaining limbs
+
+    <0>                  // keep looping
+  OP_ENDIF
+OP_UNTIL
+
+// After loop:
+//   main: (empty)
+//   alt:  [finalAcc]
+OP_FROMALTSTACK          // main: finalAcc
+
+// Step C: load newCommit from output 0's NFT commitment
+<0>
+OP_OUTPUTTOKENCOMMITMENT // main: finalAcc newCommit
+
+OP_SWAP                  // main: newCommit finalAcc
+OP_EQUALVERIFY           // abort if mismatch
+OP_1
