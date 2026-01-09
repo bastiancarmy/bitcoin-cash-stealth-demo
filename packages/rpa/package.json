@@ -1,0 +1,37 @@
+{
+  "name": "@bch/rpa",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./derive": {
+      "types": "./dist/derive.d.ts",
+      "default": "./dist/derive.js"
+    },
+    "./scan": {
+      "types": "./dist/scan.d.ts",
+      "default": "./dist/scan.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@bch/rpa-derive": "workspace:^",
+    "@bch/rpa-scan": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
