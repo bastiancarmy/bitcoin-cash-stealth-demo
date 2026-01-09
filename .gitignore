@@ -1,0 +1,39 @@
+# dependencies
+node_modules/
+
+# Yarn (Berry)
+.yarn/*
+!.yarn/patches/
+!.yarn/plugins/
+!.yarn/releases/
+!.yarn/sdks/
+!.yarn/versions/
+
+.pnp.*
+.yarnrc.yml
+
+# lockfiles (pick ONE philosophy)
+yarn.lock
+package-lock.json
+pnpm-lock.yaml
+
+# build output
+dist/
+build/
+out/
+coverage/
+
+# env
+.env*
+!.env.example
+
+# logs
+*.log
+
+# misc
+.DS_Store
+.vscode/
+.idea/
+.envrc
+wallets.local.json
+repomix-output.md
