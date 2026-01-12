@@ -1,6 +1,5 @@
 {
-  "name": "@bch/rpa-derive",
-  "version": "0.1.0",
+  "name": "@bch/demo-cli",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -11,20 +10,25 @@
       "default": "./dist/index.js"
     }
   },
+  "bin": {
+    "bch-demo": "./dist/index.js"
+  },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "clean": "rm -rf dist",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@bch/electrum": "workspace:^",
+    "@bch/pool-hash-fold": "workspace:^",
+    "@bch/pool-shards": "workspace:^",
+    "@bch/rpa": "workspace:^",
+    "@bch/tx-builder": "workspace:^",
     "@bch/utils": "workspace:^",
     "@noble/curves": "^2.0.0",
-    "aes-js": "^3.1.2"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3"
+    "commander": "^12.0.0"
   }
 }

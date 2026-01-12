@@ -1,4 +1,3 @@
-// src/demo_sharded_pool.js
 /**
  * Sharded per-user pool demo (Phase 2.5 scaffolding)
  * -------------------------------------------------
@@ -40,29 +39,15 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import fsSync from 'node:fs';
 
+import { bytesToHex, hexToBytes, concat } from '@bch/utils';
+
 import {
-  bytesToHex,
-  hexToBytes,
   sha256,
   _hash160,
   ensureEvenYPriv,
-  extractPubKeyFromPaycode,
-  concat,
   reverseBytes,
   uint32le,
-} from '@bch/utils';
-
-import {
-  broadcastTx,
-  getUtxos,
-  getTxDetails,
-  getUtxosFromScripthash,
-  getFeeRate,
-  consolidateUtxos,
-  parseTx,
-} from '@bch/electrum';
-
-import { buildRawTx, signInput, addTokenToScript } from '@bch/tx-builder';
+} from './utils.js';
 
 import {
   RPA_MODE_STEALTH_P2PKH,
@@ -70,23 +55,122 @@ import {
   deriveRpaOneTimePrivReceiver,
 } from '@bch/rpa';
 
-import {
-  POOL_HASH_FOLD_VERSION,
-  getPoolHashFoldBytecode,
-  computePoolStateOut,
-  // NOTE: these must exist in your pool-hash-fold package; if names differ, update imports.
-  buildPoolHashFoldUnlockingBytecode,
-  makeProofBlobV11,
-} from '@bch/pool-hash-fold';
+import * as Electrum from '@bch/electrum';
+import * as TxBuilder from '@bch/tx-builder';
+import * as PoolHashFold from '@bch/pool-hash-fold';
 
 import { NETWORK, DUST } from './config.js';
 import { getWallets } from './wallets.js';
-import { setupPaycodesAndDerivation } from './paycodes.js';
+import { setupPaycodesAndDerivation, extractPubKeyFromPaycode } from './paycodes.js';
 
 // -------------------------------------------------------------------------------------
-// Actor identifiers (generic, stable)
+// Namespace imports (avoid TS2305 until package exports are stabilized)
+// -------------------------------------------------------------------------------------
+const {
+  broadcastTx,
+  getUtxos,
+  getTxDetails,
+  getUtxosFromScripthash,
+  getFeeRate,
+  parseTx,
+} = Electrum as any;
+
+const { buildRawTx, signInput, addTokenToScript } = TxBuilder as any;
+
+const {
+  POOL_HASH_FOLD_VERSION,
+  getPoolHashFoldBytecode,
+  computePoolStateOut,
+  buildPoolHashFoldUnlockingBytecode,
+  makeProofBlobV11,
+} = PoolHashFold as any;
+
+// -------------------------------------------------------------------------------------
+// Local structural types (keep wallet/tooling unblocked without depending on upstream typings)
 // -------------------------------------------------------------------------------------
 
+type WalletLike = {
+  address: string;
+  privBytes: Uint8Array;
+  pubBytes: Uint8Array;
+  hash160: Uint8Array;
+  scanPrivBytes?: Uint8Array;
+  spendPrivBytes?: Uint8Array;
+};
+
+type RpaContext = {
+  senderPub33Hex: string;
+  prevoutHashHex: string;
+  prevoutN: number;
+  index: number;
+};
+
+type StealthUtxoRecord = {
+  owner: string;
+  purpose: string;
+  txid: string;
+  vout: number;
+  value: string;
+  hash160Hex: string;
+  rpaContext: RpaContext;
+  createdAt: string;
+  spentInTxid?: string;
+  spentAt?: string;
+};
+
+type DepositRecord = {
+  txid: string;
+  vout: number;
+  value: string;
+  receiverRpaHash160Hex: string;
+  createdAt: string;
+  rpaContext: RpaContext;
+  importTxid?: string;
+  importedIntoShard?: number;
+  spentTxid?: string;
+  spentAt?: string;
+};
+
+type WithdrawalRecord = {
+  txid: string;
+  shardIndex: number;
+  amountSats: number;
+  receiverRpaHash160Hex: string;
+  createdAt: string;
+  rpaContext: RpaContext;
+  receiverPaycodePub33Hex?: string;
+  shardBefore?: any;
+  shardAfter?: any;
+};
+
+type ShardPointer = {
+  txid: string;
+  vout: number;
+  value: string;
+  commitmentHex: string;
+  index?: number;
+};
+
+type DemoState = {
+  network?: string;
+  txid?: string;
+  categoryHex?: string;
+  poolVersion?: any;
+  redeemScriptHex?: string;
+  shards: ShardPointer[];
+  stealthUtxos: StealthUtxoRecord[];
+  deposits: DepositRecord[];
+  withdrawals: WithdrawalRecord[];
+  lastDeposit?: DepositRecord;
+  lastImport?: any;
+  lastWithdraw?: any;
+  createdAt?: string;
+  repairedAt?: string;
+};
+
+// -------------------------------------------------------------------------------------
+// Stable actors
+// -------------------------------------------------------------------------------------
 const ACTOR_A = { id: 'actor_a', label: 'Actor A' };
 const ACTOR_B = { id: 'actor_b', label: 'Actor B' };
 
@@ -94,14 +178,23 @@ const ACTOR_B = { id: 'actor_b', label: 'Actor B' };
 // Repo root & state file
 // -------------------------------------------------------------------------------------
 
-function findRepoRoot(startDir = process.cwd()) {
+function emptyDemoState(): DemoState {
+  return {
+    network: NETWORK,
+    shards: [],
+    stealthUtxos: [],
+    deposits: [],
+    withdrawals: [],
+  };
+}
+
+function findRepoRoot(startDir = process.cwd()): string {
   let dir = startDir;
   while (true) {
     const pkg = path.join(dir, 'package.json');
     if (fsSync.existsSync(pkg)) return dir;
-
     const parent = path.dirname(dir);
-    if (parent === dir) return startDir; // fallback
+    if (parent === dir) return startDir;
     dir = parent;
   }
 }
@@ -109,7 +202,6 @@ function findRepoRoot(startDir = process.cwd()) {
 const REPO_ROOT = findRepoRoot();
 const STATE_FILE = path.join(REPO_ROOT, 'demo_state', 'sharded_pool_state.json');
 
-// Conservative defaults for chipnet demos.
 const SHARD_VALUE = 2_000n;
 const DEFAULT_FEE = 2_000n;
 
@@ -117,7 +209,7 @@ const DEFAULT_FEE = 2_000n;
 // Small script helpers
 // -------------------------------------------------------------------------------------
 
-function parseP2pkhHash160(scriptPubKey) {
+function parseP2pkhHash160(scriptPubKey: Uint8Array | string): Uint8Array | null {
   const spk = scriptPubKey instanceof Uint8Array ? scriptPubKey : hexToBytes(scriptPubKey);
 
   // OP_DUP OP_HASH160 PUSH20 <20B> OP_EQUALVERIFY OP_CHECKSIG
@@ -134,22 +226,22 @@ function parseP2pkhHash160(scriptPubKey) {
   return null;
 }
 
-function reverseHex32(txidHex) {
+function reverseHex32(txidHex: string): string {
   return bytesToHex(reverseBytes(hexToBytes(txidHex)));
 }
 
-function pubkeyHashFromPriv(privBytes) {
+function pubkeyHashFromPriv(privBytes: Uint8Array): { pub: Uint8Array; h160: Uint8Array } {
   const pub = secp256k1.getPublicKey(privBytes, true);
   const h160 = _hash160(pub);
   return { pub, h160 };
 }
 
-function flattenBinArray(chunks) {
+function flattenBinArray(chunks: Uint8Array[]): Uint8Array {
   return concat(...chunks);
 }
 
 /** Build standard P2PKH locking bytecode for a 20-byte hash160. */
-function p2pkhLockingBytecode(hash160) {
+function p2pkhLockingBytecode(hash160: Uint8Array): Uint8Array {
   if (!(hash160 instanceof Uint8Array) || hash160.length !== 20) {
     throw new Error('p2pkhLockingBytecode: hash160 must be 20 bytes');
   }
@@ -164,73 +256,82 @@ function p2pkhLockingBytecode(hash160) {
 }
 
 /** Minimal push for <= 75 bytes. */
-function pushData(data) {
+function pushData(data: Uint8Array): Uint8Array {
   if (!(data instanceof Uint8Array)) throw new Error('pushData: Uint8Array required');
   if (data.length > 75) throw new Error('pushData: only supports <= 75B pushes in this demo');
   return Uint8Array.from([data.length, ...data]);
 }
 
 /** Derive a stable 32-byte hash for an outpoint (demo placeholder). */
-function outpointHash32(txidHex, vout) {
+function outpointHash32(txidHex: string, vout: number): Uint8Array {
   const txid = hexToBytes(txidHex);
   const n = uint32le(vout >>> 0);
   return sha256(flattenBinArray([txid, n]));
 }
 
-function assertChipnet() {
+function assertChipnet(): void {
   // This demo intentionally targets chipnet for BCH2026-introspection opcodes.
   if ((NETWORK ?? '').toLowerCase() !== 'chipnet') {
     throw new Error(`This demo targets CHIPNET only. Current NETWORK=${NETWORK}`);
   }
 }
 
-async function readState() {
+// -------------------------------------------------------------------------------------
+// State helpers (PATCHED: always return a concrete DemoState, prevent never[] and {} fallbacks)
+// -------------------------------------------------------------------------------------
+
+function ensureStateDefaults(state?: DemoState | null): DemoState {
+  const st = (state ?? emptyDemoState()) as DemoState;
+
+  st.network = st.network ?? NETWORK;
+  st.shards = Array.isArray(st.shards) ? st.shards : [];
+  st.stealthUtxos = Array.isArray(st.stealthUtxos) ? st.stealthUtxos : [];
+  st.deposits = Array.isArray(st.deposits) ? st.deposits : [];
+  st.withdrawals = Array.isArray(st.withdrawals) ? st.withdrawals : [];
+
+  return st;
+}
+
+async function readState(): Promise<DemoState | null> {
   try {
     const raw = await fs.readFile(STATE_FILE, 'utf8');
-    const st = JSON.parse(raw);
-    ensureStateDefaults(st);
-    return st;
+    const st = JSON.parse(raw) as DemoState;
+    return ensureStateDefaults(st);
   } catch {
     return null;
   }
 }
 
-async function writeState(state) {
+async function writeState(state: DemoState): Promise<void> {
+  const st = ensureStateDefaults(state);
   await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
-  await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+  await fs.writeFile(STATE_FILE, JSON.stringify(st, null, 2), 'utf8');
 }
 
-function ensureStateDefaults(state) {
-  if (!state) return state;
-  state.stealthUtxos = Array.isArray(state.stealthUtxos) ? state.stealthUtxos : [];
-  state.deposits = Array.isArray(state.deposits) ? state.deposits : [];
-  state.withdrawals = Array.isArray(state.withdrawals) ? state.withdrawals : [];
-  return state;
-}
-
-function upsertStealthUtxo(state, rec) {
-  ensureStateDefaults(state);
+function upsertStealthUtxo(state: DemoState, rec: StealthUtxoRecord): void {
+  const st = ensureStateDefaults(state);
   const key = `${rec.txid}:${rec.vout}`;
-  const idx = state.stealthUtxos.findIndex((r) => r && `${r.txid}:${r.vout}` === key);
-  if (idx >= 0) state.stealthUtxos[idx] = { ...state.stealthUtxos[idx], ...rec };
-  else state.stealthUtxos.push(rec);
+  const idx = st.stealthUtxos.findIndex((r) => r && `${r.txid}:${r.vout}` === key);
+  if (idx >= 0) st.stealthUtxos[idx] = { ...st.stealthUtxos[idx], ...rec };
+  else st.stealthUtxos.push(rec);
 }
 
-function markStealthSpent(state, txid, vout, spentInTxid) {
-  ensureStateDefaults(state);
+function markStealthSpent(state: DemoState, txid: string, vout: number, spentInTxid: string): void {
+  const st = ensureStateDefaults(state);
   const key = `${txid}:${vout}`;
-  const idx = state.stealthUtxos.findIndex((r) => r && `${r.txid}:${r.vout}` === key);
+  const idx = st.stealthUtxos.findIndex((r) => r && `${r.txid}:${r.vout}` === key);
   if (idx >= 0) {
-    state.stealthUtxos[idx] = {
-      ...state.stealthUtxos[idx],
+    st.stealthUtxos[idx] = {
+      ...st.stealthUtxos[idx],
       spentInTxid,
       spentAt: new Date().toISOString(),
     };
   }
 }
 
-function getLatestUnimportedDeposit(state, amountSats) {
-  const deps = Array.isArray(state?.deposits) ? state.deposits : [];
+function getLatestUnimportedDeposit(state: DemoState, amountSats: number | null): DepositRecord | null {
+  const st = ensureStateDefaults(state);
+  const deps = Array.isArray(st?.deposits) ? st.deposits : [];
   for (let i = deps.length - 1; i >= 0; i--) {
     const d = deps[i];
     if (!d) continue;
@@ -241,21 +342,21 @@ function getLatestUnimportedDeposit(state, amountSats) {
   return null;
 }
 
-function upsertDeposit(state, dep) {
-  ensureStateDefaults(state);
-  const i = state.deposits.findIndex((d) => d.txid === dep.txid && d.vout === dep.vout);
-  if (i >= 0) state.deposits[i] = { ...state.deposits[i], ...dep };
-  else state.deposits.push(dep);
+function upsertDeposit(state: DemoState, dep: DepositRecord): void {
+  const st = ensureStateDefaults(state);
+  const i = st.deposits.findIndex((d) => d.txid === dep.txid && d.vout === dep.vout);
+  if (i >= 0) st.deposits[i] = { ...st.deposits[i], ...dep };
+  else st.deposits.push(dep);
 }
 
-async function getPrevOutput(txid, vout) {
+async function getPrevOutput(txid: string, vout: number): Promise<any> {
   const details = await getTxDetails(txid, NETWORK);
   const out = details.outputs?.[vout];
   if (!out) throw new Error(`Unable to read prevout ${txid}:${vout}`);
   return out;
 }
 
-async function pickFeeRateOrFallback() {
+async function pickFeeRateOrFallback(): Promise<number> {
   try {
     const fr = await getFeeRate();
     if (typeof fr === 'number' && Number.isFinite(fr) && fr >= 1) return Math.ceil(fr);
@@ -263,39 +364,50 @@ async function pickFeeRateOrFallback() {
   return 2;
 }
 
-function feeFromSize(sizeBytes, feeRateSatPerByte, { safety = 200n } = {}) {
+function feeFromSize(sizeBytes: number, feeRateSatPerByte: number, { safety = 200n } = {}): bigint {
   return BigInt(sizeBytes) * BigInt(feeRateSatPerByte) + safety;
 }
 
-function toBigIntSats(x) {
+function toBigIntSats(x: any): bigint {
   return typeof x === 'bigint' ? x : BigInt(x);
 }
 
-function toLowerHex(x) {
+function toLowerHex(x: unknown): string | null {
   if (typeof x === 'string') return x.toLowerCase();
   if (x instanceof Uint8Array) return bytesToHex(x).toLowerCase();
   return null;
 }
 
-function p2pkhScripthashFromHash160(hash16020) {
+function p2pkhScripthashFromHash160(hash16020: Uint8Array): string {
   const script = p2pkhLockingBytecode(hash16020);
   const h = sha256(script);
   const scripthash = reverseBytes(h);
   return bytesToHex(scripthash);
 }
 
-async function isP2pkhOutpointUnspent({ txid, vout, hash160Hex }) {
+async function isP2pkhOutpointUnspent({
+  txid,
+  vout,
+  hash160Hex,
+}: {
+  txid: string;
+  vout: number;
+  hash160Hex: string;
+}): Promise<boolean> {
   const hash160 = hexToBytes(hash160Hex);
   const sh = p2pkhScripthashFromHash160(hash160).toLowerCase();
   const utxos = await getUtxosFromScripthash(sh, NETWORK, true);
   return Array.isArray(utxos) && utxos.some((u) => u.txid === txid && u.vout === vout);
 }
 
-function sleep(ms) {
+function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function waitForP2pkhOutpointUnspent({ txid, vout, hash160Hex }, { attempts = 10, delayMs = 800 } = {}) {
+async function waitForP2pkhOutpointUnspent(
+  { txid, vout, hash160Hex }: { txid: string; vout: number; hash160Hex: string },
+  { attempts = 10, delayMs = 800 }: { attempts?: number; delayMs?: number } = {}
+): Promise<boolean> {
   for (let i = 0; i < attempts; i++) {
     const ok = await isP2pkhOutpointUnspent({ txid, vout, hash160Hex });
     if (ok) return true;
@@ -308,7 +420,19 @@ async function waitForP2pkhOutpointUnspent({ txid, vout, hash160Hex }, { attempt
  * Convenience: derive a stealth P2PKH locking intent AND the minimum context the receiver needs
  * to derive the one-time private key later.
  */
-function deriveStealthP2pkhLock({ senderWallet, receiverPaycodePub33, prevoutTxidHex, prevoutN, index }) {
+function deriveStealthP2pkhLock({
+  senderWallet,
+  receiverPaycodePub33,
+  prevoutTxidHex,
+  prevoutN,
+  index,
+}: {
+  senderWallet: WalletLike;
+  receiverPaycodePub33: Uint8Array;
+  prevoutTxidHex: string;
+  prevoutN: number;
+  index: number;
+}): { intent: any; rpaContext: RpaContext } {
   const intent = deriveRpaLockIntent({
     mode: RPA_MODE_STEALTH_P2PKH,
     senderPrivBytes: senderWallet.privBytes,
@@ -318,7 +442,7 @@ function deriveStealthP2pkhLock({ senderWallet, receiverPaycodePub33, prevoutTxi
     index,
   });
 
-  const rpaContext = {
+  const rpaContext: RpaContext = {
     senderPub33Hex: bytesToHex(senderWallet.pubBytes),
     // IMPORTANT (LOCKED-IN): prevout txid is used "as-is" (no endian reversal)
     prevoutHashHex: prevoutTxidHex,
@@ -333,18 +457,35 @@ function deriveStealthP2pkhLock({ senderWallet, receiverPaycodePub33, prevoutTxi
  * Select a single spendable funding UTXO for `ownerTag`, preferring any previously-recorded
  * stealth outputs in the state file. Returns both the prevOut data and the private key bytes to sign.
  */
-async function selectFundingUtxo({ state, wallet, ownerTag, minSats = BigInt(DUST) }) {
-  ensureStateDefaults(state);
+async function selectFundingUtxo({
+  state,
+  wallet,
+  ownerTag,
+  minSats = BigInt(DUST),
+}: {
+  state?: DemoState | null;
+  wallet: WalletLike;
+  ownerTag: string;
+  minSats?: bigint;
+}): Promise<{
+  txid: string;
+  vout: number;
+  prevOut: any;
+  signPrivBytes: Uint8Array;
+  source: 'stealth' | 'base';
+  record?: StealthUtxoRecord;
+}> {
+  const st = ensureStateDefaults(state);
 
   // 1) Prefer stealth UTXOs created by this demo (we can derive spending keys deterministically).
-  const stealthRecs = (state?.stealthUtxos ?? [])
+  const stealthRecs = (st?.stealthUtxos ?? [])
     .filter((r) => r && r.owner === ownerTag && !r.spentInTxid)
     .sort((a, b) => (toBigIntSats(b.value ?? 0) > toBigIntSats(a.value ?? 0) ? 1 : -1));
 
   for (const r of stealthRecs) {
     const unspent = await isP2pkhOutpointUnspent({ txid: r.txid, vout: r.vout, hash160Hex: r.hash160Hex });
     if (!unspent) {
-      markStealthSpent(state, r.txid, r.vout, '<spent>');
+      markStealthSpent(st, r.txid, r.vout, '<spent>');
       continue;
     }
 
@@ -392,7 +533,15 @@ async function selectFundingUtxo({ state, wallet, ownerTag, minSats = BigInt(DUS
   throw new Error(`No funding UTXO available for ${ownerTag}. Fund ${wallet.address} on chipnet.`);
 }
 
-async function finalizeAndSignInitTx({ tx, inputPrivBytes, prevOut }) {
+async function finalizeAndSignInitTx({
+  tx,
+  inputPrivBytes,
+  prevOut,
+}: {
+  tx: any;
+  inputPrivBytes: Uint8Array;
+  prevOut: any;
+}): Promise<{ rawHex: string; sizeBytes: number }> {
   signInput(tx, 0, inputPrivBytes, prevOut.scriptPubKey, toBigIntSats(prevOut.value));
   const rawBytes = buildRawTx(tx, { format: 'bytes' });
   const sizeBytes = rawBytes.length;
@@ -404,8 +553,20 @@ async function finalizeAndSignInitTx({ tx, inputPrivBytes, prevOut }) {
 // State init / reuse
 // -------------------------------------------------------------------------------------
 
-async function ensurePoolState({ ownerWallet, ownerPaycodePub33, shardCount, poolVersion, fresh = false }) {
-  let state = await readState();
+async function ensurePoolState({
+  ownerWallet,
+  ownerPaycodePub33,
+  shardCount,
+  poolVersion,
+  fresh = false,
+}: {
+  ownerWallet: WalletLike;
+  ownerPaycodePub33: Uint8Array;
+  shardCount: number;
+  poolVersion: any;
+  fresh?: boolean;
+}): Promise<DemoState> {
+  let state = ensureStateDefaults(await readState());
 
   const stateLooksValid =
     state?.network === NETWORK &&
@@ -416,7 +577,7 @@ async function ensurePoolState({ ownerWallet, ownerPaycodePub33, shardCount, poo
 
   if (!fresh && stateLooksValid) {
     // quick validation: do the shard outpoints still exist?
-    const missing = [];
+    const missing: string[] = [];
     for (const s of state.shards) {
       try {
         await getPrevOutput(s.txid, s.vout);
@@ -428,8 +589,7 @@ async function ensurePoolState({ ownerWallet, ownerPaycodePub33, shardCount, poo
     if (missing.length === 0) {
       console.log(`\n[0/4] using existing shard state: ${STATE_FILE}`);
       console.log(`      shards: ${state.shards.length}`);
-      ensureStateDefaults(state);
-      return state;
+      return ensureStateDefaults(state);
     }
 
     console.warn(`\n[0/4] state exists but ${missing.length} shard outpoints missing/spent.`);
@@ -440,8 +600,7 @@ async function ensurePoolState({ ownerWallet, ownerPaycodePub33, shardCount, poo
       state = repaired;
       await writeState(state);
       console.log(`      ✅ repaired shard pointers and updated state file.`);
-      ensureStateDefaults(state);
-      return state;
+      return ensureStateDefaults(state);
     }
 
     console.warn(`      ⚠️ repair failed; falling back to fresh init.`);
@@ -450,22 +609,28 @@ async function ensurePoolState({ ownerWallet, ownerPaycodePub33, shardCount, poo
   console.log(`\n[1/4] init ${shardCount} shards...`);
   const init = await initShardsTx({ state: null, ownerWallet, ownerPaycodePub33, shardCount, poolVersion });
 
-  state = {
+  state = ensureStateDefaults({
     network: NETWORK,
     ...init,
     stealthUtxos: init.stealthUtxos ?? [],
     deposits: [],
     withdrawals: [],
     createdAt: new Date().toISOString(),
-  };
+  });
 
   await writeState(state);
   return state;
 }
 
-async function tryRepairShardsFromWallet({ state, ownerWallet }) {
-  const redeemScriptHex = state.redeemScriptHex.toLowerCase();
-  const categoryHex = state.categoryHex.toLowerCase();
+async function tryRepairShardsFromWallet({
+  state,
+  ownerWallet,
+}: {
+  state: DemoState;
+  ownerWallet: WalletLike;
+}): Promise<DemoState | null> {
+  const redeemScriptHex = (state.redeemScriptHex ?? '').toLowerCase();
+  const categoryHex = (state.categoryHex ?? '').toLowerCase();
 
   const utxos = await getUtxos(ownerWallet.address, NETWORK, true);
 
@@ -476,7 +641,7 @@ async function tryRepairShardsFromWallet({ state, ownerWallet }) {
 
   if (tokenUtxos.length === 0) return null;
 
-  const matches = [];
+  const matches: ShardPointer[] = [];
   for (const u of tokenUtxos) {
     try {
       const tx = await getTxDetails(u.txid, NETWORK);
@@ -504,23 +669,42 @@ async function tryRepairShardsFromWallet({ state, ownerWallet }) {
   if (matches.length === 0) return null;
 
   // NOTE: cannot recover original shard indices once commitments have been mutated.
-  const repairedShards = matches.map((m, i) => ({ index: i, ...m }));
+  const repairedShards: ShardPointer[] = matches.map((m, i) => ({ index: i, ...m }));
 
   const unknown = repairedShards.filter((s) => s.commitmentHex === 'UNKNOWN').length;
   if (unknown) console.warn(`repair: ${unknown} shard commitments missing; outpoints recovered only.`);
 
-  return {
+  return ensureStateDefaults({
     ...state,
     shards: repairedShards,
     repairedAt: new Date().toISOString(),
-  };
+  });
 }
 
 // -------------------------------------------------------------------------------------
 // Core demo steps
 // -------------------------------------------------------------------------------------
 
-async function initShardsTx({ state = null, ownerWallet, ownerPaycodePub33 = null, shardCount, poolVersion }) {
+async function initShardsTx({
+  state = null,
+  ownerWallet,
+  ownerPaycodePub33 = null,
+  shardCount,
+  poolVersion,
+}: {
+  state?: DemoState | null;
+  ownerWallet: WalletLike;
+  ownerPaycodePub33?: Uint8Array | null;
+  shardCount: number;
+  poolVersion: any;
+}): Promise<{
+  txid: string;
+  categoryHex: string;
+  poolVersion: any;
+  redeemScriptHex: string;
+  shards: ShardPointer[];
+  stealthUtxos: StealthUtxoRecord[];
+}> {
   const redeemScript = await getPoolHashFoldBytecode(poolVersion);
 
   const shardsTotal = SHARD_VALUE * BigInt(shardCount);
@@ -561,7 +745,7 @@ async function initShardsTx({ state = null, ownerWallet, ownerPaycodePub33 = nul
 
   // Change output: prefer stealth P2PKH (RPA) back to the owner's paycode if available.
   let changeSpk = p2pkhLockingBytecode(ownerWallet.hash160);
-  let changeStealthTemplate = null;
+  let changeStealthTemplate: StealthUtxoRecord | null = null;
 
   if (ownerPaycodePub33) {
     const { intent, rpaContext } = deriveStealthP2pkhLock({
@@ -651,14 +835,14 @@ async function initShardsTx({ state = null, ownerWallet, ownerPaycodePub33 = nul
     console.log(`[init] change (base P2PKH fallback) -> outpoint ${txid}:${shardCount} value=${changeValue.toString()} sats`);
   }
 
-  const shards = shardCommitments.map((c, i) => ({
+  const shards: ShardPointer[] = shardCommitments.map((c, i) => ({
     txid,
     vout: i,
     value: SHARD_VALUE.toString(),
     commitmentHex: bytesToHex(c),
   }));
 
-  const stealthUtxos = [];
+  const stealthUtxos: StealthUtxoRecord[] = [];
   if (changeStealthTemplate) {
     stealthUtxos.push({
       ...changeStealthTemplate,
@@ -684,14 +868,21 @@ async function createDeposit({
   senderTag,
   receiverPaycodePub33,
   amountSats,
-}) {
-  ensureStateDefaults(state);
+}: {
+  state: DemoState;
+  senderWallet: WalletLike;
+  senderPaycodePub33: Uint8Array;
+  senderTag: string;
+  receiverPaycodePub33: Uint8Array;
+  amountSats: number;
+}): Promise<{ deposit: DepositRecord; change: StealthUtxoRecord | null }> {
+  const st = ensureStateDefaults(state);
 
   const amount = BigInt(amountSats);
   if (amount < BigInt(DUST)) throw new Error('deposit amount below dust');
 
   const senderUtxo = await selectFundingUtxo({
-    state,
+    state: st,
     wallet: senderWallet,
     ownerTag: senderTag,
     minSats: amount + BigInt(DUST) + 2_000n,
@@ -728,9 +919,9 @@ async function createDeposit({
 
   let changeValue = inputValue - amount - feeFloor;
 
-  const outputs = [{ value: amount, scriptPubKey: outSpk }];
+  const outputs: any[] = [{ value: amount, scriptPubKey: outSpk }];
 
-  let changeRec = null;
+  let changeRec: StealthUtxoRecord | null = null;
   if (changeValue >= BigInt(DUST)) {
     outputs.push({ value: changeValue, scriptPubKey: changeSpkStealth });
 
@@ -780,7 +971,7 @@ async function createDeposit({
   }
 
   if (senderUtxo.source === 'stealth') {
-    markStealthSpent(state, senderUtxo.txid, senderUtxo.vout, txid);
+    markStealthSpent(st, senderUtxo.txid, senderUtxo.vout, txid);
   }
 
   if (changeRec) changeRec.txid = txid;
@@ -806,11 +997,19 @@ async function ensureDeposit({
   receiverPaycodePub33,
   amountSats,
   fresh = false,
-}) {
-  ensureStateDefaults(state);
+}: {
+  state: DemoState;
+  senderWallet: WalletLike;
+  senderPaycodePub33: Uint8Array;
+  senderTag?: string;
+  receiverPaycodePub33: Uint8Array;
+  amountSats: number;
+  fresh?: boolean;
+}): Promise<DepositRecord> {
+  const st = ensureStateDefaults(state);
 
   if (!fresh) {
-    const existing = getLatestUnimportedDeposit(state, amountSats);
+    const existing = getLatestUnimportedDeposit(st, amountSats);
     if (existing?.txid && existing?.receiverRpaHash160Hex) {
       const unspent = await isP2pkhOutpointUnspent({
         txid: existing.txid,
@@ -818,8 +1017,8 @@ async function ensureDeposit({
         hash160Hex: existing.receiverRpaHash160Hex,
       });
       if (unspent) {
-        state.lastDeposit = existing;
-        await writeState(state);
+        st.lastDeposit = existing;
+        await writeState(st);
         console.log(`[deposit] reusing existing deposit: ${existing.txid}:${existing.vout}`);
         return existing;
       }
@@ -827,7 +1026,7 @@ async function ensureDeposit({
   }
 
   const { deposit: dep, change } = await createDeposit({
-    state,
+    state: st,
     senderWallet,
     senderPaycodePub33,
     senderTag,
@@ -835,17 +1034,23 @@ async function ensureDeposit({
     amountSats,
   });
 
-  if (change) upsertStealthUtxo(state, change);
+  if (change) upsertStealthUtxo(st, change);
 
-  state.lastDeposit = dep;
-  upsertDeposit(state, dep);
-  await writeState(state);
+  st.lastDeposit = dep;
+  upsertDeposit(st, dep);
+  await writeState(st);
 
   console.log(`[deposit] created new deposit: ${dep.txid}:${dep.vout}`);
   return dep;
 }
 
-async function sweepDepositDebug({ depositOutpoint, receiverWallet }) {
+async function sweepDepositDebug({
+  depositOutpoint,
+  receiverWallet,
+}: {
+  depositOutpoint: DepositRecord;
+  receiverWallet: WalletLike;
+}): Promise<string> {
   const depositPrev = await getPrevOutput(depositOutpoint.txid, depositOutpoint.vout);
   const depositValue = BigInt(depositPrev.value);
 
@@ -903,9 +1108,19 @@ async function sweepDepositDebug({ depositOutpoint, receiverWallet }) {
   return txid;
 }
 
-async function importDepositToShard({ poolState, shardIndex, depositOutpoint, receiverWallet }) {
-  const redeemScript = hexToBytes(poolState.redeemScriptHex);
-  const category32 = hexToBytes(poolState.categoryHex);
+async function importDepositToShard({
+  poolState,
+  shardIndex,
+  depositOutpoint,
+  receiverWallet,
+}: {
+  poolState: DemoState;
+  shardIndex: number;
+  depositOutpoint: DepositRecord;
+  receiverWallet: WalletLike;
+}): Promise<{ txid: string }> {
+  const redeemScript = hexToBytes(poolState.redeemScriptHex!);
+  const category32 = hexToBytes(poolState.categoryHex!);
 
   const shard = poolState.shards[shardIndex];
   if (!shard) throw new Error(`invalid shardIndex ${shardIndex}`);
@@ -939,7 +1154,7 @@ async function importDepositToShard({ poolState, shardIndex, depositOutpoint, re
     const candA = ctx.prevoutHashHex;
     const candB = reverseHex32(ctx.prevoutHashHex);
 
-    const deriveH160 = (prevoutHashHex, normalizeEvenY) => {
+    const deriveH160 = (prevoutHashHex: string, normalizeEvenY: boolean) => {
       try {
         const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
           receiverWallet.scanPrivBytes ?? receiverWallet.privBytes,
@@ -984,7 +1199,7 @@ async function importDepositToShard({ poolState, shardIndex, depositOutpoint, re
   console.log('[import] noteHash32A:', bytesToHex(noteHash32));
 
   const stateIn32 = hexToBytes(shard.commitmentHex);
-  const limbs = []; // placeholder (must match covenant expectations)
+  const limbs: Uint8Array[] = []; // placeholder (must match covenant expectations)
 
   // ---- Locked-in category mode (B) ----
   const stateOut32 = computePoolStateOut({
@@ -1058,12 +1273,22 @@ async function importDepositToShard({ poolState, shardIndex, depositOutpoint, re
   return { txid };
 }
 
-async function ensureImport({ state, receiverWallet, shardIndexOpt = null, fresh = false }) {
-  ensureStateDefaults(state);
+async function ensureImport({
+  state,
+  receiverWallet,
+  shardIndexOpt = null,
+  fresh = false,
+}: {
+  state: DemoState;
+  receiverWallet: WalletLike;
+  shardIndexOpt?: number | null;
+  fresh?: boolean;
+}): Promise<{ txid: string; shardIndex: number } | null> {
+  const st = ensureStateDefaults(state);
 
   const dep =
-    (state.lastDeposit && !state.lastDeposit.importTxid ? state.lastDeposit : null) ??
-    getLatestUnimportedDeposit(state, null);
+    (st.lastDeposit && !st.lastDeposit.importTxid ? st.lastDeposit : null) ??
+    getLatestUnimportedDeposit(st, null);
 
   if (!dep) {
     console.log('[import] no unimported deposit found; skipping.');
@@ -1072,7 +1297,7 @@ async function ensureImport({ state, receiverWallet, shardIndexOpt = null, fresh
 
   if (!fresh && dep.importTxid) {
     console.log(`[import] already imported (state): ${dep.txid}:${dep.vout} -> tx ${dep.importTxid}`);
-    return { txid: dep.importTxid, shardIndex: dep.importedIntoShard };
+    return { txid: dep.importTxid, shardIndex: dep.importedIntoShard! };
   }
 
   let stillUnspent = await isP2pkhOutpointUnspent({
@@ -1101,37 +1326,37 @@ async function ensureImport({ state, receiverWallet, shardIndexOpt = null, fresh
     }
   }
 
-  const shardCount = state.shards.length;
+  const shardCount = st.shards.length;
   const noteHash = outpointHash32(dep.txid, dep.vout);
   const derivedIndex = noteHash[0] % shardCount;
   const shardIndex =
     shardIndexOpt == null ? derivedIndex : Math.max(0, Math.min(shardCount - 1, Number(shardIndexOpt)));
 
-  const shardBefore = { ...state.shards[shardIndex] };
+  const shardBefore = { ...(st.shards[shardIndex]!) };
 
   const res = await importDepositToShard({
-    poolState: state,
+    poolState: st,
     shardIndex,
     depositOutpoint: dep,
     receiverWallet,
   });
 
-  upsertDeposit(state, {
+  upsertDeposit(st, {
     ...dep,
     importedIntoShard: shardIndex,
     importTxid: res.txid,
   });
 
-  state.lastImport = {
+  st.lastImport = {
     txid: res.txid,
     shardIndex,
     deposit: { txid: dep.txid, vout: dep.vout },
     shardBefore,
-    shardAfter: { ...state.shards[shardIndex] },
+    shardAfter: { ...st.shards[shardIndex]! },
     createdAt: new Date().toISOString(),
   };
 
-  await writeState(state);
+  await writeState(st);
 
   console.log(`[import] imported deposit ${dep.txid}:${dep.vout} into shard ${shardIndex} (tx ${res.txid})`);
   return { txid: res.txid, shardIndex };
@@ -1145,13 +1370,25 @@ async function withdrawFromShard({
   senderPaycodePub33,
   senderTag = ACTOR_B.id,
   receiverPaycodePub33,
-}) {
-  ensureStateDefaults(poolState);
+}: {
+  poolState: DemoState;
+  shardIndex: number;
+  amountSats: number;
+  senderWallet: WalletLike;
+  senderPaycodePub33: Uint8Array;
+  senderTag?: string;
+  receiverPaycodePub33: Uint8Array;
+}): Promise<{ txid: string }> {
+  const st = ensureStateDefaults(poolState);
 
-  const redeemScript = hexToBytes(poolState.redeemScriptHex);
-  const category32 = hexToBytes(poolState.categoryHex);
+  if (!st?.redeemScriptHex || !st?.categoryHex) {
+    throw new Error('State missing redeemScriptHex/categoryHex. Run init first or repair state.');
+  }
 
-  const shard = poolState.shards[shardIndex];
+  const redeemScript = hexToBytes(st.redeemScriptHex);
+  const category32 = hexToBytes(st.categoryHex);
+
+  const shard = st.shards[shardIndex];
   if (!shard) throw new Error(`Unknown shard index ${shardIndex}`);
 
   const shardPrev = await getPrevOutput(shard.txid, shard.vout);
@@ -1164,7 +1401,7 @@ async function withdrawFromShard({
   const newShardValue = shardValue - payment;
 
   const feeUtxo = await selectFundingUtxo({
-    state: poolState,
+    state: st,
     wallet: senderWallet,
     ownerTag: senderTag,
     minSats: BigInt(DUST) + 2_000n,
@@ -1198,7 +1435,7 @@ async function withdrawFromShard({
     flattenBinArray([hexToBytes(shard.commitmentHex), payIntent.childHash160, sha256(uint32le(amountSats >>> 0))])
   );
   const proofBlob32 = sha256(flattenBinArray([nullifier32, Uint8Array.from([0x02])]));
-  const limbs = [];
+  const limbs: Uint8Array[] = [];
 
   const stateIn32 = hexToBytes(shard.commitmentHex);
   const stateOut32 = computePoolStateOut({
@@ -1224,12 +1461,12 @@ async function withdrawFromShard({
   const feeValue = BigInt(feePrev.value);
   let changeValue = feeValue - fee;
 
-  const outputs = [
+  const outputs: any[] = [
     { value: newShardValue, scriptPubKey: shardOutSpk },
     { value: payment, scriptPubKey: paySpk },
   ];
 
-  let changeRec = null;
+  let changeRec: StealthUtxoRecord | null = null;
   if (changeValue >= BigInt(DUST)) {
     outputs.push({ value: changeValue, scriptPubKey: changeSpk });
 
@@ -1274,21 +1511,21 @@ async function withdrawFromShard({
     console.log(`[withdraw] change: none (remainder absorbed into fee to avoid dust)`);
   }
 
-  if (feeUtxo.source === 'stealth') markStealthSpent(poolState, feeUtxo.txid, feeUtxo.vout, txid);
+  if (feeUtxo.source === 'stealth') markStealthSpent(st, feeUtxo.txid, feeUtxo.vout, txid);
 
   if (changeRec) {
     changeRec.txid = txid;
-    upsertStealthUtxo(poolState, changeRec);
+    upsertStealthUtxo(st, changeRec);
   }
 
-  poolState.shards[shardIndex] = {
+  st.shards[shardIndex] = {
     txid,
     vout: 0,
     value: newShardValue.toString(),
     commitmentHex: bytesToHex(stateOut32),
   };
 
-  poolState.withdrawals.push({
+  st.withdrawals.push({
     txid,
     shardIndex,
     amountSats,
@@ -1309,20 +1546,29 @@ async function ensureWithdraw({
   senderTag = ACTOR_B.id,
   receiverPaycodePub33,
   fresh = false,
-}) {
-  ensureStateDefaults(state);
+}: {
+  state: DemoState;
+  shardIndex: number;
+  amountSats: number;
+  senderWallet: WalletLike;
+  senderPaycodePub33: Uint8Array;
+  senderTag?: string;
+  receiverPaycodePub33: Uint8Array;
+  fresh?: boolean;
+}): Promise<{ txid: string }> {
+  const st = ensureStateDefaults(state);
 
   const receiverPaycodePub33Hex = bytesToHex(receiverPaycodePub33);
 
-  if (!fresh && Array.isArray(state.withdrawals)) {
-    for (let i = state.withdrawals.length - 1; i >= 0; i--) {
-      const w = state.withdrawals[i];
+  if (!fresh && Array.isArray(st.withdrawals)) {
+    for (let i = st.withdrawals.length - 1; i >= 0; i--) {
+      const w = st.withdrawals[i];
       if (!w) continue;
       if (w.shardIndex !== shardIndex) continue;
       if (Number(w.amountSats) !== Number(amountSats)) continue;
       if (w.receiverPaycodePub33Hex !== receiverPaycodePub33Hex) continue;
 
-      const cur = state.shards[shardIndex];
+      const cur = st.shards[shardIndex];
       if (cur?.txid === w.shardAfter?.txid && cur?.vout === w.shardAfter?.vout) {
         console.log(`[withdraw] already done (state): tx ${w.txid}`);
         return { txid: w.txid };
@@ -1331,10 +1577,10 @@ async function ensureWithdraw({
     }
   }
 
-  const shardBefore = { ...state.shards[shardIndex] };
+  const shardBefore = { ...(st.shards[shardIndex]!) };
 
   const res = await withdrawFromShard({
-    poolState: state,
+    poolState: st,
     shardIndex,
     amountSats,
     senderWallet,
@@ -1343,18 +1589,18 @@ async function ensureWithdraw({
     receiverPaycodePub33,
   });
 
-  const shardAfter = { ...state.shards[shardIndex] };
+  const shardAfter = { ...st.shards[shardIndex]! };
 
   // Patch the most recent withdrawal entry with idempotence fields
-  const last = state.withdrawals[state.withdrawals.length - 1];
-  state.withdrawals[state.withdrawals.length - 1] = {
+  const last = st.withdrawals[st.withdrawals.length - 1]!;
+  st.withdrawals[st.withdrawals.length - 1] = {
     ...last,
     receiverPaycodePub33Hex,
     shardBefore,
     shardAfter,
   };
 
-  state.lastWithdraw = {
+  st.lastWithdraw = {
     txid: res.txid,
     shardIndex,
     amountSats,
@@ -1364,7 +1610,7 @@ async function ensureWithdraw({
     createdAt: new Date().toISOString(),
   };
 
-  await writeState(state);
+  await writeState(st);
 
   console.log(`[withdraw] withdrew ${amountSats} from shard ${shardIndex} (tx ${res.txid})`);
   return res;
@@ -1373,6 +1619,29 @@ async function ensureWithdraw({
 // -------------------------------------------------------------------------------------
 // Wallet integration helpers (repo-specific)
 // -------------------------------------------------------------------------------------
+
+/**
+ * paycodes.js expects Wallet with { priv, pub }. Our repo wallets are WalletLike with { privBytes, pubBytes }.
+ * This adapter preserves *all* existing fields while adding the required aliases.
+ */
+
+function asPaycodeWallet<T extends WalletLike>(w: T): T & { priv: Uint8Array; pub: Uint8Array } {
+  if (!w) throw new Error('asPaycodeWallet: wallet is required');
+
+  const priv = (w as any).priv ?? w.privBytes;
+  const pub = (w as any).pub ?? w.pubBytes;
+
+  if (!(priv instanceof Uint8Array)) {
+    throw new Error('asPaycodeWallet: wallet missing privBytes (cannot alias to priv)');
+  }
+  if (!(pub instanceof Uint8Array)) {
+    throw new Error('asPaycodeWallet: wallet missing pubBytes (cannot alias to pub)');
+  }
+
+  // Preserve everything, just add the aliases expected by setupPaycodesAndDerivation.
+  return Object.assign({}, w, { priv, pub });
+}
+
 
 async function loadDemoActors() {
   const wallets = await getWallets();
@@ -1383,8 +1652,12 @@ async function loadDemoActors() {
     throw new Error(`getWallets() returned unexpected shape. Keys: ${Object.keys(wallets ?? {}).join(', ')}`);
   }
 
-  // ✅ paycodes.js expects (alice, bob) wallet args
-  const { alicePaycode, bobPaycode } = setupPaycodesAndDerivation(actorABaseWallet, actorBBaseWallet);
+  // Adapt WalletLike -> Wallet shape expected by paycodes.js (adds { priv, pub } aliases)
+  const aliceForPaycodes = asPaycodeWallet(actorABaseWallet);
+  const bobForPaycodes = asPaycodeWallet(actorBBaseWallet);
+
+  // paycodes.js expects (alice, bob) wallet args
+  const { alicePaycode, bobPaycode } = setupPaycodesAndDerivation(aliceForPaycodes, bobForPaycodes);
 
   const actorAPaycodePub33 = extractPubKeyFromPaycode(alicePaycode);
   const actorBPaycodePub33 = extractPubKeyFromPaycode(bobPaycode);
@@ -1431,13 +1704,13 @@ program
       poolVersion,
     });
 
-    const state = {
+    const state = ensureStateDefaults({
       network: NETWORK,
       ...init,
       deposits: [],
       withdrawals: [],
       createdAt: new Date().toISOString(),
-    };
+    });
 
     await writeState(state);
 
@@ -1457,7 +1730,7 @@ program
       throw new Error(`amount must be >= dust (${DUST})`);
     }
 
-    const state = (await readState()) ?? {};
+    const state = (await readState()) ?? emptyDemoState();
     const { actorABaseWallet, actorAPaycodePub33, actorBPaycodePub33 } = await loadDemoActors();
 
     await ensureDeposit({
@@ -1480,11 +1753,11 @@ program
   .option('--sweep', 'debug: sweep the deposit UTXO alone (and stop)', false)
   .action(async (opts) => {
     assertChipnet();
-    const state = await readState();
+    const state = (await readState()) ?? emptyDemoState();
     if (!state?.shards?.length) throw new Error(`Run init first (state file missing).`);
 
     const { actorBBaseWallet } = await loadDemoActors();
-    const shardIndexOpt = opts.shard === '' ? null : Number(opts.shard);
+    const shardIndexOpt: number | null = opts.shard === '' ? null : Number(opts.shard);
 
     if (opts.sweep) {
       const dep =
@@ -1523,7 +1796,7 @@ program
   .option('--fresh', 'force a new withdrawal even if already recorded', false)
   .action(async (opts) => {
     assertChipnet();
-    const state = await readState();
+    const state = (await readState()) ?? emptyDemoState();
     if (!state?.shards?.length) throw new Error(`Run init first (state file missing).`);
 
     const shardIndex = Number(opts.shard);
