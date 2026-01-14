@@ -1,5 +1,5 @@
 {
-  "name": "@bch/demo-state",
+  "name": "@bch-stealth/demo-state",
   "version": "0.0.0",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,10 +1,9 @@
 // src/wallets.ts
 import { secp256k1 } from '@noble/curves/secp256k1.js';
-import { hexToBytes, bytesToHex } from '@bch/utils';
-import { ensureEvenYPriv, _hash160 } from './utils.js';
-import { encodeCashAddr } from './cashaddr.js';
+import { hexToBytes, bytesToHex, ensureEvenYPriv, hash160 } from '@bch-stealth/utils';
 import { promptPrivKey, promptYesNo } from './prompts.js';
 import { NETWORK } from './config.js';
+import { encodeCashAddr } from '@bch-stealth/utils';
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -108,7 +107,7 @@ export function createWallet(name: string, privKeyHex: string): Wallet {
   const pubBytes = secp256k1.getPublicKey(privBytes, true);
   const pub = bytesToHex(pubBytes);
 
-  const h160 = _hash160(pubBytes);
+  const h160 = hash160(pubBytes);
 
   const prefix = NETWORK === 'mainnet' ? 'bitcoincash' : 'bchtest';
   const address = encodeCashAddr(prefix, 'P2PKH', h160);

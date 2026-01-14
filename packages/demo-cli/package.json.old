@@ -1,5 +1,5 @@
 {
-  "name": "@bch/demo-cli",
+  "name": "@bch-stealth/demo-cli",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -22,12 +22,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@bch/electrum": "workspace:^",
-    "@bch/pool-hash-fold": "workspace:^",
-    "@bch/pool-shards": "workspace:^",
-    "@bch/rpa": "workspace:^",
-    "@bch/tx-builder": "workspace:^",
-    "@bch/utils": "workspace:^",
+    "@bch-stealth/electrum": "workspace:^",
+    "@bch-stealth/pool-hash-fold": "workspace:^",
+    "@bch-stealth/pool-shards": "workspace:^",
+    "@bch-stealth/rpa": "workspace:^",
+    "@bch-stealth/tx-builder": "workspace:^",
+    "@bch-stealth/utils": "workspace:^",
     "@noble/curves": "^2.0.0",
     "commander": "^12.0.0"
   }

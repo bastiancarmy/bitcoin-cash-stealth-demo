@@ -1,5 +1,5 @@
 {
-  "name": "@bch/rpa",
+  "name": "@bch-stealth/rpa",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -27,8 +27,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@bch/rpa-derive": "workspace:^",
-    "@bch/rpa-scan": "workspace:^"
+    "@bch-stealth/rpa-derive": "workspace:^",
+    "@bch-stealth/rpa-scan": "workspace:^",
+    "@bch-stealth/utils": "workspace:^"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

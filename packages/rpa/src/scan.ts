@@ -1,2 +1,2 @@
 // packages/rpa/src/scan.ts
-export * from "@bch/rpa-scan";
+export * from "@bch-stealth/rpa-scan";

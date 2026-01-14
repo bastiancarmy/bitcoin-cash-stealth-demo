@@ -1,10 +1,8 @@
 {
-  "name": "@bch-stealth/tx-builder",
+  "name": "@bch-stealth/crypto",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -20,9 +18,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@bch-stealth/utils": "workspace:^"
+    "@bch-stealth/utils": "workspace:^",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1"
   },
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "typescript": "^5.5.0"
   }
 }

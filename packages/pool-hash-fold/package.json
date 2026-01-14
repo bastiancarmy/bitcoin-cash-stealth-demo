@@ -1,5 +1,5 @@
 {
-  "name": "@bch/pool-hash-fold",
+  "name": "@bch-stealth/pool-hash-fold",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -20,8 +20,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@bch/tx-builder": "workspace:^",
-    "@bch/utils": "workspace:^"
+    "@bch-stealth/tx-builder": "workspace:^",
+    "@bch-stealth/utils": "workspace:^"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

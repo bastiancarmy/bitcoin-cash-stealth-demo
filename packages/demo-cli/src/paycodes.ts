@@ -3,7 +3,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { randomBytes } from "node:crypto";
 import type { Wallet } from "./wallets.js";
 import { ensureEvenYPriv, getXOnlyPub } from "./utils.js";
-import { bytesToHex, hexToBytes } from '@bch/utils';
+import { bytesToHex, hexToBytes } from '@bch-stealth/utils'
 
 export type PaycodeSetup = {
   alicePaycode: string;

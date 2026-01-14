@@ -1,5 +1,5 @@
 {
-  "name": "@bch/demo-cli",
+  "name": "@bch-stealth/demo-cli",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -22,16 +22,16 @@
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
-"dependencies": {
-  "commander": "^12.0.0",
-  "@noble/curves": "^2.0.0",
-  "@bch/utils": "workspace:^",
-  "@bch/electrum": "workspace:^",
-  "@bch/tx-builder": "workspace:^",
-  "@bch/rpa": "workspace:^",
-  "@bch/pool-hash-fold": "workspace:^",
-  "@bch/pool-shards": "workspace:^"
-},
+  "dependencies": {
+    "@bch-stealth/electrum": "workspace:^",
+    "@bch-stealth/pool-hash-fold": "workspace:^",
+    "@bch-stealth/pool-shards": "workspace:^",
+    "@bch-stealth/rpa": "workspace:^",
+    "@bch-stealth/tx-builder": "workspace:^",
+    "@bch-stealth/utils": "workspace:^",
+    "@noble/curves": "^2.0.0",
+    "commander": "^12.0.0"
+  },
   "devDependencies": {
     "@types/node": "^25.0.3",
     "typescript": "^5.9.3"

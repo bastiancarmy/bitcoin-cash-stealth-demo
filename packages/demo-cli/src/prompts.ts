@@ -1,7 +1,7 @@
 // src/prompts.ts
 import { AMOUNT, FEE, DUST, NETWORK } from './config.js';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
-import { bytesToHex } from './utils.js';
+import { bytesToHex } from '@bch-stealth/utils';
 import readline from 'node:readline/promises';
 
 export async function promptYesNo(question: string, defaultNo = true): Promise<boolean> {

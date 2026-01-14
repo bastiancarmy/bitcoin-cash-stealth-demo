@@ -9,6 +9,7 @@
 //       buildRawTx() supports blobs, but arrays are clearer and less error prone.
 // -----------------------------------------------------------------------------
 
+import { normalizeCategory32 } from './token.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import {
   concat,
@@ -17,20 +18,12 @@ import {
   varInt,
   uint32le,
   uint64le,
-  _hash160,
-  bchSchnorrSign,
-  bchSchnorrVerify,
+  hash160,
   pushDataPrefix,
   minimalScriptNumber,
-} from './utils.js';
-import {
-  getUtxos,
-  getUtxosFromScripthash,
-  getFeeRate,
-  broadcastTx,
-  addressToScripthash,
-} from './electrum.js';
-import { DUST } from './config.js';
+} from '@bch-stealth/utils';
+
+import { bchSchnorrSign, bchSchnorrVerify } from '@bch-stealth/crypto';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 /* ========================================================================== */
@@ -42,16 +35,14 @@ export function getOutpoint(input) {
   return concat(hexToBytes(input.txid).reverse(), uint32le(input.vout));
 }
 
-/** hashPrevouts input aggregator */
-export function getAllPrevOut(inputs) {
-  const parts = [];
+export function getAllPrevOut(inputs: any) {
+  const parts: Uint8Array[] = [];
   for (const inp of inputs) parts.push(getOutpoint(inp));
   return concat(...parts);
 }
 
-/** hashSequence input aggregator */
-export function getAllSequences(inputs) {
-  const parts = [];
+export function getAllSequences(inputs: any) {
+  const parts: Uint8Array[] = [];
   for (const inp of inputs) parts.push(uint32le(inp.sequence));
   return concat(...parts);
 }
@@ -161,7 +152,7 @@ export function addTokenToScript(token, lockingScript) {
     throw new Error('token.category must be Uint8Array of 32 bytes');
   }
 
-  const prefixParts = [new Uint8Array([0xef])]; // CashTokens prefix marker
+  const prefixParts: Uint8Array[] = [new Uint8Array([0xef])]; // CashTokens prefix marker
   prefixParts.push(token.category);
 
   let bitfield = 0x00;
@@ -220,11 +211,11 @@ export function addTokenToScript(token, lockingScript) {
 
   if (hasCommitment) {
     const commitLen = commitment.length;
-    prefixParts.push(varInt(commitLen), commitment);
+    prefixParts.push(varInt(commitLen) as unknown as Uint8Array, commitment);
   }
 
   if (hasAmount) {
-    prefixParts.push(varInt(Number(token.amount)));
+    prefixParts.push(varInt(Number(token.amount)) as unknown as Uint8Array);
   }
 
   const tokenPrefix = concat(...prefixParts);
@@ -337,44 +328,54 @@ function countOutputsFromBlob(blob) {
  *  - Pre-serialized Uint8Array of outputs (without a leading count)
  *  - { raw: Uint8Array } wrapper
  */
-export function getAllOutputs(outputs) {
+export function getAllOutputs(outputs: any): Uint8Array {
+  // passthrough: already serialized (no count prefix)
   if (outputs instanceof Uint8Array) return outputs;
 
-  if (Array.isArray(outputs)) {
-    const parts = [];
-    for (const item of outputs) {
-      let v, spk;
-      if (Array.isArray(item) && item.length === 2) {
-        v = normalizeSatsBigInt(outItem[0]); // or outItem.value/satoshis/etc
-        spk = scriptToBytesLoose(item[1]);
-      } else if (item && typeof item === 'object') {
-        v = normalizeSats(
-          'value' in item
-            ? item.value
-            : 'satoshis' in item
-            ? item.satoshis
-            : 'amount' in item
-            ? item.amount
-            : 'val' in item
-            ? item.val
-            : (() => {
-                throw new Error('resolveOutputValue: output.value missing');
-              })()
-        );
-        spk = scriptToBytesLoose(item.scriptPubKey ?? item);
-      } else {
-        throw new Error('getAllOutputs: unsupported output item type');
-      }
-      parts.push(uint64le(v), varInt(spk.length), spk);
-    }
-    return concat(...parts);
-  }
-
+  // wrapper shape
   if (outputs && typeof outputs === 'object' && outputs.raw instanceof Uint8Array) {
     return outputs.raw;
   }
 
-  throw new Error('getAllOutputs: unsupported outputs shape');
+  if (!Array.isArray(outputs)) {
+    throw new Error('getAllOutputs: unsupported outputs shape');
+  }
+
+  const resolveValueBigInt = (out: any): bigint => {
+    // tuple form: [value, script]
+    if (Array.isArray(out) && out.length === 2) {
+      return normalizeSatsBigInt(out[0]);
+    }
+
+    // object form: { value | satoshis | amount | val, scriptPubKey? ... }
+    if (out && typeof out === 'object') {
+      const rawValue =
+        'value' in out ? out.value
+        : 'satoshis' in out ? out.satoshis
+        : 'amount' in out ? out.amount
+        : 'val' in out ? out.val
+        : (() => { throw new Error('getAllOutputs: output value missing'); })();
+
+      return normalizeSatsBigInt(rawValue);
+    }
+
+    throw new Error('getAllOutputs: unsupported output item type');
+  };
+
+  const resolveScript = (out: any): Uint8Array => {
+    if (Array.isArray(out) && out.length === 2) return scriptToBytesLoose(out[1]);
+    if (out && typeof out === 'object') return scriptToBytesLoose(out.scriptPubKey ?? out);
+    throw new Error('getAllOutputs: unsupported output item type');
+  };
+
+  const parts: Uint8Array[] = [];
+  for (const item of outputs) {
+    const v = resolveValueBigInt(item);
+    const spk = resolveScript(item);
+    parts.push(uint64le(v), varInt(spk.length), spk);
+  }
+
+  return concat(...parts);
 }
 
 /* ========================================================================== */
@@ -386,20 +387,20 @@ export function getAllOutputs(outputs) {
  *
  * @param {*} tx
  * @param {number} inputIndex
- * @param {Uint8Array} scriptCode     Redeem script or scriptCode for this input
- * @param {number|bigint} value       Prevout value (sats)
- * @param {number} sigHashType        Default 0x41 (ALL|FORKID)
- * @param {Uint8Array|null} prevTokenPrefix  Raw 0xef... prefix if present
+ * @param {Uint8Array} scriptCode       Redeem script or scriptCode for this input
+ * @param {number|bigint} value         Prevout value (sats)
+ * @param {number} [sigHashType=0x41]   Default 0x41 (SIGHASH_ALL | FORKID)
+ * @param {Uint8Array|null} [prevTokenPrefix] Raw 0xef... prefix if present (optional)
  */
 export function getPreimage(
-  tx,
-  inputIndex,
-  scriptCode,
-  value,
-  sigHashType = 0x41,
-  prevTokenPrefix = null
-) {
-  const parts = [];
+  tx: any,
+  inputIndex: number,
+  scriptCode: Uint8Array,
+  value: number | bigint,
+  sigHashType: number = 0x41,
+  prevTokenPrefix?: Uint8Array | null
+): Uint8Array {
+  const parts: Uint8Array[] = [];
   const normValue = normalizeSats(value);
 
   // nVersion
@@ -415,7 +416,7 @@ export function getPreimage(
   parts.push(getOutpoint(tx.inputs[inputIndex]));
 
   // previous output token contents (if present)
-  if (prevTokenPrefix && prevTokenPrefix.length) {
+  if (prevTokenPrefix && prevTokenPrefix.length > 0) {
     parts.push(prevTokenPrefix);
   }
 
@@ -605,80 +606,6 @@ export function signCovenantInput(
   return tx;
 }
 
-/* ========================================================================== */
-/* UTXO consolidation (ensures single vout=0 UTXO when needed)                */
-/* ========================================================================== */
-/**
- * Consolidate all UTXOs for `address` into a single UTXO at vout=0.
- * If `optional` is true and there are no UTXOs, returns null instead of throwing.
- */
-export async function consolidateUtxos(address, privBytes, network, optional = false) {
-  console.log('Starting consolidation check for address:', address, '(optional:', optional, ')');
-
-  const scripthash = addressToScripthash(address);
-  const utxos = await getUtxos(address, network);
-  console.log('UTXO details:', utxos);
-
-  if (utxos.length === 1 && utxos[0].vout === 0) {
-    console.log('No consolidation needed (single vout=0 UTXO)');
-    return { txid: utxos[0].txid, vout: utxos[0].vout, value: utxos[0].value };
-  }
-  if (utxos.length === 0) {
-    if (optional) return null;
-    throw new Error('No UTXOs found for consolidation');
-  }
-
-  console.log('Consolidating to vout=0 for valid token genesis');
-
-  const rate = await getFeeRate();
-  const estSize = estimateTxSize(utxos.length, 1);
-  const fee = Math.ceil(estSize * rate);
-  const total = utxos.reduce((a, u) => a + u.value, 0);
-  if (total - fee < DUST) throw new Error('Insufficient funds for consolidation fee');
-
-  const pub33 = secp256k1.getPublicKey(privBytes, true);
-  const destScript = getP2PKHScript(_hash160(pub33));
-
-  const tx = {
-    version: 1,
-    inputs: utxos.map((u) => ({
-      txid: u.txid,
-      vout: u.vout,
-      sequence: 0xffffffff,
-      scriptSig: new Uint8Array(),
-    })),
-    outputs: [{ value: total - fee, scriptPubKey: destScript }],
-    locktime: 0,
-  };
-
-  for (let i = 0; i < tx.inputs.length; i++) {
-    signInput(tx, i, privBytes, destScript, utxos[i].value);
-  }
-
-  const txHex = buildRawTx(tx);
-  const newTxid = await broadcastTx(txHex, network);
-  console.log('Consolidation TX broadcasted:', newTxid);
-
-  // Poll for the new UTXO (0-conf accepted on BCH)
-  let consolidatedUtxo;
-  for (let attempt = 0; attempt < 30; attempt++) {
-    const polledUtxos = await getUtxosFromScripthash(scripthash, network);
-    console.log('Polled UTXOs:', polledUtxos);
-    consolidatedUtxo = polledUtxos.find((u) => u.txid === newTxid && u.vout === 0);
-    if (consolidatedUtxo && consolidatedUtxo.height >= 0) {
-      console.log('✅ Consolidated UTXO found (0-conf accepted):', consolidatedUtxo);
-      break;
-    }
-    const delayMs = Math.pow(2, attempt) * 2000;
-    console.log(`Waiting for consolidated UTXO (attempt ${attempt + 1}/30). Delaying ${Math.floor(delayMs / 1000)}s...`);
-    // eslint-disable-next-line no-await-in-loop
-    await new Promise((r) => setTimeout(r, delayMs));
-  }
-
-  if (!consolidatedUtxo) throw new Error('Consolidation failed after max attempts');
-  return { txid: consolidatedUtxo.txid, vout: consolidatedUtxo.vout, value: consolidatedUtxo.value };
-}
-
 function normalizeSatsBigInt(v) {
   if (typeof v === 'bigint') return v;
   if (typeof v === 'number') return BigInt(v);
@@ -687,7 +614,7 @@ function normalizeSatsBigInt(v) {
   throw new Error('normalizeSatsBigInt: unsupported value type for satoshis');
 }
 
-export function buildRawTxBytes(tx) {
+export function buildRawTxBytes(tx: any, opts: any = {}) {
   const inputsArr = tx.inputs ?? [];
 
   // ---- inputs ----

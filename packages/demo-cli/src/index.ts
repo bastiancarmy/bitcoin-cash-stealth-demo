@@ -39,25 +39,25 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import fsSync from 'node:fs';
 
-import { bytesToHex, hexToBytes, concat } from '@bch/utils';
+import { bytesToHex, hexToBytes, concat } from '@bch-stealth/utils';
 
 import {
   sha256,
-  _hash160,
+  hash160,
   ensureEvenYPriv,
   reverseBytes,
   uint32le,
-} from './utils.js';
+} from '@bch-stealth/utils';
 
 import {
   RPA_MODE_STEALTH_P2PKH,
   deriveRpaLockIntent,
   deriveRpaOneTimePrivReceiver,
-} from '@bch/rpa';
+} from '@bch-stealth/rpa';
 
-import * as Electrum from '@bch/electrum';
-import * as TxBuilder from '@bch/tx-builder';
-import * as PoolHashFold from '@bch/pool-hash-fold';
+import * as Electrum from '@bch-stealth/electrum';
+import * as TxBuilder from '@bch-stealth/tx-builder';
+import * as PoolHashFold from '@bch-stealth/pool-hash-fold';
 
 import { NETWORK, DUST } from './config.js';
 import { getWallets } from './wallets.js';
@@ -232,7 +232,7 @@ function reverseHex32(txidHex: string): string {
 
 function pubkeyHashFromPriv(privBytes: Uint8Array): { pub: Uint8Array; h160: Uint8Array } {
   const pub = secp256k1.getPublicKey(privBytes, true);
-  const h160 = _hash160(pub);
+  const h160 = hash160(pub);
   return { pub, h160 };
 }
 
