@@ -1,5 +1,5 @@
 // src/pool_hash_fold_script.js
-import { bytesToHex } from './utils.js';
+import { bytesToHex } from '@bch-stealth/utils';
 import { loadCasm } from './casm_loader.js';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';

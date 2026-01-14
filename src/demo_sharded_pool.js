@@ -50,7 +50,7 @@ import {
   concat,
   reverseBytes,
   uint32le,
-} from '@bch/utils';
+} @bch-stealth/utils
 
 import {
   broadcastTx,
@@ -60,15 +60,15 @@ import {
   getFeeRate,
   consolidateUtxos,
   parseTx,
-} from '@bch/electrum';
+} from '@bch-stealth/electrum';
 
-import { buildRawTx, signInput, addTokenToScript } from '@bch/tx-builder';
+import { buildRawTx, signInput, addTokenToScript } from '@bch-stealth/tx-builder';
 
 import {
   RPA_MODE_STEALTH_P2PKH,
   deriveRpaLockIntent,
   deriveRpaOneTimePrivReceiver,
-} from '@bch/rpa';
+} from '@bch-stealth/rpa';
 
 import {
   POOL_HASH_FOLD_VERSION,
@@ -77,7 +77,7 @@ import {
   // NOTE: these must exist in your pool-hash-fold package; if names differ, update imports.
   buildPoolHashFoldUnlockingBytecode,
   makeProofBlobV11,
-} from '@bch/pool-hash-fold';
+} from '@bch-stealth/pool-hash-fold';
 
 import { NETWORK, DUST } from './config.js';
 import { getWallets } from './wallets.js';
