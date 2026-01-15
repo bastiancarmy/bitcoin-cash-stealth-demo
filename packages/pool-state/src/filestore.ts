@@ -1,9 +1,9 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
-import type { DemoStateFile, DemoStateStore } from './types.js';
+import type { PoolStateFile, PoolStateStore } from './types.js';
 import { getPath, setPath, deletePath } from './keys.js';
 
-const DEFAULT_FILE: DemoStateFile = {
+const DEFAULT_FILE: PoolStateFile = {
   schemaVersion: 1,
   updatedAt: new Date(0).toISOString(),
   data: {},
@@ -13,9 +13,9 @@ export type FileBackedStoreOptions = {
   filename: string;
 };
 
-export class FileBackedDemoStateStore implements DemoStateStore {
+export class FileBackedPoolStateStore implements PoolStateStore {
   private filename: string;
-  private file: DemoStateFile = structuredClone(DEFAULT_FILE);
+  private file: PoolStateFile = structuredClone(DEFAULT_FILE);
   private loaded = false;
 
   constructor(opts: FileBackedStoreOptions) {
@@ -27,7 +27,7 @@ export class FileBackedDemoStateStore implements DemoStateStore {
 
     try {
       const raw = await fs.readFile(this.filename, 'utf8');
-      const parsed = JSON.parse(raw) as DemoStateFile;
+      const parsed = JSON.parse(raw) as PoolStateFile;
 
       if (parsed.schemaVersion !== 1) {
         throw new Error(`Unsupported schemaVersion: ${String((parsed as any).schemaVersion)}`);

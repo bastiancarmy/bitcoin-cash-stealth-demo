@@ -1,12 +1,12 @@
-export type DemoStateSchemaVersion = 1;
+export type PoolStateSchemaVersion = 1;
 
-export type DemoStateFile = {
-  schemaVersion: DemoStateSchemaVersion;
+export type PoolStateFile = {
+  schemaVersion: PoolStateSchemaVersion;
   updatedAt: string; // ISO
   data: Record<string, unknown>;
 };
 
-export interface DemoStateStore {
+export interface PoolStateStore {
   load(): Promise<void>;
   flush(): Promise<void>;
 

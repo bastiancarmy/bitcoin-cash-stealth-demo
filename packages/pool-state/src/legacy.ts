@@ -1,6 +1,6 @@
 // demo-state/src/legacy.ts
 import { promises as fs } from 'node:fs';
-import type { DemoStateStore } from './types.js';
+import type { PoolStateStore } from './types.js';
 
 type LegacyShard = {
   index?: number;
@@ -31,11 +31,11 @@ function normalizePoolVersion(v: string): 'v1' | 'v1.1' {
 }
 
 /**
- * Import legacy sharded_pool_state.json into the new DemoStateStore.
+ * Import legacy sharded_pool_state.json into the new PoolStateStore.
  * Safe to call multiple times: only imports if pool.state is missing.
  */
 export async function importLegacyShardedPoolState(opts: {
-  store: DemoStateStore;
+  store: PoolStateStore;
   legacyFilename: string;
 }): Promise<{ imported: boolean }> {
   const { store, legacyFilename } = opts;
