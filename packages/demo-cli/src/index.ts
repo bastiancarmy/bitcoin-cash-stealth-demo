@@ -39,6 +39,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import fsSync from 'node:fs';
 
+import { FileBackedDemoStateStore } from '@bch-stealth/demo-state';
 import { bytesToHex, hexToBytes, concat } from '@bch-stealth/utils';
 
 import {
@@ -178,6 +179,20 @@ const ACTOR_B = { id: 'actor_b', label: 'Actor B' };
 // Repo root & state file
 // -------------------------------------------------------------------------------------
 
+const SHARD_VALUE = 2_000n;
+const DEFAULT_FEE = 2_000n;
+
+const REPO_ROOT = findRepoRoot();
+
+// writable scratch state (NEW)
+const STORE_FILE = path.join(REPO_ROOT, '.demo-state', 'state.json');
+
+// read-only fixture (KEEP, do not write)
+const FIXTURE_FILE = path.join(REPO_ROOT, 'packages', 'demo-state', 'sharded_pool_state.json');
+
+// where we store the demo state blob inside demo-state store
+const STORE_KEY = 'demo.shardedPool'; 
+
 function emptyDemoState(): DemoState {
   return {
     network: NETWORK,
@@ -199,11 +214,24 @@ function findRepoRoot(startDir = process.cwd()): string {
   }
 }
 
-const REPO_ROOT = findRepoRoot();
-const STATE_FILE = path.join(REPO_ROOT, 'demo_state', 'sharded_pool_state.json');
+// Store factory reads program option (override) when available
+function makeStore(): FileBackedDemoStateStore {
+  // NOTE: commander options are available after program is defined; this is called inside handlers.
+  const filename = (program?.opts?.()?.stateFile as string | undefined) ?? STORE_FILE;
+  return new FileBackedDemoStateStore({ filename });
+}
 
-const SHARD_VALUE = 2_000n;
-const DEFAULT_FEE = 2_000n;
+async function readState(store: FileBackedDemoStateStore): Promise<DemoState | null> {
+  await store.load();
+  const st = store.get<DemoState>(STORE_KEY);
+  return st ? ensureStateDefaults(st) : null;
+}
+
+async function writeState(store: FileBackedDemoStateStore, state: DemoState): Promise<void> {
+  await store.load();
+  store.set(STORE_KEY, ensureStateDefaults(state));
+  await store.flush();
+}
 
 // -------------------------------------------------------------------------------------
 // Small script helpers
@@ -290,22 +318,6 @@ function ensureStateDefaults(state?: DemoState | null): DemoState {
   st.withdrawals = Array.isArray(st.withdrawals) ? st.withdrawals : [];
 
   return st;
-}
-
-async function readState(): Promise<DemoState | null> {
-  try {
-    const raw = await fs.readFile(STATE_FILE, 'utf8');
-    const st = JSON.parse(raw) as DemoState;
-    return ensureStateDefaults(st);
-  } catch {
-    return null;
-  }
-}
-
-async function writeState(state: DemoState): Promise<void> {
-  const st = ensureStateDefaults(state);
-  await fs.mkdir(path.dirname(STATE_FILE), { recursive: true });
-  await fs.writeFile(STATE_FILE, JSON.stringify(st, null, 2), 'utf8');
 }
 
 function upsertStealthUtxo(state: DemoState, rec: StealthUtxoRecord): void {
@@ -553,20 +565,26 @@ async function finalizeAndSignInitTx({
 // State init / reuse
 // -------------------------------------------------------------------------------------
 
+// Refactored to use demo-state store (FileBackedDemoStateStore) + STORE_KEY,
+// and to avoid any legacy STATE_FILE read/write paths.
+
 async function ensurePoolState({
+  store,
   ownerWallet,
   ownerPaycodePub33,
   shardCount,
   poolVersion,
   fresh = false,
 }: {
+  store: FileBackedDemoStateStore;
   ownerWallet: WalletLike;
   ownerPaycodePub33: Uint8Array;
   shardCount: number;
   poolVersion: any;
   fresh?: boolean;
 }): Promise<DemoState> {
-  let state = ensureStateDefaults(await readState());
+  // Load existing state from the store (or start empty)
+  let state = ensureStateDefaults((await readState(store)) ?? emptyDemoState());
 
   const stateLooksValid =
     state?.network === NETWORK &&
@@ -587,7 +605,8 @@ async function ensurePoolState({
     }
 
     if (missing.length === 0) {
-      console.log(`\n[0/4] using existing shard state: ${STATE_FILE}`);
+      console.log(`\n[0/4] using existing shard state: ${(program.opts().stateFile as string) ?? STORE_FILE}`);
+      console.log(`      key: ${STORE_KEY}`);
       console.log(`      shards: ${state.shards.length}`);
       return ensureStateDefaults(state);
     }
@@ -597,9 +616,9 @@ async function ensurePoolState({
 
     const repaired = await tryRepairShardsFromWallet({ state, ownerWallet });
     if (repaired) {
-      state = repaired;
-      await writeState(state);
-      console.log(`      ✅ repaired shard pointers and updated state file.`);
+      state = ensureStateDefaults(repaired);
+      await writeState(store, state);
+      console.log(`      ✅ repaired shard pointers and updated state in store.`);
       return ensureStateDefaults(state);
     }
 
@@ -607,7 +626,13 @@ async function ensurePoolState({
   }
 
   console.log(`\n[1/4] init ${shardCount} shards...`);
-  const init = await initShardsTx({ state: null, ownerWallet, ownerPaycodePub33, shardCount, poolVersion });
+  const init = await initShardsTx({
+    state: null,
+    ownerWallet,
+    ownerPaycodePub33,
+    shardCount,
+    poolVersion,
+  });
 
   state = ensureStateDefaults({
     network: NETWORK,
@@ -618,7 +643,7 @@ async function ensurePoolState({
     createdAt: new Date().toISOString(),
   });
 
-  await writeState(state);
+  await writeState(store, state);
   return state;
 }
 
@@ -1018,7 +1043,6 @@ async function ensureDeposit({
       });
       if (unspent) {
         st.lastDeposit = existing;
-        await writeState(st);
         console.log(`[deposit] reusing existing deposit: ${existing.txid}:${existing.vout}`);
         return existing;
       }
@@ -1038,7 +1062,6 @@ async function ensureDeposit({
 
   st.lastDeposit = dep;
   upsertDeposit(st, dep);
-  await writeState(st);
 
   console.log(`[deposit] created new deposit: ${dep.txid}:${dep.vout}`);
   return dep;
@@ -1356,8 +1379,6 @@ async function ensureImport({
     createdAt: new Date().toISOString(),
   };
 
-  await writeState(st);
-
   console.log(`[import] imported deposit ${dep.txid}:${dep.vout} into shard ${shardIndex} (tx ${res.txid})`);
   return { txid: res.txid, shardIndex };
 }
@@ -1609,9 +1630,7 @@ async function ensureWithdraw({
     shardAfter,
     createdAt: new Date().toISOString(),
   };
-
-  await writeState(st);
-
+  
   console.log(`[withdraw] withdrew ${amountSats} from shard ${shardIndex} (tx ${res.txid})`);
   return res;
 }
@@ -1681,13 +1700,16 @@ const program = new Command();
 program
   .name('demo_sharded_pool')
   .description('Sharded per-user pool demo (Phase 2.5 scaffolding)')
-  .option('--pool-version <ver>', 'pool hash-fold version: v1 or v1_1', 'v1_1');
+  .option('--pool-version <ver>', 'pool hash-fold version: v1 or v1_1', 'v1_1')
+  .option('--state-file <path>', 'demo state file', STORE_FILE);
 
-program
+  program
   .command('init')
   .option('--shards <n>', 'number of shards', '8')
   .action(async (opts) => {
     assertChipnet();
+    const store = makeStore();
+
     const shardCount = Number(opts.shards);
     if (!Number.isFinite(shardCount) || shardCount < 2) throw new Error('shards must be >= 2');
 
@@ -1712,25 +1734,27 @@ program
       createdAt: new Date().toISOString(),
     });
 
-    await writeState(state);
+    await writeState(store, state);
 
     console.log(`✅ init txid: ${init.txid}`);
     console.log(`   shards: ${shardCount}`);
-    console.log(`   state saved: ${STATE_FILE}`);
+    console.log(`   state saved: ${(program.opts().stateFile as string) ?? STORE_FILE} (${STORE_KEY})`);
   });
 
-program
+  program
   .command('deposit')
   .option('--amount <sats>', 'deposit amount in sats', '120000')
   .option('--fresh', 'force a new deposit even if one exists', false)
   .action(async (opts) => {
     assertChipnet();
+    const store = makeStore();
+
     const amountSats = Number(opts.amount);
     if (!Number.isFinite(amountSats) || amountSats < Number(DUST)) {
       throw new Error(`amount must be >= dust (${DUST})`);
     }
 
-    const state = (await readState()) ?? emptyDemoState();
+    const state = (await readState(store)) ?? emptyDemoState();
     const { actorABaseWallet, actorAPaycodePub33, actorBPaycodePub33 } = await loadDemoActors();
 
     await ensureDeposit({
@@ -1743,18 +1767,22 @@ program
       fresh: !!opts.fresh,
     });
 
-    console.log(`✅ deposit step done (state saved: ${STATE_FILE})`);
+    await writeState(store, state);
+
+    console.log(`✅ deposit step done (state saved: ${(program.opts().stateFile as string) ?? STORE_FILE})`);
   });
 
-program
+  program
   .command('import')
   .option('--shard <i>', 'shard index (default: derived from deposit outpoint)', '')
   .option('--fresh', 'force a new import even if already marked imported', false)
   .option('--sweep', 'debug: sweep the deposit UTXO alone (and stop)', false)
   .action(async (opts) => {
     assertChipnet();
-    const state = (await readState()) ?? emptyDemoState();
-    if (!state?.shards?.length) throw new Error(`Run init first (state file missing).`);
+    const store = makeStore();
+
+    const state = (await readState(store)) ?? emptyDemoState();
+    if (!state?.shards?.length) throw new Error(`Run init first (state missing shards).`);
 
     const { actorBBaseWallet } = await loadDemoActors();
     const shardIndexOpt: number | null = opts.shard === '' ? null : Number(opts.shard);
@@ -1773,7 +1801,8 @@ program
       const sweepTxid = await sweepDepositDebug({ depositOutpoint: dep, receiverWallet: actorBBaseWallet });
 
       upsertDeposit(state, { ...dep, spentTxid: sweepTxid ?? 'unknown', spentAt: new Date().toISOString() });
-      await writeState(state);
+
+      await writeState(store, state);
 
       console.log('[sweep-debug] sweep done. (import skipped)');
       return;
@@ -1786,18 +1815,22 @@ program
       fresh: !!opts.fresh,
     });
 
-    console.log(`✅ import step done (state saved: ${STATE_FILE})`);
+    await writeState(store, state);
+
+    console.log(`✅ import step done (state saved: ${(program.opts().stateFile as string) ?? STORE_FILE})`);
   });
 
-program
+  program
   .command('withdraw')
   .option('--shard <i>', 'shard index', '0')
   .option('--amount <sats>', 'withdraw amount in sats', '50000')
   .option('--fresh', 'force a new withdrawal even if already recorded', false)
   .action(async (opts) => {
     assertChipnet();
-    const state = (await readState()) ?? emptyDemoState();
-    if (!state?.shards?.length) throw new Error(`Run init first (state file missing).`);
+    const store = makeStore();
+
+    const state = (await readState(store)) ?? emptyDemoState();
+    if (!state?.shards?.length) throw new Error(`Run init first (state missing shards).`);
 
     const shardIndex = Number(opts.shard);
     const amountSats = Number(opts.amount);
@@ -1815,10 +1848,12 @@ program
       fresh: !!opts.fresh,
     });
 
-    console.log(`✅ withdraw step done (state saved: ${STATE_FILE})`);
+    await writeState(store, state);
+
+    console.log(`✅ withdraw step done (state saved: ${(program.opts().stateFile as string) ?? STORE_FILE})`);
   });
 
-program
+  program
   .command('run')
   .option('--shards <n>', 'number of shards', '8')
   .option('--deposit <sats>', 'deposit amount', '120000')
@@ -1826,27 +1861,37 @@ program
   .option('--fresh', 'force a new init (creates new shards)', false)
   .action(async (opts) => {
     assertChipnet();
+    const store = makeStore();
 
     const shardCount = Number(opts.shards);
     const depositSats = Number(opts.deposit);
     const withdrawSats = Number(opts.withdraw);
 
     if (!Number.isFinite(shardCount) || shardCount < 2) throw new Error('shards must be >= 2');
-    if (!Number.isFinite(depositSats) || depositSats < Number(DUST)) throw new Error(`deposit must be >= dust (${DUST})`);
-    if (!Number.isFinite(withdrawSats) || withdrawSats < Number(DUST)) throw new Error(`withdraw must be >= dust (${DUST})`);
+    if (!Number.isFinite(depositSats) || depositSats < Number(DUST)) {
+      throw new Error(`deposit must be >= dust (${DUST})`);
+    }
+    if (!Number.isFinite(withdrawSats) || withdrawSats < Number(DUST)) {
+      throw new Error(`withdraw must be >= dust (${DUST})`);
+    }
 
     const { actorABaseWallet, actorBBaseWallet, actorAPaycodePub33, actorBPaycodePub33 } = await loadDemoActors();
 
     const poolVersion =
       program.opts().poolVersion === 'v1' ? POOL_HASH_FOLD_VERSION.V1 : POOL_HASH_FOLD_VERSION.V1_1;
 
+    // ensurePoolState returns DemoState, but your version currently reads/writes via file.
+    // We'll keep it in-memory and persist via demo-state store after each step.
     let state = await ensurePoolState({
+      store,
       ownerWallet: actorBBaseWallet,
       ownerPaycodePub33: actorBPaycodePub33,
       shardCount,
       poolVersion,
       fresh: !!opts.fresh,
     });
+
+    await writeState(store, state);
 
     console.log(`\n[2/4] deposit ${depositSats} sats (Actor A -> Actor B stealth P2PKH)...`);
     await ensureDeposit({
@@ -1858,6 +1903,7 @@ program
       amountSats: depositSats,
       fresh: false,
     });
+    await writeState(store, state);
 
     console.log(`\n[3/4] import deposit into shard (derived selection)...`);
     const imp = await ensureImport({
@@ -1866,6 +1912,7 @@ program
       shardIndexOpt: null,
       fresh: false,
     });
+    await writeState(store, state);
 
     const shardIndex = imp?.shardIndex ?? 0;
 
@@ -1880,9 +1927,10 @@ program
       receiverPaycodePub33: actorAPaycodePub33,
       fresh: false,
     });
+    await writeState(store, state);
 
     console.log('\n✅ done');
-    console.log(`state saved: ${STATE_FILE}`);
+    console.log(`state saved: ${(program.opts().stateFile as string) ?? STORE_FILE} (${STORE_KEY})`);
   });
 
 program.parseAsync(process.argv).catch((err) => {
