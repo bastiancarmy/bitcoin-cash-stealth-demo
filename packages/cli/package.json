@@ -1,5 +1,5 @@
 {
-  "name": "@bch-stealth/demo-cli",
+  "name": "@bch-stealth/cli",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,11 +12,9 @@
     }
   },
   "bin": {
-    "bch-demo": "./dist/index.js"
+    "bch-stealth": "./dist/index.js"
   },
-  "files": [
-    "dist"
-  ],
+  "files": ["dist"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
