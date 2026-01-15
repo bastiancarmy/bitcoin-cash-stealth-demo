@@ -36,4 +36,5 @@ coverage/
 .idea/
 .envrc
 wallets.local.json
-repomix-output.md
+repomix-output*
+doc/
