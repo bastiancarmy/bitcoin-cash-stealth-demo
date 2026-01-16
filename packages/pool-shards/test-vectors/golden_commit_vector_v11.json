@@ -1,0 +1,18 @@
+{
+  "name": "golden_commitment_v11_vector_0",
+  "version": "V1_1",
+  "categoryMode": "reverse",
+  "capByte": "0x01",
+  "stateIn32Hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "category32Hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "noteHash32Hex": "2222222222222222222222222222222222222222222222222222222222222222",
+  "limbsHex": ["03", "040506"],
+  "expectedStateOut32Hex": "b60155126395a5d0be7027338327b0f9ce1cd8dab2fb99803141b61f99fdda59",
+  "shardSelection": {
+    "txidHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "vout": 5,
+    "shardCount": 8,
+    "expectedOutpointHash32Hex": "cef6f2b2d3e0d887874c3c35d17c6c7cf8306e6fc62fa20f94ce783d2a7d1a74",
+    "expectedShardIndex": 6
+  }
+}

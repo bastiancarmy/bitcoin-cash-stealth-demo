@@ -50,7 +50,7 @@ import {
   concat,
   reverseBytes,
   uint32le,
-} @bch-stealth/utils
+} from '@bch-stealth/utils';
 
 import {
   broadcastTx,

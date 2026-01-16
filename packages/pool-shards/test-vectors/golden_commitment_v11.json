@@ -1,0 +1,24 @@
+{
+  "name": "golden_commitment_v11_vector_0",
+  "version": "V1_1",
+  "categoryMode": "none",
+  "capByte": "0x01",
+  "stateIn32Hex": "0101010101010101010101010101010101010101010101010101010101010101",
+  "category32Hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "depositOutpoint": {
+    "txidHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "vout": 5
+  },
+  "noteHash32Hex": "cef6f2b2d3e0d887874c3c35d17c6c7cf8306e6fc62fa20f94ce783d2a7d1a74",
+  "limbsHex": [
+    "cef6f2b2d3e0d887874c3c35d17c6c7cf8306e6fc62fa20f94ce783d2a7d1a74"
+  ],
+  "expectedStateOut32Hex": "a04d867f138fc0960a631db95a71593f49f864202460bf0dae84fd6738bc2546",
+  "shardSelection": {
+    "txidHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "vout": 5,
+    "shardCount": 8,
+    "expectedOutpointHash32Hex": "cef6f2b2d3e0d887874c3c35d17c6c7cf8306e6fc62fa20f94ce783d2a7d1a74",
+    "expectedShardIndex": 6
+  }
+}
