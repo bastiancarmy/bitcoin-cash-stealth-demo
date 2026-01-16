@@ -14,7 +14,9 @@
   "bin": {
     "bch-stealth": "./dist/index.js"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",

@@ -107,7 +107,7 @@ function findRepoRoot(startDir = process.cwd()) {
 }
 
 const REPO_ROOT = findRepoRoot();
-const STATE_FILE = path.join(REPO_ROOT, 'demo_state', 'sharded_pool_state.json');
+const STATE_FILE = path.join(REPO_ROOT, '.bch-stealth', 'sharded_pool_state.json');
 
 // Conservative defaults for chipnet demos.
 const SHARD_VALUE = 2_000n;

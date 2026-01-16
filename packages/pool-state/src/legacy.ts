@@ -1,4 +1,4 @@
-// demo-state/src/legacy.ts
+// pool-state/src/legacy.ts
 import { promises as fs } from 'node:fs';
 import type { PoolStateStore } from './types.js';
 
@@ -50,7 +50,7 @@ export async function importLegacyShardedPoolState(opts: {
     poolIdHex: (legacy as any).poolIdHex ?? 'unknown', // if present in other variants
     poolVersion: normalizePoolVersion(String(legacy.poolVersion)),
     shardCount: legacy.shards.length,
-    network: legacy.network === 'chipnet' ? 'chipnet' : 'chipnet', // demo default
+    network: legacy.network === 'chipnet' ? 'chipnet' : 'chipnet', // default
     categoryHex: legacy.categoryHex,
     redeemScriptHex: legacy.redeemScriptHex,
     shards: legacy.shards.map((s, i) => ({

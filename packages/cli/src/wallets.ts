@@ -21,7 +21,8 @@ export type Wallet = {
 
 type WalletPrivFile = { alicePriv: string; bobPriv: string };
 
-function findRepoRoot(startDir = process.cwd()): string {
+// Exported so index.ts can reuse it without duplicating logic.
+export function findRepoRoot(startDir = process.cwd()): string {
   let dir = startDir;
   while (true) {
     const pkg = path.join(dir, 'package.json');
@@ -34,14 +35,30 @@ function findRepoRoot(startDir = process.cwd()): string {
 }
 
 const REPO_ROOT = findRepoRoot();
-const WALLET_FILE = path.join(REPO_ROOT, 'demo_state', 'wallets.local.json');
+
+const STATE_DIR = path.join(REPO_ROOT, '.bch-stealth');
+const WALLET_FILE = path.join(STATE_DIR, 'wallets.local.json');
+
+// legacy location
+const LEGACY_WALLET_FILE = path.join(REPO_ROOT, 'demo_state', 'wallets.local.json');
+
+function migrateWalletFileSync(): void {
+  if (fs.existsSync(WALLET_FILE)) return;
+  if (!fs.existsSync(LEGACY_WALLET_FILE)) return;
+
+  fs.mkdirSync(path.dirname(WALLET_FILE), { recursive: true });
+  fs.renameSync(LEGACY_WALLET_FILE, WALLET_FILE);
+}
 
 function walletFileExists(): boolean {
+  migrateWalletFileSync();
   return fs.existsSync(WALLET_FILE);
 }
 
 function loadLocalWalletPrivs(): WalletPrivFile | null {
   try {
+    migrateWalletFileSync();
+
     if (!fs.existsSync(WALLET_FILE)) return null;
     const raw = fs.readFileSync(WALLET_FILE, 'utf8');
     const parsed: unknown = JSON.parse(raw);
@@ -63,6 +80,8 @@ function loadLocalWalletPrivs(): WalletPrivFile | null {
 }
 
 function saveLocalWalletPrivs(alicePriv: string, bobPriv: string): void {
+  migrateWalletFileSync();
+
   fs.mkdirSync(path.dirname(WALLET_FILE), { recursive: true });
   const data: WalletPrivFile = { alicePriv, bobPriv };
   fs.writeFileSync(WALLET_FILE, JSON.stringify(data, null, 2), { mode: 0o600 });

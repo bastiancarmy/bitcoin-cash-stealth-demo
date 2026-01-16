@@ -9,5 +9,5 @@ export * from './script.js';
 // from the root so consumers don't need path hacks.
 export { encodeCashAddr, decodeCashAddress } from './cashaddr.js';
 
-// Key normalization helpers used by demo-cli
+// Key normalization helpers used by cli
 export { ensureEvenYPriv, getXOnlyPub } from './secp.js';

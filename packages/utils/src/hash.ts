@@ -10,5 +10,5 @@ export function hash160(x: Uint8Array): Uint8Array {
   return _ripemd160(_sha256(x));
 }
 
-// Back-compat alias for older callsites (demo-cli currently imports `_hash160`)
+// Back-compat alias for older callsites (cli currently imports `_hash160`)
 export const _hash160 = hash160;

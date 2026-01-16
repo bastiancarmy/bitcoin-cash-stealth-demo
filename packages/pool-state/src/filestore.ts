@@ -14,7 +14,7 @@ export type FileBackedStoreOptions = {
 };
 
 export class FileBackedPoolStateStore implements PoolStateStore {
-  private filename: string;
+  public readonly filename: string; // <-- changed (was private)
   private file: PoolStateFile = structuredClone(DEFAULT_FILE);
   private loaded = false;
 
