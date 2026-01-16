@@ -1,3 +1,5 @@
+// packages/pool-shards/src/withdraw.ts
+
 import {
   buildRawTx,
   signInput,
@@ -18,7 +20,14 @@ import {
 
 import { computePoolStateOut, buildPoolHashFoldUnlockingBytecode } from '@bch-stealth/pool-hash-fold';
 
-import type { PoolState, PrevoutLike, WalletLike, WithdrawResult, CategoryMode } from './types.js';
+import type {
+  PoolState,
+  PrevoutLike,
+  WalletLike,
+  WithdrawResult,
+  CategoryMode,
+  WithdrawDiagnostics,
+} from './types.js';
 
 function ensureBytesLen(u8: Uint8Array, n: number, label: string) {
   if (!(u8 instanceof Uint8Array) || u8.length !== n) throw new Error(`${label} must be ${n} bytes`);
@@ -86,7 +95,7 @@ export function withdrawFromShard(args: {
   const changeValue = feePrevout.valueSats - fee;
   if (changeValue < DUST_SATS) throw new Error('withdrawFromShard: fee prevout too small after fee');
 
-  // placeholder “nullifier-ish” update (deterministic, no electrum required)
+  // deterministic “nullifier-ish” update (no electrum required)
   const nullifier32 = sha256(
     concat(
       stateIn32,
@@ -98,13 +107,15 @@ export function withdrawFromShard(args: {
   const limbs: Uint8Array[] = [];
   const proofBlob32 = sha256(concat(nullifier32, Uint8Array.of(0x02)));
 
+  const effectiveCategoryMode = categoryMode ?? DEFAULT_CATEGORY_MODE;
+
   const stateOut32 = computePoolStateOut({
     version: DEFAULT_POOL_HASH_FOLD_VERSION,
     stateIn32,
     category32,
     noteHash32: nullifier32,
     limbs,
-    categoryMode: categoryMode ?? DEFAULT_CATEGORY_MODE,
+    categoryMode: effectiveCategoryMode,
     capByte: DEFAULT_CAP_BYTE,
   });
 
@@ -130,7 +141,7 @@ export function withdrawFromShard(args: {
     locktime: 0,
     inputs: [
       { txid: shardPrevout.txid, vout: shardPrevout.vout, sequence: 0xffffffff }, // covenant
-      { txid: feePrevout.txid, vout: feePrevout.vout, sequence: 0xffffffff },    // fee P2PKH
+      { txid: feePrevout.txid, vout: feePrevout.vout, sequence: 0xffffffff }, // fee P2PKH
     ],
     outputs: [
       { value: asBigInt(shard.valueSats, 'shard.valueSats'), scriptPubKey: shardOutSpk },
@@ -139,14 +150,14 @@ export function withdrawFromShard(args: {
     ],
   };
 
-  // covenant spend (needs amountCommitment arg)
+  // covenant spend
   signCovenantInput(
     tx,
     0,
     senderWallet.signPrivBytes,
     redeemScript,
-    shardPrevout.scriptPubKey ?? p2shSpk,
     shardPrevout.valueSats,
+    shardPrevout.scriptPubKey ?? p2shSpk,
     amountCommitment ?? 0n,
   );
 
@@ -159,6 +170,7 @@ export function withdrawFromShard(args: {
 
   const rawAny = buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
+  const sizeBytes = rawTx.length;
 
   const nextPoolState: PoolState = structuredClone(pool) as PoolState;
   nextPoolState.shards[shardIndex] = {
@@ -168,5 +180,23 @@ export function withdrawFromShard(args: {
     commitmentHex: bytesToHex(stateOut32),
   };
 
-  return { tx, rawTx, nextPoolState };
+  const diagnostics: WithdrawDiagnostics = {
+    shardIndex,
+    receiverHash160Hex: receiverP2pkhHash160Hex,
+    amountSats: payment.toString(),
+    feeSats: fee.toString(),
+    changeSats: changeValue.toString(),
+    category32Hex: bytesToHex(category32),
+    stateIn32Hex: bytesToHex(stateIn32),
+    stateOut32Hex: bytesToHex(stateOut32),
+    noteHash32Hex: bytesToHex(nullifier32),
+    limbsHex: limbs.map(bytesToHex),
+    policy: {
+      poolHashFoldVersion: 'V1_1',
+      categoryMode: effectiveCategoryMode,
+      capByte: DEFAULT_CAP_BYTE,
+    },
+  };
+
+  return { tx, rawTx, sizeBytes, diagnostics, nextPoolState };
 }

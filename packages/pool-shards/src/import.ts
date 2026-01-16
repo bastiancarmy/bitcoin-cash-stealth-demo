@@ -1,3 +1,5 @@
+// packages/pool-shards/src/import.ts
+
 import {
   buildRawTx,
   signInput,
@@ -22,7 +24,14 @@ import {
   makeProofBlobV11,
 } from '@bch-stealth/pool-hash-fold';
 
-import type { ImportDepositResult, PoolState, PrevoutLike, WalletLike, CategoryMode } from './types.js';
+import type {
+  ImportDepositResult,
+  PoolState,
+  PrevoutLike,
+  WalletLike,
+  CategoryMode,
+  ImportDepositDiagnostics,
+} from './types.js';
 
 function ensureBytesLen(u8: Uint8Array, n: number, label: string) {
   if (!(u8 instanceof Uint8Array) || u8.length !== n) throw new Error(`${label} must be ${n} bytes`);
@@ -81,12 +90,14 @@ export function importDepositToShard(args: {
     throw new Error(`importDepositToShard: deposit too small after fee; got ${changeValue.toString()} sats`);
   }
 
-  // noteHash = outpointHash32(deposit outpoint)  // txid as-is
+  // noteHash = outpointHash32(deposit outpoint)
   const noteHash32 = outpointHash32(depositPrevout.txid, depositPrevout.vout);
   const proofBlob32 = makeProofBlobV11(noteHash32);
 
   // demo convention: limbs = [noteHash32]
   const limbs: Uint8Array[] = [noteHash32];
+
+  const effectiveCategoryMode = categoryMode ?? DEFAULT_CATEGORY_MODE;
 
   const stateOut32 = computePoolStateOut({
     version: DEFAULT_POOL_HASH_FOLD_VERSION,
@@ -94,7 +105,7 @@ export function importDepositToShard(args: {
     category32,
     noteHash32,
     limbs,
-    categoryMode: categoryMode ?? DEFAULT_CATEGORY_MODE,
+    categoryMode: effectiveCategoryMode,
     capByte: DEFAULT_CAP_BYTE,
   });
 
@@ -105,7 +116,7 @@ export function importDepositToShard(args: {
     proofBlob32,
   });
 
-  // shard output locking script: token  P2SH(redeemScript)
+  // shard output locking script: token + P2SH(redeemScript)
   const p2shSpk = getP2SHScript(hash160(redeemScript));
   const tokenOut = {
     category: category32,
@@ -117,23 +128,26 @@ export function importDepositToShard(args: {
     version: 2,
     locktime: 0,
     inputs: [
-      { txid: shardPrevout.txid, vout: shardPrevout.vout, sequence: 0xffffffff },        // covenant
-      { txid: depositPrevout.txid, vout: depositPrevout.vout, sequence: 0xffffffff },    // deposit P2PKH
+      { txid: shardPrevout.txid, vout: shardPrevout.vout, sequence: 0xffffffff }, // covenant
+      { txid: depositPrevout.txid, vout: depositPrevout.vout, sequence: 0xffffffff }, // deposit P2PKH
     ],
     outputs: [
-      { value: asBigInt(pool.shards[shardIndex].valueSats, 'shard.valueSats'), scriptPubKey: shardOutSpk },
+      { value: asBigInt(shard.valueSats, 'shard.valueSats'), scriptPubKey: shardOutSpk },
       { value: changeValue, scriptPubKey: depositPrevout.scriptPubKey },
     ],
   };
 
-  // covenant unlocking: prefix  covenant pushes
-  // NOTE: tx-builder signCovenantInput expects amountCommitment argument.
-   signCovenantInput(
-       tx, 0, ownerWallet.signPrivBytes, redeemScript,
-       shardPrevout.valueSats,
-       shardPrevout.scriptPubKey ?? p2shSpk,
-       amountCommitment ?? 0n
-     );
+  // covenant unlocking: prefix + covenant pushes
+  // signCovenantInput(tx, idx, priv, redeem, value, rawPrevScript, amount, [hashtype])
+  signCovenantInput(
+    tx,
+    0,
+    ownerWallet.signPrivBytes,
+    redeemScript,
+    shardPrevout.valueSats,
+    shardPrevout.scriptPubKey ?? p2shSpk,
+    amountCommitment ?? 0n,
+  );
 
   // prepend pool-hash-fold unlock prefix to the covenant scriptSig
   const base = hexToBytes(tx.inputs[0].scriptSig);
@@ -144,6 +158,7 @@ export function importDepositToShard(args: {
 
   const rawAny = buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
+  const sizeBytes = rawTx.length;
 
   const nextPoolState: PoolState = structuredClone(pool) as PoolState;
   nextPoolState.shards[shardIndex] = {
@@ -153,5 +168,22 @@ export function importDepositToShard(args: {
     commitmentHex: bytesToHex(stateOut32),
   };
 
-  return { tx, rawTx, nextPoolState };
+  const diagnostics: ImportDepositDiagnostics = {
+    shardIndex,
+    depositOutpoint: { txid: depositPrevout.txid, vout: depositPrevout.vout },
+    category32Hex: bytesToHex(category32),
+    stateIn32Hex: bytesToHex(stateIn32),
+    stateOut32Hex: bytesToHex(stateOut32),
+    noteHash32Hex: bytesToHex(noteHash32),
+    limbsHex: limbs.map(bytesToHex),
+    feeSats: fee.toString(),
+    changeSats: changeValue.toString(),
+    policy: {
+      poolHashFoldVersion: 'V1_1',
+      categoryMode: effectiveCategoryMode,
+      capByte: DEFAULT_CAP_BYTE,
+    },
+  };
+
+  return { tx, rawTx, sizeBytes, diagnostics, nextPoolState };
 }

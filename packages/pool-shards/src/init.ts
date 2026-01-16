@@ -1,3 +1,5 @@
+// packages/pool-shards/src/init.ts
+
 import {
   buildRawTx,
   signInput,
@@ -15,7 +17,14 @@ import {
   initialShardCommitment32,
 } from './policy.js';
 
-import type { InitShardsResult, PoolConfig, WalletLike, PoolState, PrevoutLike } from './types.js';
+import type {
+  InitShardsResult,
+  PoolConfig,
+  WalletLike,
+  PoolState,
+  PrevoutLike,
+  InitShardsDiagnostics,
+} from './types.js';
 
 function asBigInt(v: number | string | bigint, label: string): bigint {
   if (typeof v === 'bigint') return v;
@@ -30,8 +39,6 @@ function ensureBytesLen(u8: Uint8Array, n: number, label: string) {
 
 function normalizeRawTxBytes(raw: string | Uint8Array): Uint8Array {
   if (raw instanceof Uint8Array) return raw;
-  // buildRawTx normally returns hex if not bytes; but we always request bytes.
-  // Still handle union defensively.
   return hexToBytes(raw);
 }
 
@@ -66,6 +73,7 @@ export function initShardsTx(args: {
   const outputs: any[] = [{ value: 0n, scriptPubKey: changeSpk }];
 
   const shards: PoolState['shards'] = [];
+  const shardCommitmentsHex: string[] = [];
 
   for (let i = 0; i < shardCount; i++) {
     const commitment32 = initialShardCommitment32({
@@ -83,12 +91,15 @@ export function initShardsTx(args: {
     const shardSpk = addTokenToScript(tokenOut, p2shSpk);
     outputs.push({ value: shardValue, scriptPubKey: shardSpk });
 
+    const commitmentHex = bytesToHex(commitment32);
+    shardCommitmentsHex.push(commitmentHex);
+
     shards.push({
       index: i,
       txid: '<pending>',
       vout: i + 1,
       valueSats: shardValue.toString(),
-      commitmentHex: bytesToHex(commitment32),
+      commitmentHex,
     });
   }
 
@@ -112,6 +123,7 @@ export function initShardsTx(args: {
 
   const rawAny = buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
+  const sizeBytes = rawTx.length;
 
   const poolState: PoolState = {
     poolIdHex: cfg.poolIdHex,
@@ -123,5 +135,29 @@ export function initShardsTx(args: {
     shards,
   };
 
-  return { tx, rawTx, poolState };
+  const diagnostics: InitShardsDiagnostics = {
+    fundingOutpoint: { txid: funding.txid, vout: funding.vout },
+    category32Hex: categoryHex,
+    poolIdHex: cfg.poolIdHex,
+    poolVersion: cfg.poolVersion,
+    shardCount,
+    shardValueSats: shardValue.toString(),
+    feeSats: fee.toString(),
+    changeSats: changeValue.toString(),
+    redeemScriptHex,
+    shardCommitmentsHex,
+    policy: {
+      categoryDerivation: 'fundingTxid',
+      initialCommitment: 'H(H(poolId||category32||i||shardCount))',
+    },
+  };
+
+  return {
+    tx,
+    rawTx,
+    sizeBytes,
+    diagnostics,
+    poolState, // back-compat
+    nextPoolState: poolState,
+  };
 }
