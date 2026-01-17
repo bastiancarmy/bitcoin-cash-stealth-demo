@@ -1,21 +1,10 @@
 // packages/pool-shards/src/init.ts
+import type { BuilderDeps } from './di.js';
 
-import {
-  buildRawTx,
-  signInput,
-  addTokenToScript,
-  getP2PKHScript,
-  getP2SHScript,
-  getBobRedeemScript,
-} from '@bch-stealth/tx-builder';
-
+import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
 
-import {
-  DUST_SATS,
-  deriveCategory32FromFundingTxidHex,
-  initialShardCommitment32,
-} from './policy.js';
+import { DUST_SATS, deriveCategory32FromFundingTxidHex, initialShardCommitment32 } from './policy.js';
 
 import type {
   InitShardsResult,
@@ -47,8 +36,10 @@ export function initShardsTx(args: {
   shardCount: number;
   funding: PrevoutLike;
   ownerWallet: WalletLike;
+  deps?: BuilderDeps;
 }): InitShardsResult {
-  const { cfg, shardCount, funding, ownerWallet } = args;
+  const { cfg, shardCount, funding, ownerWallet, deps } = args;
+  const txb = deps?.txb ?? txbDefault;
 
   if (!Number.isInteger(shardCount) || shardCount <= 0) {
     throw new Error('initShardsTx: shardCount must be a positive integer');
@@ -63,11 +54,17 @@ export function initShardsTx(args: {
   const category32 = deriveCategory32FromFundingTxidHex(funding.txid);
   const categoryHex = bytesToHex(category32);
 
-  const redeemScript = getBobRedeemScript(poolId);
+  // Prefer explicit redeemScript from config; fallback to injected factory; final fallback to legacy tx-builder helper.
+  const redeemScript =
+    cfg.redeemScriptHex
+      ? hexToBytes(cfg.redeemScriptHex)
+      : deps?.redeemScriptFactory
+        ? deps.redeemScriptFactory(poolId)
+        : txb.getBobRedeemScript(poolId); // legacy fallback for now
   const redeemScriptHex = bytesToHex(redeemScript);
 
-  const p2shSpk = getP2SHScript(hash160(redeemScript));
-  const changeSpk = getP2PKHScript(hexToBytes(ownerWallet.pubkeyHash160Hex));
+  const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
+  const changeSpk = txb.getP2PKHScript(hexToBytes(ownerWallet.pubkeyHash160Hex));
 
   // output[0] = change; outputs[1..] = shard anchors
   const outputs: any[] = [{ value: 0n, scriptPubKey: changeSpk }];
@@ -88,7 +85,7 @@ export function initShardsTx(args: {
       nft: { capability: 'mutable' as const, commitment: commitment32 },
     };
 
-    const shardSpk = addTokenToScript(tokenOut, p2shSpk);
+    const shardSpk = txb.addTokenToScript(tokenOut, p2shSpk);
     outputs.push({ value: shardValue, scriptPubKey: shardSpk });
 
     const commitmentHex = bytesToHex(commitment32);
@@ -119,9 +116,9 @@ export function initShardsTx(args: {
   };
 
   // funding input is P2PKH
-  signInput(tx, 0, ownerWallet.signPrivBytes, funding.scriptPubKey, funding.valueSats);
+  txb.signInput(tx, 0, ownerWallet.signPrivBytes, funding.scriptPubKey, funding.valueSats);
 
-  const rawAny = buildRawTx(tx, { format: 'bytes' });
+  const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
   const sizeBytes = rawTx.length;
 

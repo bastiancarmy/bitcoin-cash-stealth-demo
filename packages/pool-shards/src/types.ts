@@ -2,12 +2,14 @@
 
 export type CategoryMode = 'none' | 'reverse';
 
+// types.ts
 export type PoolConfig = {
   network: string;
-  poolIdHex: string; // 20-byte hex
+  poolIdHex: string;
   poolVersion: string;
   shardValueSats: number | string;
   defaultFeeSats: number | string;
+  redeemScriptHex?: string;
 };
 
 export type ShardPointer = {

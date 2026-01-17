@@ -1,13 +1,7 @@
 // packages/pool-shards/src/import.ts
+import type { BuilderDeps } from './di.js';
 
-import {
-  buildRawTx,
-  signInput,
-  signCovenantInput,
-  addTokenToScript,
-  getP2SHScript,
-} from '@bch-stealth/tx-builder';
-
+import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
 
 import {
@@ -62,6 +56,8 @@ export function importDepositToShard(args: {
   feeSats?: bigint | number | string;
   categoryMode?: CategoryMode;
   amountCommitment?: bigint | number;
+
+  deps?: BuilderDeps;
 }): ImportDepositResult {
   const {
     pool,
@@ -72,7 +68,10 @@ export function importDepositToShard(args: {
     feeSats,
     categoryMode,
     amountCommitment,
+    deps,
   } = args;
+
+  const txb = deps?.txb ?? txbDefault;
 
   const shard = pool.shards[shardIndex];
   if (!shard) throw new Error(`importDepositToShard: invalid shardIndex ${shardIndex}`);
@@ -117,12 +116,12 @@ export function importDepositToShard(args: {
   });
 
   // shard output locking script: token + P2SH(redeemScript)
-  const p2shSpk = getP2SHScript(hash160(redeemScript));
+  const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
   const tokenOut = {
     category: category32,
     nft: { capability: 'mutable' as const, commitment: stateOut32 },
   };
-  const shardOutSpk = addTokenToScript(tokenOut, p2shSpk);
+  const shardOutSpk = txb.addTokenToScript(tokenOut, p2shSpk);
 
   const tx: any = {
     version: 2,
@@ -137,9 +136,8 @@ export function importDepositToShard(args: {
     ],
   };
 
-  // covenant unlocking: prefix + covenant pushes
-  // signCovenantInput(tx, idx, priv, redeem, value, rawPrevScript, amount, [hashtype])
-  signCovenantInput(
+  // covenant unlocking: signCovenantInput(tx, idx, priv, redeem, value, rawPrevScript, amount, [hashtype])
+  txb.signCovenantInput(
     tx,
     0,
     ownerWallet.signPrivBytes,
@@ -154,9 +152,9 @@ export function importDepositToShard(args: {
   tx.inputs[0].scriptSig = bytesToHex(new Uint8Array([...shardUnlockPrefix, ...base]));
 
   // sign deposit spend
-  signInput(tx, 1, ownerWallet.signPrivBytes, depositPrevout.scriptPubKey, depositPrevout.valueSats);
+  txb.signInput(tx, 1, ownerWallet.signPrivBytes, depositPrevout.scriptPubKey, depositPrevout.valueSats);
 
-  const rawAny = buildRawTx(tx, { format: 'bytes' });
+  const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
   const sizeBytes = rawTx.length;
 

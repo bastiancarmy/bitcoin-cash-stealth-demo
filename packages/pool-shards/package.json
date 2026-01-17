@@ -22,8 +22,7 @@
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "pretest": "yarn build",
-    "test": "node --test ./tests/*.test.js"
+    "test": "yarn build && node --test ./tests/**/*.test.js"
   },
   "dependencies": {
     "@bch-stealth/electrum": "workspace:^",

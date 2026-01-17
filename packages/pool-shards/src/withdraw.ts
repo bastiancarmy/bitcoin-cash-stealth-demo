@@ -1,22 +1,10 @@
 // packages/pool-shards/src/withdraw.ts
+import type { BuilderDeps } from './di.js';
 
-import {
-  buildRawTx,
-  signInput,
-  signCovenantInput,
-  addTokenToScript,
-  getP2PKHScript,
-  getP2SHScript,
-} from '@bch-stealth/tx-builder';
-
+import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, concat, hexToBytes, hash160, sha256, uint32le } from '@bch-stealth/utils';
 
-import {
-  DEFAULT_CAP_BYTE,
-  DEFAULT_CATEGORY_MODE,
-  DEFAULT_POOL_HASH_FOLD_VERSION,
-  DUST_SATS,
-} from './policy.js';
+import { DEFAULT_CAP_BYTE, DEFAULT_CATEGORY_MODE, DEFAULT_POOL_HASH_FOLD_VERSION, DUST_SATS } from './policy.js';
 
 import { computePoolStateOut, buildPoolHashFoldUnlockingBytecode } from '@bch-stealth/pool-hash-fold';
 
@@ -61,6 +49,8 @@ export function withdrawFromShard(args: {
   feeSats?: bigint | number | string;
   categoryMode?: CategoryMode;
   amountCommitment?: bigint | number;
+
+  deps?: BuilderDeps;
 }): WithdrawResult {
   const {
     pool,
@@ -73,7 +63,10 @@ export function withdrawFromShard(args: {
     feeSats,
     categoryMode,
     amountCommitment,
+    deps,
   } = args;
+
+  const txb = deps?.txb ?? txbDefault;
 
   const shard = pool.shards[shardIndex];
   if (!shard) throw new Error(`withdrawFromShard: invalid shardIndex ${shardIndex}`);
@@ -126,15 +119,15 @@ export function withdrawFromShard(args: {
     proofBlob32,
   });
 
-  const p2shSpk = getP2SHScript(hash160(redeemScript));
+  const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
   const tokenOut = {
     category: category32,
     nft: { capability: 'mutable' as const, commitment: stateOut32 },
   };
-  const shardOutSpk = addTokenToScript(tokenOut, p2shSpk);
+  const shardOutSpk = txb.addTokenToScript(tokenOut, p2shSpk);
 
-  const paySpk = getP2PKHScript(receiverHash160);
-  const changeSpk = getP2PKHScript(hexToBytes(senderWallet.pubkeyHash160Hex));
+  const paySpk = txb.getP2PKHScript(receiverHash160);
+  const changeSpk = txb.getP2PKHScript(hexToBytes(senderWallet.pubkeyHash160Hex));
 
   const tx: any = {
     version: 2,
@@ -151,7 +144,7 @@ export function withdrawFromShard(args: {
   };
 
   // covenant spend
-  signCovenantInput(
+  txb.signCovenantInput(
     tx,
     0,
     senderWallet.signPrivBytes,
@@ -166,9 +159,9 @@ export function withdrawFromShard(args: {
   tx.inputs[0].scriptSig = bytesToHex(new Uint8Array([...shardUnlockPrefix, ...base]));
 
   // fee spend
-  signInput(tx, 1, senderWallet.signPrivBytes, feePrevout.scriptPubKey, feePrevout.valueSats);
+  txb.signInput(tx, 1, senderWallet.signPrivBytes, feePrevout.scriptPubKey, feePrevout.valueSats);
 
-  const rawAny = buildRawTx(tx, { format: 'bytes' });
+  const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
   const sizeBytes = rawTx.length;
 
