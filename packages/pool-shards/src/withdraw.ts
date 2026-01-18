@@ -8,14 +8,7 @@ import { DEFAULT_CAP_BYTE, DEFAULT_CATEGORY_MODE, DEFAULT_POOL_HASH_FOLD_VERSION
 
 import { computePoolStateOut, buildPoolHashFoldUnlockingBytecode } from '@bch-stealth/pool-hash-fold';
 
-import type {
-  PoolState,
-  PrevoutLike,
-  WalletLike,
-  WithdrawResult,
-  CategoryMode,
-  WithdrawDiagnostics,
-} from './types.js';
+import type { PoolState, PrevoutLike, WalletLike, WithdrawResult, CategoryMode, WithdrawDiagnostics } from './types.js';
 
 function ensureBytesLen(u8: Uint8Array, n: number, label: string) {
   if (!(u8 instanceof Uint8Array) || u8.length !== n) throw new Error(`${label} must be ${n} bytes`);
@@ -40,7 +33,8 @@ export function withdrawFromShard(args: {
   shardPrevout: PrevoutLike;
   feePrevout: PrevoutLike;
 
-  senderWallet: WalletLike;
+  covenantWallet: WalletLike;
+  feeWallet: WalletLike;
 
   receiverP2pkhHash160Hex: string;
   amountSats: bigint | number;
@@ -50,6 +44,9 @@ export function withdrawFromShard(args: {
   categoryMode?: CategoryMode;
   amountCommitment?: bigint | number;
 
+  // optional: allow stealth change (or any chosen change destination)
+  changeP2pkhHash160Hex?: string;
+
   deps?: BuilderDeps;
 }): WithdrawResult {
   const {
@@ -57,12 +54,14 @@ export function withdrawFromShard(args: {
     shardIndex,
     shardPrevout,
     feePrevout,
-    senderWallet,
+    covenantWallet,
+    feeWallet,
     receiverP2pkhHash160Hex,
     amountSats,
     feeSats,
     categoryMode,
     amountCommitment,
+    changeP2pkhHash160Hex,
     deps,
   } = args;
 
@@ -84,21 +83,21 @@ export function withdrawFromShard(args: {
   const payment = asBigInt(amountSats, 'amountSats');
   if (payment < DUST_SATS) throw new Error('withdrawFromShard: payment is dust');
 
+  const shardValueIn = asBigInt(shardPrevout.valueSats, 'shardPrevout.valueSats');
+  const newShardValue = shardValueIn - payment;
+  if (newShardValue < DUST_SATS) {
+    throw new Error(`withdrawFromShard: shard remainder is dust; remainder=${newShardValue.toString()} sats`);
+  }
+
   const fee = feeSats !== undefined ? asBigInt(feeSats, 'feeSats') : 0n;
-  const changeValue = feePrevout.valueSats - fee;
+  const feeValue = asBigInt(feePrevout.valueSats, 'feePrevout.valueSats');
+  const changeValue = feeValue - fee;
   if (changeValue < DUST_SATS) throw new Error('withdrawFromShard: fee prevout too small after fee');
 
   // deterministic “nullifier-ish” update (no electrum required)
-  const nullifier32 = sha256(
-    concat(
-      stateIn32,
-      receiverHash160,
-      sha256(uint32le(Number(payment & 0xffffffffn))),
-    ),
-  );
-
-  const limbs: Uint8Array[] = [];
+  const nullifier32 = sha256(concat(stateIn32, receiverHash160, sha256(uint32le(Number(payment & 0xffffffffn)))));
   const proofBlob32 = sha256(concat(nullifier32, Uint8Array.of(0x02)));
+  const limbs: Uint8Array[] = [];
 
   const effectiveCategoryMode = categoryMode ?? DEFAULT_CATEGORY_MODE;
 
@@ -127,7 +126,11 @@ export function withdrawFromShard(args: {
   const shardOutSpk = txb.addTokenToScript(tokenOut, p2shSpk);
 
   const paySpk = txb.getP2PKHScript(receiverHash160);
-  const changeSpk = txb.getP2PKHScript(hexToBytes(senderWallet.pubkeyHash160Hex));
+
+  // default change destination = feeWallet change (but CLI can override with stealth change)
+  const changeHash160 = hexToBytes(changeP2pkhHash160Hex ?? feeWallet.pubkeyHash160Hex);
+  ensureBytesLen(changeHash160, 20, 'changeHash160');
+  const changeSpk = txb.getP2PKHScript(changeHash160);
 
   const tx: any = {
     version: 2,
@@ -137,17 +140,17 @@ export function withdrawFromShard(args: {
       { txid: feePrevout.txid, vout: feePrevout.vout, sequence: 0xffffffff }, // fee P2PKH
     ],
     outputs: [
-      { value: asBigInt(shard.valueSats, 'shard.valueSats'), scriptPubKey: shardOutSpk },
+      { value: newShardValue, scriptPubKey: shardOutSpk },
       { value: payment, scriptPubKey: paySpk },
       { value: changeValue, scriptPubKey: changeSpk },
     ],
   };
 
-  // covenant spend
+  // covenant spend (covenant signer)
   txb.signCovenantInput(
     tx,
     0,
-    senderWallet.signPrivBytes,
+    covenantWallet.signPrivBytes,
     redeemScript,
     shardPrevout.valueSats,
     shardPrevout.scriptPubKey ?? p2shSpk,
@@ -158,8 +161,8 @@ export function withdrawFromShard(args: {
   const base = hexToBytes(tx.inputs[0].scriptSig);
   tx.inputs[0].scriptSig = bytesToHex(new Uint8Array([...shardUnlockPrefix, ...base]));
 
-  // fee spend
-  txb.signInput(tx, 1, senderWallet.signPrivBytes, feePrevout.scriptPubKey, feePrevout.valueSats);
+  // fee spend (fee signer)
+  txb.signInput(tx, 1, feeWallet.signPrivBytes, feePrevout.scriptPubKey, feePrevout.valueSats);
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
@@ -170,6 +173,7 @@ export function withdrawFromShard(args: {
     ...shard,
     txid: '<pending>',
     vout: 0,
+    valueSats: newShardValue.toString(),
     commitmentHex: bytesToHex(stateOut32),
   };
 

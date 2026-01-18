@@ -50,7 +50,8 @@ export function importDepositToShard(args: {
   shardPrevout: PrevoutLike;
   depositPrevout: PrevoutLike;
 
-  ownerWallet: WalletLike;
+  covenantWallet: WalletLike;
+  depositWallet: WalletLike;
 
   // optional overrides
   feeSats?: bigint | number | string;
@@ -64,7 +65,8 @@ export function importDepositToShard(args: {
     shardIndex,
     shardPrevout,
     depositPrevout,
-    ownerWallet,
+    covenantWallet,
+    depositWallet,
     feeSats,
     categoryMode,
     amountCommitment,
@@ -142,7 +144,7 @@ export function importDepositToShard(args: {
   txb.signCovenantInput(
     tx,
     0,
-    ownerWallet.signPrivBytes,
+    covenantWallet.signPrivBytes,
     redeemScript,
     shardPrevout.valueSats,
     shardPrevout.scriptPubKey ?? p2shSpk,
@@ -154,7 +156,7 @@ export function importDepositToShard(args: {
   tx.inputs[0].scriptSig = bytesToHex(new Uint8Array([...shardUnlockPrefix, ...base]));
 
   // sign deposit spend
-  txb.signInput(tx, 1, ownerWallet.signPrivBytes, depositPrevout.scriptPubKey, depositPrevout.valueSats);
+  txb.signInput(tx, 1, depositWallet.signPrivBytes, depositPrevout.scriptPubKey, depositPrevout.valueSats);
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
