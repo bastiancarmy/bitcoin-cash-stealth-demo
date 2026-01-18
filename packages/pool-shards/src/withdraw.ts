@@ -1,6 +1,9 @@
 // packages/pool-shards/src/withdraw.ts
 import type { BuilderDeps } from './di.js';
+
 import { makeDefaultAuthProvider } from './auth.js';
+import { makeDefaultLockingTemplates } from './locking.js';
+
 import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, concat, hexToBytes, hash160, sha256, uint32le } from '@bch-stealth/utils';
 
@@ -102,9 +105,10 @@ export function withdrawFromShard(args: any) {
     categoryMode,
     deps,
   } = a;
-  
+
   const txb = deps?.txb ?? txbDefault;
   const auth = deps?.auth ?? makeDefaultAuthProvider(txb);
+  const locking = deps?.locking ?? makeDefaultLockingTemplates({ txb });
 
   const shard = pool.shards[shardIndex];
   if (!shard) throw new Error(`withdrawFromShard: invalid shardIndex ${shardIndex}`);
@@ -159,19 +163,23 @@ export function withdrawFromShard(args: any) {
     proofBlob32,
   });
 
+  // shard output locking script via templates
+  // (p2shSpk retained for covenant prevout fallback behavior)
   const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
+
   const tokenOut = {
     category: category32,
     nft: { capability: 'mutable' as const, commitment: stateOut32 },
   };
-  const shardOutSpk = txb.addTokenToScript(tokenOut, p2shSpk);
 
-  const paySpk = txb.getP2PKHScript(receiverHash160);
+  const shardOutSpk = locking.shardLock({ token: tokenOut, redeemScript });
+
+  const paySpk = locking.p2pkh(receiverHash160);
 
   // default change destination = feeWallet change (but CLI can override with stealth change)
   const changeHash160 = hexToBytes(changeP2pkhHash160Hex ?? feeWallet.pubkeyHash160Hex);
   ensureBytesLen(changeHash160, 20, 'changeHash160');
-  const changeSpk = txb.getP2PKHScript(changeHash160);
+  const changeSpk = locking.p2pkh(changeHash160);
 
   const tx: any = {
     version: 2,

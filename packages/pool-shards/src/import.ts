@@ -2,6 +2,8 @@
 import type { BuilderDeps } from './di.js';
 
 import { makeDefaultAuthProvider } from './auth.js';
+import { makeDefaultLockingTemplates } from './locking.js';
+
 import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
 
@@ -152,14 +154,18 @@ export function importDepositToShard(args: any) {
 
   const txb = deps?.txb ?? txbDefault;
   const auth = deps?.auth ?? makeDefaultAuthProvider(txb);
+  const locking = deps?.locking ?? makeDefaultLockingTemplates({ txb });
 
-  // shard output locking script: token + P2SH(redeemScript)
+  // shard output locking script via templates
+  // (p2shSpk retained for covenant prevout fallback behavior)
   const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
+
   const tokenOut = {
     category: category32,
     nft: { capability: 'mutable' as const, commitment: stateOut32 },
   };
-  const shardOutSpk = txb.addTokenToScript(tokenOut, p2shSpk);
+
+  const shardOutSpk = locking.shardLock({ token: tokenOut, redeemScript });
 
   const tx: any = {
     version: 2,

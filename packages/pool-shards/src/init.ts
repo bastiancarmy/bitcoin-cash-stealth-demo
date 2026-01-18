@@ -1,8 +1,8 @@
 // packages/pool-shards/src/init.ts
 import type { BuilderDeps } from './di.js';
-
+import { makeDefaultLockingTemplates } from './locking.js';
 import * as txbDefault from '@bch-stealth/tx-builder';
-import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
+import { bytesToHex, hexToBytes } from '@bch-stealth/utils';
 
 import { DUST_SATS, deriveCategory32FromFundingTxidHex, initialShardCommitment32 } from './policy.js';
 
@@ -40,6 +40,7 @@ export function initShardsTx(args: {
 }): InitShardsResult {
   const { cfg, shardCount, funding, ownerWallet, deps } = args;
   const txb = deps?.txb ?? txbDefault;
+  const locking = deps?.locking ?? makeDefaultLockingTemplates({ txb });
 
   if (!Number.isInteger(shardCount) || shardCount <= 0) {
     throw new Error('initShardsTx: shardCount must be a positive integer');
@@ -71,8 +72,7 @@ export function initShardsTx(args: {
 
   const redeemScriptHex = bytesToHex(redeemScript);
 
-  const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
-  const changeSpk = txb.getP2PKHScript(hexToBytes(ownerWallet.pubkeyHash160Hex));
+  const changeSpk = locking.p2pkh(hexToBytes(ownerWallet.pubkeyHash160Hex));
 
   // output[0] = change; outputs[1..] = shard anchors
   const outputs: any[] = [{ value: 0n, scriptPubKey: changeSpk }];
@@ -93,7 +93,7 @@ export function initShardsTx(args: {
       nft: { capability: 'mutable' as const, commitment: commitment32 },
     };
 
-    const shardSpk = txb.addTokenToScript(tokenOut, p2shSpk);
+    const shardSpk = locking.shardLock({ token: tokenOut, redeemScript });
     outputs.push({ value: shardValue, scriptPubKey: shardSpk });
 
     const commitmentHex = bytesToHex(commitment32);

@@ -1,5 +1,6 @@
 // packages/pool-shards/src/di.ts
 import type { AuthProvider } from './auth.js';
+import type { LockingTemplates } from './locking.js';
 
 export type TxBuilderLike = {
   buildRawTx(tx: any, opts: { format: 'bytes' }): Uint8Array | string;
@@ -28,10 +29,9 @@ export type TxBuilderLike = {
 
 export type BuilderDeps = {
   txb?: TxBuilderLike;
-
   // Optional: authorizer abstraction (default wraps txb signing routines)
   auth?: AuthProvider;
-
+  locking?: LockingTemplates;
   // Optional: allow caller to define covenant policy without actor naming.
   redeemScriptFactory?: (poolId20: Uint8Array) => Uint8Array;
 };
