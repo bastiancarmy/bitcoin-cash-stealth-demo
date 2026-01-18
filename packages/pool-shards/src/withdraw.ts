@@ -28,8 +28,11 @@ function normalizeRawTxBytes(raw: string | Uint8Array): Uint8Array {
 
 export function withdrawFromShard(args: any) {
   // --- Back-compat / caller normalization ---------------------------------
-  // New API expects: { covenantWallet, feeWallet, changeP2pkhHash160Hex }
-  // Legacy wrapper/tests pass: { senderWallet } (or { ownerWallet })
+  // Preferred API shapes:
+  //   - { covenantWallet, feeWallet, changeP2pkhHash160Hex } OR
+  //   - { senderWallet } (legacy)
+  // New multi-signer shape:
+  //   - { signers?: { covenantPrivBytes, feePrivBytes } }
   const a: any = args ?? {};
 
   const legacyWallet =
@@ -54,6 +57,16 @@ export function withdrawFromShard(args: any) {
   }
   if (a.feeWallet && !a.feeWallet.pubkeyHash160Hex && legacyWallet?.pubkeyHash160Hex) {
     a.feeWallet.pubkeyHash160Hex = legacyWallet.pubkeyHash160Hex;
+  }
+
+  // ---- Multi-signer overlay (B3g) ----------------------------------------
+  if (a.signers?.covenantPrivBytes) {
+    if (!a.covenantWallet) a.covenantWallet = {};
+    a.covenantWallet.signPrivBytes = a.signers.covenantPrivBytes;
+  }
+  if (a.signers?.feePrivBytes) {
+    if (!a.feeWallet) a.feeWallet = {};
+    a.feeWallet.signPrivBytes = a.signers.feePrivBytes;
   }
 
   // Helpful early errors (avoid undefined.pubkeyHash160Hex / undefined.signPrivBytes)
@@ -90,8 +103,6 @@ export function withdrawFromShard(args: any) {
     deps,
   } = a;
 
-  // ... keep the rest of your existing function body exactly as-is ...
-
   const txb = deps?.txb ?? txbDefault;
 
   const shard = pool.shards[shardIndex];
@@ -113,7 +124,9 @@ export function withdrawFromShard(args: any) {
   const shardValueIn = asBigInt(shardPrevout.valueSats, 'shardPrevout.valueSats');
   const newShardValue = shardValueIn - payment;
   if (newShardValue < DUST_SATS) {
-    throw new Error(`withdrawFromShard: shard remainder is dust; remainder=${newShardValue.toString()} sats`);
+    throw new Error(
+      `withdrawFromShard: shard remainder is dust; remainder=${newShardValue.toString()} sats`
+    );
   }
 
   const fee = feeSats !== undefined ? asBigInt(feeSats, 'feeSats') : 0n;
@@ -181,7 +194,7 @@ export function withdrawFromShard(args: any) {
     redeemScript,
     shardPrevout.valueSats,
     shardPrevout.scriptPubKey ?? p2shSpk,
-    amountCommitment ?? 0n,
+    amountCommitment ?? 0n
   );
 
   // prepend pool-hash-fold unlock prefix

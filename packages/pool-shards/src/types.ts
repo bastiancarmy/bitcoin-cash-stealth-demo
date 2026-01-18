@@ -36,6 +36,19 @@ export type WalletLike = {
   pubkeyHash160Hex: string; // 20-byte hex (for change)
 };
 
+// ---- Multi-signer support (B3g) -------------------------------------------
+// Optional explicit per-input signers.
+// Back-compat behavior: if omitted, builders fall back to wallet signPrivBytes.
+export type ImportDepositSigners = {
+  covenantPrivBytes?: Uint8Array;
+  depositPrivBytes?: Uint8Array;
+};
+
+export type WithdrawSigners = {
+  covenantPrivBytes?: Uint8Array;
+  feePrivBytes?: Uint8Array;
+};
+
 // Legacy alias still used by some callers
 export type Actor = {
   signPrivBytes: Uint8Array;

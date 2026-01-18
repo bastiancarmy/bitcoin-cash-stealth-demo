@@ -43,22 +43,36 @@ function normalizeRawTxBytes(raw: string | Uint8Array): Uint8Array {
   return hexToBytes(raw);
 }
 
-// packages/pool-shards/src/import.ts
-
 export function importDepositToShard(args: any) {
   // --- Back-compat / caller normalization ---------------------------------
-  // New API expects: { covenantWallet, depositWallet }
-  // Legacy callers/tests may pass: { ownerWallet } (or { wallet })
+  // Preferred API shapes:
+  //   - { covenantWallet, depositWallet } OR
+  //   - { ownerWallet } (legacy)
+  // New multi-signer shape:
+  //   - { signers?: { covenantPrivBytes, depositPrivBytes } }
   const a: any = args ?? {};
 
   const legacyWallet =
     a.ownerWallet ?? a.wallet ?? a.signerWallet ?? a.senderWallet ?? a.actorWallet;
 
+  // Populate wallet aliases (existing behavior)
   if (!a.covenantWallet && legacyWallet) a.covenantWallet = legacyWallet;
   if (!a.depositWallet && legacyWallet) a.depositWallet = legacyWallet;
 
   // If caller only provided covenantWallet, use it for depositWallet too (parity tests).
   if (!a.depositWallet && a.covenantWallet) a.depositWallet = a.covenantWallet;
+
+  // ---- Multi-signer overlay (B3g) ----------------------------------------
+  // If explicit signers provided, they override the signing keys used by each input.
+  // This keeps callsites stable while enabling correctness for stealth + covenant split.
+  if (a.signers?.covenantPrivBytes) {
+    if (!a.covenantWallet) a.covenantWallet = {};
+    a.covenantWallet.signPrivBytes = a.signers.covenantPrivBytes;
+  }
+  if (a.signers?.depositPrivBytes) {
+    if (!a.depositWallet) a.depositWallet = {};
+    a.depositWallet.signPrivBytes = a.signers.depositPrivBytes;
+  }
 
   // Helpful early errors (so we don’t crash on undefined.signPrivBytes)
   if (!a.covenantWallet?.signPrivBytes) {
@@ -85,21 +99,6 @@ export function importDepositToShard(args: any) {
     amountCommitment,
     deps,
   } = a;
-  
-  if (!a.covenantWallet && a.ownerWallet) a.covenantWallet = a.ownerWallet;
-  if (!a.depositWallet && a.ownerWallet) a.depositWallet = a.ownerWallet;
-
-  // (Optional) friendlier error if still missing
-  if (!a.covenantWallet?.signPrivBytes) {
-    throw new Error(
-      'importDepositToShard: missing covenantWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
-    );
-  }
-  if (!a.depositWallet?.signPrivBytes) {
-    throw new Error(
-      'importDepositToShard: missing depositWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
-    );
-  }
 
   const txb = deps?.txb ?? txbDefault;
 
@@ -117,11 +116,13 @@ export function importDepositToShard(args: any) {
 
   const shardValueIn = asBigInt(shardPrevout.valueSats, 'shardPrevout.valueSats');
   const depositValueIn = asBigInt(depositPrevout.valueSats, 'depositPrevout.valueSats');
-  
+
   const newShardValue = shardValueIn + depositValueIn - fee;
-  
+
   if (newShardValue < DUST_SATS) {
-    throw new Error(`importDepositToShard: new shard value below dust; got ${newShardValue.toString()} sats`);
+    throw new Error(
+      `importDepositToShard: new shard value below dust; got ${newShardValue.toString()} sats`
+    );
   }
 
   // noteHash = outpointHash32(deposit outpoint)
@@ -176,7 +177,7 @@ export function importDepositToShard(args: any) {
     redeemScript,
     shardPrevout.valueSats,
     shardPrevout.scriptPubKey ?? p2shSpk,
-    amountCommitment ?? 0n,
+    amountCommitment ?? 0n
   );
 
   // prepend pool-hash-fold unlock prefix to the covenant scriptSig
@@ -184,7 +185,13 @@ export function importDepositToShard(args: any) {
   tx.inputs[0].scriptSig = bytesToHex(new Uint8Array([...shardUnlockPrefix, ...base]));
 
   // sign deposit spend
-  txb.signInput(tx, 1, depositWallet.signPrivBytes, depositPrevout.scriptPubKey, depositPrevout.valueSats);
+  txb.signInput(
+    tx,
+    1,
+    depositWallet.signPrivBytes,
+    depositPrevout.scriptPubKey,
+    depositPrevout.valueSats
+  );
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
