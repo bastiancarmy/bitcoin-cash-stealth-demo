@@ -43,23 +43,36 @@ function normalizeRawTxBytes(raw: string | Uint8Array): Uint8Array {
   return hexToBytes(raw);
 }
 
-export function importDepositToShard(args: {
-  pool: PoolState;
-  shardIndex: number;
+// packages/pool-shards/src/import.ts
 
-  shardPrevout: PrevoutLike;
-  depositPrevout: PrevoutLike;
+export function importDepositToShard(args: any) {
+  // --- Back-compat / caller normalization ---------------------------------
+  // New API expects: { covenantWallet, depositWallet }
+  // Legacy callers/tests may pass: { ownerWallet } (or { wallet })
+  const a: any = args ?? {};
 
-  covenantWallet: WalletLike;
-  depositWallet: WalletLike;
+  const legacyWallet =
+    a.ownerWallet ?? a.wallet ?? a.signerWallet ?? a.senderWallet ?? a.actorWallet;
 
-  // optional overrides
-  feeSats?: bigint | number | string;
-  categoryMode?: CategoryMode;
-  amountCommitment?: bigint | number;
+  if (!a.covenantWallet && legacyWallet) a.covenantWallet = legacyWallet;
+  if (!a.depositWallet && legacyWallet) a.depositWallet = legacyWallet;
 
-  deps?: BuilderDeps;
-}): ImportDepositResult {
+  // If caller only provided covenantWallet, use it for depositWallet too (parity tests).
+  if (!a.depositWallet && a.covenantWallet) a.depositWallet = a.covenantWallet;
+
+  // Helpful early errors (so we don’t crash on undefined.signPrivBytes)
+  if (!a.covenantWallet?.signPrivBytes) {
+    throw new Error(
+      'importDepositToShard: missing covenantWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
+    );
+  }
+  if (!a.depositWallet?.signPrivBytes) {
+    throw new Error(
+      'importDepositToShard: missing depositWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
+    );
+  }
+
+  // --- Now destructure from the normalized object --------------------------
   const {
     pool,
     shardIndex,
@@ -71,7 +84,22 @@ export function importDepositToShard(args: {
     categoryMode,
     amountCommitment,
     deps,
-  } = args;
+  } = a;
+  
+  if (!a.covenantWallet && a.ownerWallet) a.covenantWallet = a.ownerWallet;
+  if (!a.depositWallet && a.ownerWallet) a.depositWallet = a.ownerWallet;
+
+  // (Optional) friendlier error if still missing
+  if (!a.covenantWallet?.signPrivBytes) {
+    throw new Error(
+      'importDepositToShard: missing covenantWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
+    );
+  }
+  if (!a.depositWallet?.signPrivBytes) {
+    throw new Error(
+      'importDepositToShard: missing depositWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
+    );
+  }
 
   const txb = deps?.txb ?? txbDefault;
 

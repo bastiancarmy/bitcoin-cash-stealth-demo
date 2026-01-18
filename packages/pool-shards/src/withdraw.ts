@@ -26,29 +26,54 @@ function normalizeRawTxBytes(raw: string | Uint8Array): Uint8Array {
   return hexToBytes(raw);
 }
 
-export function withdrawFromShard(args: {
-  pool: PoolState;
-  shardIndex: number;
+export function withdrawFromShard(args: any) {
+  // --- Back-compat / caller normalization ---------------------------------
+  // New API expects: { covenantWallet, feeWallet, changeP2pkhHash160Hex }
+  // Legacy wrapper/tests pass: { senderWallet } (or { ownerWallet })
+  const a: any = args ?? {};
 
-  shardPrevout: PrevoutLike;
-  feePrevout: PrevoutLike;
+  const legacyWallet =
+    a.senderWallet ?? a.ownerWallet ?? a.wallet ?? a.signerWallet ?? a.actorWallet;
 
-  covenantWallet: WalletLike;
-  feeWallet: WalletLike;
+  if (!a.covenantWallet && legacyWallet) a.covenantWallet = legacyWallet;
+  if (!a.feeWallet && legacyWallet) a.feeWallet = legacyWallet;
 
-  receiverP2pkhHash160Hex: string;
-  amountSats: bigint | number;
+  // If caller didn’t provide change destination, default change back to sender.
+  if (!a.changeP2pkhHash160Hex && legacyWallet?.pubkeyHash160Hex) {
+    a.changeP2pkhHash160Hex = legacyWallet.pubkeyHash160Hex;
+  }
 
-  // optional overrides
-  feeSats?: bigint | number | string;
-  categoryMode?: CategoryMode;
-  amountCommitment?: bigint | number;
+  // Some older shapes used pubkeyHashHex (still 20B hex) — accept it as a fallback.
+  if (!a.changeP2pkhHash160Hex && legacyWallet?.pubkeyHashHex) {
+    a.changeP2pkhHash160Hex = legacyWallet.pubkeyHashHex;
+  }
 
-  // optional: allow stealth change (or any chosen change destination)
-  changeP2pkhHash160Hex?: string;
+  // Ensure wallet objects have the fields withdraw expects
+  if (a.covenantWallet && !a.covenantWallet.pubkeyHash160Hex && legacyWallet?.pubkeyHash160Hex) {
+    a.covenantWallet.pubkeyHash160Hex = legacyWallet.pubkeyHash160Hex;
+  }
+  if (a.feeWallet && !a.feeWallet.pubkeyHash160Hex && legacyWallet?.pubkeyHash160Hex) {
+    a.feeWallet.pubkeyHash160Hex = legacyWallet.pubkeyHash160Hex;
+  }
 
-  deps?: BuilderDeps;
-}): WithdrawResult {
+  // Helpful early errors (avoid undefined.pubkeyHash160Hex / undefined.signPrivBytes)
+  if (!a.covenantWallet?.signPrivBytes) {
+    throw new Error(
+      'withdrawFromShard: missing covenantWallet.signPrivBytes (or legacy senderWallet.signPrivBytes)'
+    );
+  }
+  if (!a.feeWallet?.signPrivBytes) {
+    throw new Error(
+      'withdrawFromShard: missing feeWallet.signPrivBytes (or legacy senderWallet.signPrivBytes)'
+    );
+  }
+  if (!a.changeP2pkhHash160Hex) {
+    throw new Error(
+      'withdrawFromShard: missing changeP2pkhHash160Hex (or senderWallet.pubkeyHash160Hex)'
+    );
+  }
+
+  // --- Now destructure from the normalized object --------------------------
   const {
     pool,
     shardIndex,
@@ -59,11 +84,13 @@ export function withdrawFromShard(args: {
     receiverP2pkhHash160Hex,
     amountSats,
     feeSats,
-    categoryMode,
-    amountCommitment,
     changeP2pkhHash160Hex,
+    amountCommitment,
+    categoryMode,
     deps,
-  } = args;
+  } = a;
+
+  // ... keep the rest of your existing function body exactly as-is ...
 
   const txb = deps?.txb ?? txbDefault;
 

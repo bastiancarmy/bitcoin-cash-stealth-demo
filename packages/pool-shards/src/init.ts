@@ -54,13 +54,21 @@ export function initShardsTx(args: {
   const category32 = deriveCategory32FromFundingTxidHex(funding.txid);
   const categoryHex = bytesToHex(category32);
 
-  // Prefer explicit redeemScript from config; fallback to injected factory; final fallback to legacy tx-builder helper.
+  // Prefer explicit redeemScript from config; otherwise require an injected factory.
   const redeemScript =
     cfg.redeemScriptHex
       ? hexToBytes(cfg.redeemScriptHex)
       : deps?.redeemScriptFactory
         ? deps.redeemScriptFactory(poolId)
-        : txb.getBobRedeemScript(poolId); // legacy fallback for now
+        : null;
+
+  if (!redeemScript) {
+    throw new Error(
+      `initShardsTx: missing redeemScript.\n` +
+        `Provide cfg.redeemScriptHex or deps.redeemScriptFactory(poolId).`
+    );
+  }
+
   const redeemScriptHex = bytesToHex(redeemScript);
 
   const p2shSpk = txb.getP2SHScript(hash160(redeemScript));

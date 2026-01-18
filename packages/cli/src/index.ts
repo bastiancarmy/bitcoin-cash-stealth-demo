@@ -675,7 +675,7 @@ async function tryRepairShardsFromWallet({
 async function initShardsTx({
   state = null,
   ownerWallet,
-  ownerPaycodePub33 = null,
+  ownerPaycodePub33 = null, // unused now (init builder is pure; stealth change is CLI policy if desired later)
   shardCount,
   poolVersion,
 }: {
@@ -692,11 +692,9 @@ async function initShardsTx({
   shards: ShardPointer[];
   stealthUtxos: StealthUtxoRecord[];
 }> {
-  const redeemScript = await getPoolHashFoldBytecode(poolVersion);
-
+  // ---- CLI IO boundary: select funding + prevout fetch ----
   const shardsTotal = SHARD_VALUE * BigInt(shardCount);
 
-  // Prefer any previously-created stealth UTXOs for owner (Actor B) so base address stays quiet.
   const funding = await selectFundingUtxo({
     state,
     wallet: ownerWallet,
@@ -706,143 +704,64 @@ async function initShardsTx({
 
   const prev = funding.prevOut;
 
-  // Token category convention: reverse(prevout.txid).
-  const category32 = reverseBytes(hexToBytes(funding.txid));
+  // ---- Build canonical pool-shards config ----
+  const poolIdHex =
+  (state as any)?.poolIdHex ??
+  bytesToHex(hash160(hexToBytes(funding.txid))); // deterministic fallback: H160(fundingTxidBytes)
 
-  const inputValue = toBigIntSats(prev.value);
-
-  // Build N shard outputs with simple deterministic commitments.
-  const shardCommitments = Array.from({ length: shardCount }, (_, i) => {
-    const c = new Uint8Array(32);
-    c[28] = (i >>> 24) & 0xff;
-    c[29] = (i >>> 16) & 0xff;
-    c[30] = (i >>> 8) & 0xff;
-    c[31] = i & 0xff;
-    return c;
-  });
-
-  const shardOutputs = shardCommitments.map((commitment32) => {
-    const token = {
-      category: category32,
-      nft: { capability: 'mutable', commitment: commitment32 },
-    };
-    const spk = addTokenToScript(token, redeemScript);
-    return { value: SHARD_VALUE, scriptPubKey: spk };
-  });
-
-  // Change output: prefer stealth P2PKH (RPA) back to the owner's paycode if available.
-  let changeSpk = p2pkhLockingBytecode(ownerWallet.hash160);
-  let changeStealthTemplate: StealthUtxoRecord | null = null;
-
-  if (ownerPaycodePub33) {
-    const { intent, rpaContext } = deriveStealthP2pkhLock({
-      senderWallet: ownerWallet,
-      receiverPaycodePub33: ownerPaycodePub33,
-      prevoutTxidHex: funding.txid,
-      prevoutN: funding.vout,
-      index: 0,
-    });
-
-    changeSpk = p2pkhLockingBytecode(intent.childHash160);
-    changeStealthTemplate = {
-      owner: ACTOR_B.id,
-      purpose: 'init_change',
-      txid: '<pending>',
-      vout: shardCount,
-      value: '<pending>',
-      hash160Hex: bytesToHex(intent.childHash160),
-      rpaContext,
-      createdAt: new Date().toISOString(),
-    };
-  }
-
-  const feeRate = await pickFeeRateOrFallback();
-
-  let feeGuess = 8_000n;
-  let changeValue = inputValue - shardsTotal - feeGuess;
-  if (changeValue < BigInt(DUST)) {
-    throw new Error(
-      `Not enough funds. Need at least ~${(shardsTotal + feeGuess + BigInt(DUST)).toString()} sats in the funding UTXO.`
-    );
-  }
-
-  const tx = {
-    version: 2,
-    locktime: 0,
-    inputs: [
-      {
-        txid: funding.txid,
-        vout: funding.vout,
-        scriptSig: new Uint8Array(),
-        sequence: 0xffffffff,
-      },
-    ],
-    outputs: [...shardOutputs, { value: changeValue, scriptPubKey: changeSpk }],
+  const cfg: PoolShards.PoolConfig = {
+    network: NETWORK,
+    poolIdHex,
+    poolVersion: String(poolVersion === POOL_HASH_FOLD_VERSION.V1 ? 'v1' : 'v1_1'),
+    shardValueSats: SHARD_VALUE.toString(),
+    defaultFeeSats: DEFAULT_FEE.toString(),
+    // IMPORTANT: pass redeemScriptHex explicitly to avoid any legacy helper usage in builders
+    redeemScriptHex: bytesToHex(await getPoolHashFoldBytecode(poolVersion)),
   };
 
-  let { rawHex, sizeBytes } = await finalizeAndSignInitTx({
-    tx,
-    inputPrivBytes: funding.signPrivBytes,
-    prevOut: prev,
+  const fundingPrevout: PoolShards.PrevoutLike = {
+    txid: funding.txid,
+    vout: funding.vout,
+    valueSats: BigInt(prev.value),
+    scriptPubKey: prev.scriptPubKey,
+  };
+
+  const owner: PoolShards.WalletLike = {
+    signPrivBytes: funding.signPrivBytes,
+    pubkeyHash160Hex: bytesToHex(ownerWallet.hash160),
+  };
+
+  // ---- Pure builder call ----
+  const built = PoolShards.initShardsTx({
+    cfg,
+    shardCount,
+    funding: fundingPrevout,
+    ownerWallet: owner,
   });
 
-  const feeNeeded = feeFromSize(sizeBytes, feeRate, { safety: 200n });
+  const rawHex = bytesToHex(built.rawTx);
 
-  if (feeNeeded > feeGuess) {
-    const change2 = inputValue - shardsTotal - feeNeeded;
-    if (change2 < BigInt(DUST)) {
-      throw new Error(
-        `Not enough funds to pay relay fee.\ninput=${inputValue} shardsTotal=${shardsTotal} feeNeeded≈${feeNeeded} dust=${BigInt(DUST)}`
-      );
-    }
-
-    tx.outputs[tx.outputs.length - 1] = { value: change2, scriptPubKey: changeSpk };
-    ({ rawHex, sizeBytes } = await finalizeAndSignInitTx({
-      tx,
-      inputPrivBytes: funding.signPrivBytes,
-      prevOut: prev,
-    }));
-    changeValue = change2;
-    feeGuess = feeNeeded;
-  }
-
-  const impliedFee = inputValue - shardsTotal - changeValue;
-
-  console.log(`Init tx size: ${sizeBytes} bytes`);
-  console.log(`Fee rate: ${feeRate} sat/B`);
-  console.log(`Fee paid: ${impliedFee} sats`);
-
+  // ---- CLI IO boundary: broadcast + map outpoints ----
   const txid = await broadcastTx(rawHex);
 
-  if (changeStealthTemplate) {
-    console.log(
-      `[init] change (stealth) -> outpoint ${txid}:${shardCount} value=${changeValue.toString()} sats hash160=${changeStealthTemplate.hash160Hex}`
-    );
-  } else {
-    console.log(`[init] change (base P2PKH fallback) -> outpoint ${txid}:${shardCount} value=${changeValue.toString()} sats`);
-  }
-
-  const shards: ShardPointer[] = shardCommitments.map((c, i) => ({
+  const shards: ShardPointer[] = built.nextPoolState.shards.map((s: any, i: number) => ({
+    index: i,
     txid,
-    vout: i,
-    value: SHARD_VALUE.toString(),
-    commitmentHex: bytesToHex(c),
+    vout: i + 1, // pool-shards init uses output[0]=change, outputs[1..]=shards
+    value: String(s.valueSats),
+    commitmentHex: s.commitmentHex,
   }));
 
+  // NOTE: pool-shards init produces a normal P2PKH change to ownerWallet.
+  // earlier stealth-change behavior can be reintroduced later as a CLI-only policy
+  // by using a different change destination, but that requires a slightly richer init builder API.
   const stealthUtxos: StealthUtxoRecord[] = [];
-  if (changeStealthTemplate) {
-    stealthUtxos.push({
-      ...changeStealthTemplate,
-      txid,
-      value: changeValue.toString(),
-    });
-  }
 
   return {
     txid,
-    categoryHex: bytesToHex(category32),
+    categoryHex: built.nextPoolState.categoryHex,
     poolVersion,
-    redeemScriptHex: bytesToHex(redeemScript),
+    redeemScriptHex: built.nextPoolState.redeemScriptHex,
     shards,
     stealthUtxos,
   };

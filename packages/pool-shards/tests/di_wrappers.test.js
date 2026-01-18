@@ -33,6 +33,7 @@ test('wrappers DI: can run init/import/withdraw using mock prevout provider (no 
     poolVersion: 'v1',
     shardValueSats: 2000,
     defaultFeeSats: 2000,
+    redeemScriptHex: '51',
   };
 
   const wallet = {
