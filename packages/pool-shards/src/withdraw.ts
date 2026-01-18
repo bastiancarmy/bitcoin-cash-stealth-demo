@@ -1,6 +1,6 @@
 // packages/pool-shards/src/withdraw.ts
 import type { BuilderDeps } from './di.js';
-
+import { makeDefaultAuthProvider } from './auth.js';
 import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, concat, hexToBytes, hash160, sha256, uint32le } from '@bch-stealth/utils';
 
@@ -102,8 +102,9 @@ export function withdrawFromShard(args: any) {
     categoryMode,
     deps,
   } = a;
-
+  
   const txb = deps?.txb ?? txbDefault;
+  const auth = deps?.auth ?? makeDefaultAuthProvider(txb);
 
   const shard = pool.shards[shardIndex];
   if (!shard) throw new Error(`withdrawFromShard: invalid shardIndex ${shardIndex}`);
@@ -186,23 +187,30 @@ export function withdrawFromShard(args: any) {
     ],
   };
 
-  // covenant spend (covenant signer)
-  txb.signCovenantInput(
+  // covenant spend (provider applies extraPrefix)
+  auth.authorizeCovenantInput({
     tx,
-    0,
-    covenantWallet.signPrivBytes,
+    vin: 0,
+    covenantPrivBytes: covenantWallet.signPrivBytes,
     redeemScript,
-    shardPrevout.valueSats,
-    shardPrevout.scriptPubKey ?? p2shSpk,
-    amountCommitment ?? 0n
-  );
+    prevout: {
+      valueSats: shardPrevout.valueSats,
+      scriptPubKey: (shardPrevout.scriptPubKey ?? p2shSpk) as Uint8Array,
+    },
+    amountCommitment: amountCommitment ?? 0n,
+    extraPrefix: shardUnlockPrefix,
+  });
 
-  // prepend pool-hash-fold unlock prefix
-  const base = hexToBytes(tx.inputs[0].scriptSig);
-  tx.inputs[0].scriptSig = bytesToHex(new Uint8Array([...shardUnlockPrefix, ...base]));
-
-  // fee spend (fee signer)
-  txb.signInput(tx, 1, feeWallet.signPrivBytes, feePrevout.scriptPubKey, feePrevout.valueSats);
+  // fee spend (P2PKH) via provider
+  auth.authorizeP2pkhInput({
+    tx,
+    vin: 1,
+    privBytes: feeWallet.signPrivBytes,
+    prevout: {
+      valueSats: feePrevout.valueSats,
+      scriptPubKey: feePrevout.scriptPubKey,
+    },
+  });
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);

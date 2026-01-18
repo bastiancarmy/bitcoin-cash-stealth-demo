@@ -1,6 +1,7 @@
 // packages/pool-shards/src/import.ts
 import type { BuilderDeps } from './di.js';
 
+import { makeDefaultAuthProvider } from './auth.js';
 import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
 
@@ -100,8 +101,6 @@ export function importDepositToShard(args: any) {
     deps,
   } = a;
 
-  const txb = deps?.txb ?? txbDefault;
-
   const shard = pool.shards[shardIndex];
   if (!shard) throw new Error(`importDepositToShard: invalid shardIndex ${shardIndex}`);
 
@@ -151,6 +150,9 @@ export function importDepositToShard(args: any) {
     proofBlob32,
   });
 
+  const txb = deps?.txb ?? txbDefault;
+  const auth = deps?.auth ?? makeDefaultAuthProvider(txb);
+
   // shard output locking script: token + P2SH(redeemScript)
   const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
   const tokenOut = {
@@ -169,29 +171,30 @@ export function importDepositToShard(args: any) {
     outputs: [{ value: newShardValue, scriptPubKey: shardOutSpk }],
   };
 
-  // covenant unlocking: signCovenantInput(tx, idx, priv, redeem, value, rawPrevScript, amount, [hashtype])
-  txb.signCovenantInput(
+  // covenant unlocking via provider (provider applies extraPrefix)
+  auth.authorizeCovenantInput({
     tx,
-    0,
-    covenantWallet.signPrivBytes,
+    vin: 0,
+    covenantPrivBytes: covenantWallet.signPrivBytes,
     redeemScript,
-    shardPrevout.valueSats,
-    shardPrevout.scriptPubKey ?? p2shSpk,
-    amountCommitment ?? 0n
-  );
+    prevout: {
+      valueSats: shardPrevout.valueSats,
+      scriptPubKey: (shardPrevout.scriptPubKey ?? p2shSpk) as Uint8Array,
+    },
+    amountCommitment: amountCommitment ?? 0n,
+    extraPrefix: shardUnlockPrefix,
+  });
 
-  // prepend pool-hash-fold unlock prefix to the covenant scriptSig
-  const base = hexToBytes(tx.inputs[0].scriptSig);
-  tx.inputs[0].scriptSig = bytesToHex(new Uint8Array([...shardUnlockPrefix, ...base]));
-
-  // sign deposit spend
-  txb.signInput(
+  // deposit spend via provider
+  auth.authorizeP2pkhInput({
     tx,
-    1,
-    depositWallet.signPrivBytes,
-    depositPrevout.scriptPubKey,
-    depositPrevout.valueSats
-  );
+    vin: 1,
+    privBytes: depositWallet.signPrivBytes,
+    prevout: {
+      valueSats: depositPrevout.valueSats,
+      scriptPubKey: depositPrevout.scriptPubKey,
+    },
+  });
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
