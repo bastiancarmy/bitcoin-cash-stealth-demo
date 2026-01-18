@@ -62,22 +62,22 @@ import {
   parseTx,
 } from '@bch-stealth/electrum';
 
-import { buildRawTx, signInput, addTokenToScript } from '@bch-stealth/tx-builder';
-
 import {
   RPA_MODE_STEALTH_P2PKH,
   deriveRpaLockIntent,
   deriveRpaOneTimePrivReceiver,
 } from '@bch-stealth/rpa';
 
+import { signInput, buildRawTx } from '@bch-stealth/tx-builder'; // keep ONLY for P2PKH deposit/stealth txs
+
 import {
-  POOL_HASH_FOLD_VERSION,
-  getPoolHashFoldBytecode,
-  computePoolStateOut,
-  // NOTE: these must exist in your pool-hash-fold package; if names differ, update imports.
-  buildPoolHashFoldUnlockingBytecode,
-  makeProofBlobV11,
-} from '@bch-stealth/pool-hash-fold';
+  initShardsTx as buildInitShardsTx,
+  importDepositToShard as buildImportDepositToShard,
+  withdrawFromShard as buildWithdrawFromShard,
+  selectShardIndex,
+} from '@bch-stealth/pool-shards';
+
+import { makePoolShardsDeps } from './pool_shards_deps.js';
 
 import { NETWORK, DUST } from './config.js';
 import { getWallets } from './wallets.js';
@@ -521,11 +521,10 @@ async function tryRepairShardsFromWallet({ state, ownerWallet }) {
 // -------------------------------------------------------------------------------------
 
 async function initShardsTx({ state = null, ownerWallet, ownerPaycodePub33 = null, shardCount, poolVersion }) {
-  const redeemScript = await getPoolHashFoldBytecode(poolVersion);
+  const deps = makePoolShardsDeps();
 
+  // choose funding utxo (your existing logic, unchanged)
   const shardsTotal = SHARD_VALUE * BigInt(shardCount);
-
-  // Prefer any previously-created stealth UTXOs for owner (Actor B) so base address stays quiet.
   const funding = await selectFundingUtxo({
     state,
     wallet: ownerWallet,
@@ -533,147 +532,67 @@ async function initShardsTx({ state = null, ownerWallet, ownerPaycodePub33 = nul
     minSats: shardsTotal + BigInt(DUST) + 20_000n,
   });
 
-  const prev = funding.prevOut;
+  // fetch prevout via deps (IO boundary lives in CLI)
+  const fundingPrev = await deps.prevouts.getPrevout(funding.txid, funding.vout);
 
-  // Token category convention: reverse(prevout.txid).
-  const category32 = reverseBytes(hexToBytes(funding.txid));
-
-  const inputValue = toBigIntSats(prev.value);
-
-  // Build N shard outputs with simple deterministic commitments.
-  const shardCommitments = Array.from({ length: shardCount }, (_, i) => {
-    const c = new Uint8Array(32);
-    c[28] = (i >>> 24) & 0xff;
-    c[29] = (i >>> 16) & 0xff;
-    c[30] = (i >>> 8) & 0xff;
-    c[31] = i & 0xff;
-    return c;
-  });
-
-  const shardOutputs = shardCommitments.map((commitment32) => {
-    const token = {
-      category: category32,
-      nft: { capability: 'mutable', commitment: commitment32 },
-    };
-    const spk = addTokenToScript(token, redeemScript);
-    return { value: SHARD_VALUE, scriptPubKey: spk };
-  });
-
-  // Change output: prefer stealth P2PKH (RPA) back to the owner's paycode if available.
-  let changeSpk = p2pkhLockingBytecode(ownerWallet.hash160);
-  let changeStealthTemplate = null;
-
-  if (ownerPaycodePub33) {
-    const { intent, rpaContext } = deriveStealthP2pkhLock({
-      senderWallet: ownerWallet,
-      receiverPaycodePub33: ownerPaycodePub33,
-      prevoutTxidHex: funding.txid,
-      prevoutN: funding.vout,
-      index: 0,
-    });
-
-    changeSpk = p2pkhLockingBytecode(intent.childHash160);
-    changeStealthTemplate = {
-      owner: ACTOR_B.id,
-      purpose: 'init_change',
-      txid: '<pending>',
-      vout: shardCount,
-      value: '<pending>',
-      hash160Hex: bytesToHex(intent.childHash160),
-      rpaContext,
-      createdAt: new Date().toISOString(),
-    };
-  }
-
-  const feeRate = await pickFeeRateOrFallback();
-
-  let feeGuess = 8_000n;
-  let changeValue = inputValue - shardsTotal - feeGuess;
-  if (changeValue < BigInt(DUST)) {
-    throw new Error(
-      `Not enough funds. Need at least ~${(shardsTotal + feeGuess + BigInt(DUST)).toString()} sats in the funding UTXO.`
-    );
-  }
-
-  const tx = {
-    version: 2,
-    locktime: 0,
-    inputs: [
-      {
-        txid: funding.txid,
-        vout: funding.vout,
-        scriptSig: new Uint8Array(),
-        sequence: 0xffffffff,
-      },
-    ],
-    outputs: [...shardOutputs, { value: changeValue, scriptPubKey: changeSpk }],
+  // pool-shards config
+  const cfg = {
+    network: NETWORK,
+    // poolIdHex must be 20 bytes; use ownerWallet.hash160
+    poolIdHex: bytesToHex(ownerWallet.hash160),
+    poolVersion: String(poolVersion), // you store this; internal meaning lives in pool-shards
+    shardValueSats: SHARD_VALUE.toString(),
+    defaultFeeSats: DEFAULT_FEE.toString(),
   };
 
-  let { rawHex, sizeBytes } = await finalizeAndSignInitTx({
-    tx,
-    inputPrivBytes: funding.signPrivBytes,
-    prevOut: prev,
+  // IMPORTANT:
+  // funding signer may be stealth-derived (funding.signPrivBytes).
+  // change output should go to ownerWallet.hash160 (ownerWallet.pubkeyHash160Hex).
+  const ownerWalletLike = {
+    signPrivBytes: funding.signPrivBytes,          // signer for funding input
+    pubkeyHash160Hex: bytesToHex(ownerWallet.hash160), // change destination
+  };
+
+  const result = buildInitShardsTx({
+    cfg,
+    shardCount,
+    funding: fundingPrev,
+    ownerWallet: ownerWalletLike,
+    deps: { txb: deps.txb },
   });
 
-  const feeNeeded = feeFromSize(sizeBytes, feeRate, { safety: 200n });
+  // broadcast
+  const txid = await deps.broadcast.broadcastTx(result.rawTx);
 
-  if (feeNeeded > feeGuess) {
-    const change2 = inputValue - shardsTotal - feeNeeded;
-    if (change2 < BigInt(DUST)) {
-      throw new Error(
-        `Not enough funds to pay relay fee.\ninput=${inputValue} shardsTotal=${shardsTotal} feeNeeded≈${feeNeeded} dust=${BigInt(DUST)}`
-      );
-    }
+  // adapt pool-shards state to your state-file shape
+  const poolState = result.nextPoolState;
 
-    tx.outputs[tx.outputs.length - 1] = { value: change2, scriptPubKey: changeSpk };
-    ({ rawHex, sizeBytes } = await finalizeAndSignInitTx({
-      tx,
-      inputPrivBytes: funding.signPrivBytes,
-      prevOut: prev,
-    }));
-    changeValue = change2;
-    feeGuess = feeNeeded;
+  // pool-shards shards will have txid '<pending>' until broadcast; patch them
+  for (const s of poolState.shards) {
+    s.txid = txid;
   }
 
-  const impliedFee = inputValue - shardsTotal - changeValue;
-
-  console.log(`Init tx size: ${sizeBytes} bytes`);
-  console.log(`Fee rate: ${feeRate} sat/B`);
-  console.log(`Fee paid: ${impliedFee} sats`);
-
-  const txid = await broadcastTx(rawHex);
-
-  if (changeStealthTemplate) {
-    console.log(
-      `[init] change (stealth) -> outpoint ${txid}:${shardCount} value=${changeValue.toString()} sats hash160=${changeStealthTemplate.hash160Hex}`
-    );
-  } else {
-    console.log(`[init] change (base P2PKH fallback) -> outpoint ${txid}:${shardCount} value=${changeValue.toString()} sats`);
-  }
-
-  const shards = shardCommitments.map((c, i) => ({
-    txid,
-    vout: i,
-    value: SHARD_VALUE.toString(),
-    commitmentHex: bytesToHex(c),
+  // NOTE: init outputs are [change, shard0..]
+  // your state expects shard outpoints; shard vouts are 1..N
+  // pool-shards already sets vout = i+1 in init.ts; just ensure it’s correct.
+  const shards = poolState.shards.map((s) => ({
+    index: s.index,
+    txid: txid,
+    vout: s.vout,
+    value: s.valueSats,
+    commitmentHex: s.commitmentHex,
   }));
 
-  const stealthUtxos = [];
-  if (changeStealthTemplate) {
-    stealthUtxos.push({
-      ...changeStealthTemplate,
-      txid,
-      value: changeValue.toString(),
-    });
-  }
+  console.log(`Init tx size: ${result.sizeBytes} bytes`);
+  console.log(`Fee paid (cfg defaultFeeSats): ${cfg.defaultFeeSats} sats`);
 
   return {
     txid,
-    categoryHex: bytesToHex(category32),
-    poolVersion,
-    redeemScriptHex: bytesToHex(redeemScript),
+    categoryHex: poolState.categoryHex,
+    poolVersion: poolState.poolVersion,
+    redeemScriptHex: poolState.redeemScriptHex,
     shards,
-    stealthUtxos,
+    stealthUtxos: [], // keep your stealth change recording if you still want it (can be layered back)
   };
 }
 
@@ -904,67 +823,40 @@ async function sweepDepositDebug({ depositOutpoint, receiverWallet }) {
 }
 
 async function importDepositToShard({ poolState, shardIndex, depositOutpoint, receiverWallet }) {
-  const redeemScript = hexToBytes(poolState.redeemScriptHex);
-  const category32 = hexToBytes(poolState.categoryHex);
+  const deps = makePoolShardsDeps();
 
   const shard = poolState.shards[shardIndex];
   if (!shard) throw new Error(`invalid shardIndex ${shardIndex}`);
 
-  const shardPrev = await getPrevOutput(shard.txid, shard.vout);
-  const depositPrev = await getPrevOutput(depositOutpoint.txid, depositOutpoint.vout).catch(async (e) => {
+  // Pull prevouts via deps (IO boundary in CLI)
+  const shardPrevout = await deps.prevouts.getPrevout(shard.txid, shard.vout);
+
+  // For the deposit prevout, fetch the on-chain scriptPubKey/value.
+  // (Keep your fallback logic if you still want it for 0-conf indexing lag.)
+  const depositPrevout = await deps.prevouts.getPrevout(depositOutpoint.txid, depositOutpoint.vout).catch(async (e) => {
     const ageMs = Date.now() - Date.parse(depositOutpoint.createdAt || new Date().toISOString());
     if (ageMs < 5 * 60 * 1000 && depositOutpoint.receiverRpaHash160Hex && depositOutpoint.value) {
       const h160 = hexToBytes(depositOutpoint.receiverRpaHash160Hex);
-      return { value: depositOutpoint.value, scriptPubKey: p2pkhLockingBytecode(h160), _fallback: true };
+      return {
+        txid: depositOutpoint.txid,
+        vout: depositOutpoint.vout,
+        valueSats: BigInt(depositOutpoint.value),
+        scriptPubKey: p2pkhLockingBytecode(h160),
+        _fallback: true,
+      };
     }
     throw e;
   });
 
-  const shardValue = BigInt(shardPrev.value);
-  const depositValue = BigInt(depositPrev.value);
-  const fee = DEFAULT_FEE;
-  const newShardValue = shardValue + depositValue - fee;
-  if (newShardValue < BigInt(DUST)) throw new Error('new shard value below dust');
-
-  const expectedH160 = parseP2pkhHash160(depositPrev.scriptPubKey);
-  if (!expectedH160) throw new Error('deposit prevout is not P2PKH (unexpected for demo)');
+  // Derive the one-time priv to spend the stealth deposit (this is demo-specific, OK in CLI)
+  const expectedH160 = parseP2pkhHash160(depositPrevout.scriptPubKey);
+  if (!expectedH160) throw new Error('deposit prevout is not P2PKH');
 
   const ctx = depositOutpoint.rpaContext;
   if (!ctx?.senderPub33Hex || !ctx?.prevoutHashHex) throw new Error('depositOutpoint missing rpaContext');
 
   const senderPub33 = hexToBytes(ctx.senderPub33Hex);
 
-  // Preflight logs (do NOT branch on these)
-  try {
-    const candA = ctx.prevoutHashHex;
-    const candB = reverseHex32(ctx.prevoutHashHex);
-
-    const deriveH160 = (prevoutHashHex, normalizeEvenY) => {
-      try {
-        const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
-          receiverWallet.scanPrivBytes ?? receiverWallet.privBytes,
-          receiverWallet.spendPrivBytes ?? receiverWallet.privBytes,
-          senderPub33,
-          prevoutHashHex,
-          ctx.prevoutN,
-          ctx.index
-        );
-        const pk = normalizeEvenY ? ensureEvenYPriv(oneTimePriv) : oneTimePriv;
-        const { h160 } = pubkeyHashFromPriv(pk);
-        return bytesToHex(h160);
-      } catch {
-        return null;
-      }
-    };
-
-    console.log('[import-preflight] expected deposit hash160:', bytesToHex(expectedH160));
-    console.log('[import-preflight] candidate as-is txid, no evenY:', deriveH160(candA, false));
-    console.log('[import-preflight] candidate as-is txid, evenY:', deriveH160(candA, true));
-    console.log('[import-preflight] candidate reversed txid, no evenY:', deriveH160(candB, false));
-    console.log('[import-preflight] candidate reversed txid, evenY:', deriveH160(candB, true));
-  } catch {}
-
-  // ✅ chosen (known-good): txid "as-is" + no evenY normalization
   const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
     receiverWallet.scanPrivBytes ?? receiverWallet.privBytes,
     receiverWallet.spendPrivBytes ?? receiverWallet.privBytes,
@@ -979,80 +871,37 @@ async function importDepositToShard({ poolState, shardIndex, depositOutpoint, re
     throw new Error(`deposit spend derivation mismatch. expected=${bytesToHex(expectedH160)} derived=${bytesToHex(h160)}`);
   }
 
-  // ---- Locked-in note hash policy (A) ----
-  const noteHash32 = outpointHash32(depositOutpoint.txid, depositOutpoint.vout);
-  console.log('[import] noteHash32A:', bytesToHex(noteHash32));
-
-  const stateIn32 = hexToBytes(shard.commitmentHex);
-  const limbs = []; // placeholder (must match covenant expectations)
-
-  // ---- Locked-in category mode (B) ----
-  const stateOut32 = computePoolStateOut({
-    version: POOL_HASH_FOLD_VERSION.V1_1,
-    stateIn32,
-    category32,
-    noteHash32,
-    limbs,
-    categoryMode: 'none',
-    capByte: 0x01,
-  });
-
-  const proofBlob32 = makeProofBlobV11(noteHash32, 0x50);
-
-  const shardUnlock = buildPoolHashFoldUnlockingBytecode({
-    version: POOL_HASH_FOLD_VERSION.V1_1,
-    limbs,
-    noteHash32,
-    proofBlob32,
-  });
-
-  const tokenOut = {
-    category: category32,
-    nft: { capability: 'mutable', commitment: stateOut32 },
+  // Build shard-import tx using pool-shards (single source of truth)
+  // NOTE: pool-shards builder currently signs BOTH inputs with ownerWallet.signPrivBytes.
+  // To preserve stealth deposits, we pass the one-time priv here.
+  // Covenant signing is currently also done by the same key in pool-shards;
+  // if your covenant requires a distinct key, we should add optional args in pool-shards (see note below).
+  const ownerWalletLike = {
+    signPrivBytes: oneTimePriv,
+    pubkeyHash160Hex: bytesToHex(receiverWallet.hash160),
   };
 
-  const shardOutSpk = addTokenToScript(tokenOut, redeemScript);
+  const result = buildImportDepositToShard({
+    pool: poolState,
+    shardIndex,
+    shardPrevout,
+    depositPrevout,
+    feeSats: DEFAULT_FEE,
+    deps: { txb: deps.txb },
+    signers: {
+      covenantPrivBytes: receiverWallet.privBytes, // or explicit covenant key
+      depositPrivBytes: oneTimePriv,
+    },
+  });
 
-  const tx = {
-    version: 2,
-    locktime: 0,
-    inputs: [
-      {
-        txid: shard.txid,
-        vout: shard.vout,
-        scriptSig: shardUnlock,
-        sequence: 0xffffffff,
-      },
-      {
-        txid: depositOutpoint.txid,
-        vout: depositOutpoint.vout,
-        scriptSig: new Uint8Array(),
-        sequence: 0xffffffff,
-      },
-    ],
-    outputs: [{ value: newShardValue, scriptPubKey: shardOutSpk }],
-  };
-
-  signInput(tx, 1, oneTimePriv, depositPrev.scriptPubKey, BigInt(depositPrev.value));
-
-  const rawTx = buildRawTx(tx);
-
-  if (typeof parseTx === 'function') {
-    const parsed = parseTx(rawTx);
-    const out0 = parsed.outputs?.[0];
-    const outCommit = out0?.token_data?.nft?.commitment;
-    if (!outCommit || bytesToHex(outCommit) !== bytesToHex(stateOut32)) {
-      throw new Error('preflight: output commitment mismatch vs computed stateOut');
-    }
-  }
-
-  const txid = await broadcastTx(rawTx);
+  const txid = await deps.broadcast.broadcastTx(result.rawTx);
 
   poolState.shards[shardIndex] = {
+    ...poolState.shards[shardIndex],
     txid,
     vout: 0,
-    value: newShardValue.toString(),
-    commitmentHex: bytesToHex(stateOut32),
+    value: result.diagnostics.newShardValueSats,
+    commitmentHex: result.diagnostics.stateOut32Hex,
   };
 
   return { txid };
@@ -1102,8 +951,11 @@ async function ensureImport({ state, receiverWallet, shardIndexOpt = null, fresh
   }
 
   const shardCount = state.shards.length;
-  const noteHash = outpointHash32(dep.txid, dep.vout);
-  const derivedIndex = noteHash[0] % shardCount;
+  const derivedIndex = selectShardIndex({
+    depositTxidHex: dep.txid,
+    depositVout: dep.vout,
+    shardCount,
+  });
   const shardIndex =
     shardIndexOpt == null ? derivedIndex : Math.max(0, Math.min(shardCount - 1, Number(shardIndexOpt)));
 
@@ -1146,31 +998,25 @@ async function withdrawFromShard({
   senderTag = ACTOR_B.id,
   receiverPaycodePub33,
 }) {
-  ensureStateDefaults(poolState);
-
-  const redeemScript = hexToBytes(poolState.redeemScriptHex);
-  const category32 = hexToBytes(poolState.categoryHex);
+  const deps = makePoolShardsDeps();
 
   const shard = poolState.shards[shardIndex];
   if (!shard) throw new Error(`Unknown shard index ${shardIndex}`);
 
-  const shardPrev = await getPrevOutput(shard.txid, shard.vout);
-  const shardValue = BigInt(shardPrev.value);
+  const shardPrevout = await deps.prevouts.getPrevout(shard.txid, shard.vout);
 
-  const payment = BigInt(amountSats);
-  if (payment < BigInt(DUST)) throw new Error('withdraw amount below dust');
-  if (shardValue < payment + BigInt(DUST)) throw new Error('shard value too small for withdraw');
-
-  const newShardValue = shardValue - payment;
-
+  // fee input selection stays in CLI (orchestrator responsibility)
   const feeUtxo = await selectFundingUtxo({
     state: poolState,
     wallet: senderWallet,
     ownerTag: senderTag,
     minSats: BigInt(DUST) + 2_000n,
   });
-  const feePrev = feeUtxo.prevOut;
 
+  const feePrevout = await deps.prevouts.getPrevout(feeUtxo.txid, feeUtxo.vout);
+
+  // Receiver output is stealth P2PKH in your demo; pool-shards withdraw builder pays to a P2PKH hash160.
+  // So derive the receiver stealth hash160 here (demo policy), then pass it in.
   const { intent: payIntent, rpaContext: payContext } = deriveStealthP2pkhLock({
     senderWallet,
     receiverPaycodePub33,
@@ -1178,114 +1024,37 @@ async function withdrawFromShard({
     prevoutN: feeUtxo.vout,
     index: 0,
   });
-  const paySpk = p2pkhLockingBytecode(payIntent.childHash160);
 
-  const { intent: changeIntent, rpaContext: changeContext } = deriveStealthP2pkhLock({
-    senderWallet,
-    receiverPaycodePub33: senderPaycodePub33,
-    prevoutTxidHex: feeUtxo.txid,
-    prevoutN: feeUtxo.vout,
-    index: 1,
-  });
-  const changeSpk = p2pkhLockingBytecode(changeIntent.childHash160);
-
-  const feeRate = await pickFeeRateOrFallback();
-  const estSize = 420; // rough: 2 inputs (1 covenant), 3 outputs
-  const fee = BigInt(feeRate) * BigInt(estSize);
-
-  // Placeholder: fold "nullifier-ish" into state
-  const nullifier32 = sha256(
-    flattenBinArray([hexToBytes(shard.commitmentHex), payIntent.childHash160, sha256(uint32le(amountSats >>> 0))])
-  );
-  const proofBlob32 = sha256(flattenBinArray([nullifier32, Uint8Array.from([0x02])]));
-  const limbs = [];
-
-  const stateIn32 = hexToBytes(shard.commitmentHex);
-  const stateOut32 = computePoolStateOut({
-    version: POOL_HASH_FOLD_VERSION.V1_1,
-    stateIn32,
-    category32,
-    noteHash32: nullifier32,
-    limbs,
-    categoryMode: 'none',
-    capByte: 0x01,
-  });
-
-  const shardUnlock = buildPoolHashFoldUnlockingBytecode({
-    version: POOL_HASH_FOLD_VERSION.V1_1,
-    limbs,
-    noteHash32: nullifier32,
-    proofBlob32,
-  });
-
-  const tokenOut = { category: category32, nft: { capability: 'mutable', commitment: stateOut32 } };
-  const shardOutSpk = addTokenToScript(tokenOut, redeemScript);
-
-  const feeValue = BigInt(feePrev.value);
-  let changeValue = feeValue - fee;
-
-  const outputs = [
-    { value: newShardValue, scriptPubKey: shardOutSpk },
-    { value: payment, scriptPubKey: paySpk },
-  ];
-
-  let changeRec = null;
-  if (changeValue >= BigInt(DUST)) {
-    outputs.push({ value: changeValue, scriptPubKey: changeSpk });
-
-    changeRec = {
-      owner: senderTag,
-      purpose: 'withdraw_change',
-      txid: '<pending>',
-      vout: 2,
-      value: changeValue.toString(),
-      hash160Hex: bytesToHex(changeIntent.childHash160),
-      rpaContext: changeContext,
-      createdAt: new Date().toISOString(),
-    };
-  } else {
-    changeValue = 0n; // avoid dust output
-  }
-
-  const tx = {
-    version: 2,
-    locktime: 0,
-    inputs: [
-      { txid: shard.txid, vout: shard.vout, scriptSig: shardUnlock, sequence: 0xffffffff },
-      { txid: feeUtxo.txid, vout: feeUtxo.vout, scriptSig: new Uint8Array(), sequence: 0xffffffff },
-    ],
-    outputs,
+  const ownerWalletLike = {
+    signPrivBytes: feeUtxo.signPrivBytes, // signs fee input (and covenant input in pool-shards unless overridden)
+    pubkeyHash160Hex: bytesToHex(senderWallet.hash160),
   };
 
-  signInput(tx, 1, feeUtxo.signPrivBytes, feePrev.scriptPubKey, BigInt(feePrev.value));
+  const result = buildWithdrawFromShard({
+    pool: poolState,
+    shardIndex,
+    shardPrevout,
+    feePrevout,
+    receiverP2pkhHash160Hex: bytesToHex(payIntent.childHash160),
+    amountSats: BigInt(amountSats),
+    feeSats: DEFAULT_FEE,
+    deps: { txb: deps.txb },
+    signers: {
+      covenantPrivBytes: senderWallet.privBytes,   // or covenant key
+      feePrivBytes: feeUtxo.signPrivBytes,         // from selected UTXO
+    },
+    // and change hash160 comes from senderWallet for now (or later stealth change)
+    senderWallet: { pubkeyHash160Hex: bytesToHex(senderWallet.hash160) },
+  });
 
-  const rawTx = buildRawTx(tx);
-  const txid = await broadcastTx(rawTx);
+  const txid = await deps.broadcast.broadcastTx(result.rawTx);
 
-  console.log(
-    `[withdraw] payment (stealth) -> outpoint ${txid}:1 value=${payment.toString()} sats hash160=${bytesToHex(payIntent.childHash160)}`
-  );
-
-  if (changeRec && changeValue > 0n) {
-    console.log(
-      `[withdraw] change (stealth)  -> outpoint ${txid}:${changeRec.vout} value=${changeValue.toString()} sats hash160=${changeRec.hash160Hex}`
-    );
-  } else {
-    console.log(`[withdraw] change: none (remainder absorbed into fee to avoid dust)`);
-  }
-
-  if (feeUtxo.source === 'stealth') markStealthSpent(poolState, feeUtxo.txid, feeUtxo.vout, txid);
-
-  if (changeRec) {
-    changeRec.txid = txid;
-    upsertStealthUtxo(poolState, changeRec);
-  }
-
+  // update state
   poolState.shards[shardIndex] = {
+    ...poolState.shards[shardIndex],
     txid,
     vout: 0,
-    value: newShardValue.toString(),
-    commitmentHex: bytesToHex(stateOut32),
+    commitmentHex: result.diagnostics?.stateOut32Hex ?? poolState.shards[shardIndex].commitmentHex,
   };
 
   poolState.withdrawals.push({

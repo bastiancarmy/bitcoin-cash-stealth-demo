@@ -84,9 +84,14 @@ export function importDepositToShard(args: {
   ensureBytesLen(stateIn32, 32, 'stateIn32');
 
   const fee = feeSats !== undefined ? asBigInt(feeSats, 'feeSats') : 0n;
-  const changeValue = depositPrevout.valueSats - fee;
-  if (changeValue < DUST_SATS) {
-    throw new Error(`importDepositToShard: deposit too small after fee; got ${changeValue.toString()} sats`);
+
+  const shardValueIn = asBigInt(shardPrevout.valueSats, 'shardPrevout.valueSats');
+  const depositValueIn = asBigInt(depositPrevout.valueSats, 'depositPrevout.valueSats');
+  
+  const newShardValue = shardValueIn + depositValueIn - fee;
+  
+  if (newShardValue < DUST_SATS) {
+    throw new Error(`importDepositToShard: new shard value below dust; got ${newShardValue.toString()} sats`);
   }
 
   // noteHash = outpointHash32(deposit outpoint)
@@ -130,10 +135,7 @@ export function importDepositToShard(args: {
       { txid: shardPrevout.txid, vout: shardPrevout.vout, sequence: 0xffffffff }, // covenant
       { txid: depositPrevout.txid, vout: depositPrevout.vout, sequence: 0xffffffff }, // deposit P2PKH
     ],
-    outputs: [
-      { value: asBigInt(shard.valueSats, 'shard.valueSats'), scriptPubKey: shardOutSpk },
-      { value: changeValue, scriptPubKey: depositPrevout.scriptPubKey },
-    ],
+    outputs: [{ value: newShardValue, scriptPubKey: shardOutSpk }],
   };
 
   // covenant unlocking: signCovenantInput(tx, idx, priv, redeem, value, rawPrevScript, amount, [hashtype])
@@ -163,6 +165,7 @@ export function importDepositToShard(args: {
     ...shard,
     txid: '<pending>',
     vout: 0,
+    valueSats: newShardValue.toString(),
     commitmentHex: bytesToHex(stateOut32),
   };
 
@@ -175,7 +178,9 @@ export function importDepositToShard(args: {
     noteHash32Hex: bytesToHex(noteHash32),
     limbsHex: limbs.map(bytesToHex),
     feeSats: fee.toString(),
-    changeSats: changeValue.toString(),
+    shardValueInSats: shardValueIn.toString(),
+    depositValueInSats: depositValueIn.toString(),
+    newShardValueSats: newShardValue.toString(),
     policy: {
       poolHashFoldVersion: 'V1_1',
       categoryMode: effectiveCategoryMode,

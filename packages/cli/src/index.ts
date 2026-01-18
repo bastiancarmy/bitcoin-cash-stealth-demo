@@ -23,14 +23,14 @@
  *   - NULLIFIERS: we fold a placeholder "nullifier hash" into state.
  *     (Future: ZK spend reveals nullifier w/o linking to note outpoint.)
  *
- * Recommended way to run:
- *   node src/demo_sharded_pool.js run --shards 8 --deposit 120000 --withdraw 50000
+ * Recommended quickstart:
+ *   bch-stealth pool run --shards 8 --deposit 120000 --withdraw 50000
  *
- * You can also run steps individually:
- *   node src/demo_sharded_pool.js init --shards 8
- *   node src/demo_sharded_pool.js deposit --amount 120000
- *   node src/demo_sharded_pool.js import
- *   node src/demo_sharded_pool.js withdraw --amount 50000
+ * Run steps individually (same flow as `run`):
+ *   bch-stealth pool init --shards 8
+ *   bch-stealth pool deposit --amount 120000
+ *   bch-stealth pool import
+ *   bch-stealth pool withdraw --amount 50000
  */
 
 import { secp256k1 } from '@noble/curves/secp256k1.js';
@@ -1673,7 +1673,7 @@ async function loadDemoActors() {
 const program = new Command();
 
 program
-  .name('demo_sharded_pool')
+  .name('bch-stealth')
   .description('Sharded per-user pool demo (Phase 2.5 scaffolding)')
   .option('--pool-version <ver>', 'pool hash-fold version: v1 or v1_1', 'v1_1')
   .option('--state-file <path>', 'demo state file', STORE_FILE);

@@ -25,9 +25,7 @@
     "test": "yarn build && node --test ./tests/**/*.test.js"
   },
   "dependencies": {
-    "@bch-stealth/electrum": "workspace:^",
     "@bch-stealth/pool-hash-fold": "workspace:^",
-    "@bch-stealth/rpa": "workspace:^",
     "@bch-stealth/tx-builder": "workspace:^",
     "@bch-stealth/utils": "workspace:^",
     "typescript": "^5.9.3"

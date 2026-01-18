@@ -102,7 +102,9 @@ export type ImportDepositDiagnostics = {
   noteHash32Hex: string;
   limbsHex: string[];
   feeSats: string;
-  changeSats: string;
+  shardValueInSats: string;
+  depositValueInSats: string;
+  newShardValueSats: string;
   policy: PolicyDiagnostics;
 };
 
