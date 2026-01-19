@@ -1,3 +1,5 @@
+// packages/pool-state/src/index.ts
+
 export type {
   PoolState,
   ShardPointer,
@@ -18,6 +20,7 @@ export {
 export {
   POOL_STATE_STORE_KEY,
   LEGACY_POOL_STATE_STORE_KEY,
+  LEGACY_POOL_STATE_STORE_KEY_V0,
   DEFAULT_STATE_DIRNAME,
   DEFAULT_STATE_FILENAME,
   resolveDefaultPoolStatePaths,
@@ -27,3 +30,6 @@ export {
 } from './io.js';
 
 export { FileBackedPoolStateStore } from './filestore.js';
+
+// Optional legacy file importer (kept for MVP transition)
+export { importLegacyShardedPoolState } from './legacy.js';

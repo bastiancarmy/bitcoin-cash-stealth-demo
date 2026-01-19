@@ -1,4 +1,4 @@
-// pool-state/src/legacy.ts
+// packages/pool-state/src/legacy.ts
 import { promises as fs } from 'node:fs';
 import type { PoolStateStore } from './types.js';
 
@@ -20,14 +20,13 @@ type LegacyFile = {
   deposits?: unknown[];
   withdrawals?: unknown[];
   stealthUtxos?: unknown[];
-  [k: string]: unknown; // keep everything
+  [k: string]: unknown;
 };
 
-function normalizePoolVersion(v: string): 'v1' | 'v1.1' {
+function normalizePoolVersion(v: string): string {
   if (v === 'v1') return 'v1';
   if (v === 'v1_1' || v === 'v1.1') return 'v1.1';
-  // fall back to v1.1 for demo; or throw if you prefer strictness
-  return 'v1.1';
+  return String(v);
 }
 
 /**
@@ -47,12 +46,16 @@ export async function importLegacyShardedPoolState(opts: {
   const legacy = JSON.parse(raw) as LegacyFile;
 
   const poolState = {
-    poolIdHex: (legacy as any).poolIdHex ?? 'unknown', // if present in other variants
+    schemaVersion: 1 as const,
+
+    poolIdHex: (legacy as any).poolIdHex ?? 'unknown',
     poolVersion: normalizePoolVersion(String(legacy.poolVersion)),
     shardCount: legacy.shards.length,
-    network: legacy.network === 'chipnet' ? 'chipnet' : 'chipnet', // default
+    network: String(legacy.network ?? 'chipnet'),
+
     categoryHex: legacy.categoryHex,
     redeemScriptHex: legacy.redeemScriptHex,
+
     shards: legacy.shards.map((s, i) => ({
       index: s.index ?? i,
       txid: s.txid,
@@ -62,18 +65,12 @@ export async function importLegacyShardedPoolState(opts: {
     })),
   };
 
-  // Write canonical state
   store.set('pool.state', poolState);
-
-  // Preserve the full legacy object too (lossless archive)
   store.set('pool.legacy', legacy);
 
-  // Preserve common arrays where the CLI might still use them
   if (legacy.deposits) store.set('pool.deposits', legacy.deposits);
   if (legacy.withdrawals) store.set('pool.withdrawals', legacy.withdrawals);
   if (legacy.stealthUtxos) store.set('stealth.utxos', legacy.stealthUtxos);
-
-  // Preserve legacy "txid" as metadata (so nothing disappears)
   if (legacy.txid) store.set('pool.meta.lastTxid', legacy.txid);
 
   await store.flush();

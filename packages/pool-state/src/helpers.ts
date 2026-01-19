@@ -1,34 +1,138 @@
-import type { PoolState, DepositRecord, StealthUtxoRecord } from './state.js';
+// packages/pool-state/src/helpers.ts
+import type { PoolState, DepositRecord, StealthUtxoRecord, ShardPointer } from './state.js';
 
-export function ensurePoolStateDefaults(state?: PoolState | null, networkDefault?: string): PoolState {
-  const st = (state ?? {}) as PoolState;
+function isRecord(x: unknown): x is Record<string, unknown> {
+  return !!x && typeof x === 'object';
+}
 
+function normalizeShardPointer(s: any, fallbackIndex: number): ShardPointer {
+  const index = typeof s?.index === 'number' ? s.index : fallbackIndex;
+
+  // legacy shard pointers used `value` instead of `valueSats`
+  const valueSats =
+    typeof s?.valueSats === 'string'
+      ? s.valueSats
+      : typeof s?.value === 'string'
+        ? s.value
+        : '0';
+
+  return {
+    index,
+    txid: String(s?.txid ?? ''),
+    vout: Number(s?.vout ?? 0),
+    valueSats,
+    commitmentHex: String(s?.commitmentHex ?? ''),
+  };
+}
+
+function normalizeDeposit(d: any): DepositRecord {
+  const valueSats =
+    typeof d?.valueSats === 'string'
+      ? d.valueSats
+      : typeof d?.value === 'string'
+        ? d.value
+        : '0';
+
+  return {
+    ...d,
+    txid: String(d?.txid ?? ''),
+    vout: Number(d?.vout ?? 0),
+    valueSats,
+    // keep legacy field if it exists (but canonical is valueSats)
+    value: typeof d?.value === 'string' ? d.value : undefined,
+    receiverRpaHash160Hex: String(d?.receiverRpaHash160Hex ?? ''),
+    createdAt: String(d?.createdAt ?? new Date().toISOString()),
+    rpaContext: d?.rpaContext,
+  } as DepositRecord;
+}
+
+function normalizeStealthUtxo(r: any): StealthUtxoRecord {
+  const valueSats =
+    typeof r?.valueSats === 'string'
+      ? r.valueSats
+      : typeof r?.value === 'string'
+        ? r.value
+        : '0';
+
+  return {
+    ...r,
+    txid: String(r?.txid ?? ''),
+    vout: Number(r?.vout ?? 0),
+    valueSats,
+    value: typeof r?.value === 'string' ? r.value : undefined,
+    hash160Hex: String(r?.hash160Hex ?? ''),
+    createdAt: String(r?.createdAt ?? new Date().toISOString()),
+    rpaContext: r?.rpaContext,
+    owner: String(r?.owner ?? ''),
+    purpose: String(r?.purpose ?? ''),
+  } as StealthUtxoRecord;
+}
+
+/**
+ * Ensure a PoolState is in canonical v1 shape.
+ * - Idempotent: safe to call multiple times.
+ * - Tolerant: keeps extra legacy fields without deleting them.
+ */
+export function ensurePoolStateDefaults(state?: PoolState | any | null, networkDefault?: string): PoolState {
+  const st: any = (state ?? {}) as any;
+
+  // canonical schemaVersion
+  if (st.schemaVersion !== 1) st.schemaVersion = 1;
+
+  // network defaulting
   const net = networkDefault ?? st.network;
   if (net) st.network = st.network ?? net;
+  if (!st.network) st.network = networkDefault ?? 'chipnet';
 
-  st.shards = Array.isArray(st.shards) ? st.shards : [];
-  st.stealthUtxos = Array.isArray(st.stealthUtxos) ? st.stealthUtxos : [];
-  st.deposits = Array.isArray(st.deposits) ? st.deposits : [];
-  st.withdrawals = Array.isArray(st.withdrawals) ? st.withdrawals : [];
+  // Required-ish canonical fields (keep tolerant; migrations should set these)
+  st.poolIdHex = st.poolIdHex ?? 'unknown';
+  st.poolVersion = st.poolVersion ?? 'unknown';
+  st.categoryHex = st.categoryHex ?? st.categoryHex ?? '';
+  st.redeemScriptHex = st.redeemScriptHex ?? st.redeemScriptHex ?? '';
 
-  return st;
+  // shards: normalize pointers + compute shardCount
+  const shardsIn = Array.isArray(st.shards) ? st.shards : [];
+  st.shards = shardsIn.map((s: any, i: number) => normalizeShardPointer(s, i));
+  st.shardCount =
+    typeof st.shardCount === 'number' && Number.isFinite(st.shardCount)
+      ? st.shardCount
+      : st.shards.length;
+
+  // optional history arrays (default empty arrays, but keep optional on the object)
+  const stealthIn = Array.isArray(st.stealthUtxos) ? st.stealthUtxos : [];
+  const depositsIn = Array.isArray(st.deposits) ? st.deposits : [];
+  const withdrawalsIn = Array.isArray(st.withdrawals) ? st.withdrawals : [];
+
+  st.stealthUtxos = stealthIn.map(normalizeStealthUtxo);
+  st.deposits = depositsIn.map(normalizeDeposit);
+  st.withdrawals = withdrawalsIn;
+
+  return st as PoolState;
 }
 
 export function upsertDeposit(state: PoolState, dep: DepositRecord): void {
   const st = ensurePoolStateDefaults(state);
-  const i = st.deposits.findIndex((d) => d.txid === dep.txid && d.vout === dep.vout);
-  if (i >= 0) st.deposits[i] = { ...st.deposits[i], ...dep };
-  else st.deposits.push(dep);
+
+  // normalize input record too
+  const normalized = ensurePoolStateDefaults({
+    ...st,
+    deposits: [dep],
+  } as any).deposits?.[0] as DepositRecord;
+
+  const deps = st.deposits ?? (st.deposits = []);
+  const i = deps.findIndex((d) => d.txid === normalized.txid && d.vout === normalized.vout);
+  if (i >= 0) deps[i] = { ...deps[i], ...normalized };
+  else deps.push(normalized);
 }
 
 export function getLatestUnimportedDeposit(state: PoolState, amountSats: number | null): DepositRecord | null {
   const st = ensurePoolStateDefaults(state);
-  const deps = Array.isArray(st?.deposits) ? st.deposits : [];
+  const deps = Array.isArray(st?.deposits) ? st.deposits! : [];
   for (let i = deps.length - 1; i >= 0; i--) {
     const d = deps[i];
     if (!d) continue;
     if (d.importTxid) continue;
-    if (amountSats != null && Number(d.value) !== Number(amountSats)) continue;
+    if (amountSats != null && Number(d.valueSats ?? d.value) !== Number(amountSats)) continue;
     return d;
   }
   return null;
@@ -36,19 +140,29 @@ export function getLatestUnimportedDeposit(state: PoolState, amountSats: number 
 
 export function upsertStealthUtxo(state: PoolState, rec: StealthUtxoRecord): void {
   const st = ensurePoolStateDefaults(state);
-  const key = `${rec.txid}:${rec.vout}`;
-  const idx = st.stealthUtxos.findIndex((r) => r && `${r.txid}:${r.vout}` === key);
-  if (idx >= 0) st.stealthUtxos[idx] = { ...st.stealthUtxos[idx], ...rec };
-  else st.stealthUtxos.push(rec);
+
+  // normalize input record too
+  const normalized = ensurePoolStateDefaults({
+    ...st,
+    stealthUtxos: [rec],
+  } as any).stealthUtxos?.[0] as StealthUtxoRecord;
+
+  const list = st.stealthUtxos ?? (st.stealthUtxos = []);
+  const key = `${normalized.txid}:${normalized.vout}`;
+  const idx = list.findIndex((r) => r && `${r.txid}:${r.vout}` === key);
+  if (idx >= 0) list[idx] = { ...list[idx], ...normalized };
+  else list.push(normalized);
 }
 
 export function markStealthSpent(state: PoolState, txid: string, vout: number, spentInTxid: string): void {
   const st = ensurePoolStateDefaults(state);
+  const list = st.stealthUtxos ?? (st.stealthUtxos = []);
+
   const key = `${txid}:${vout}`;
-  const idx = st.stealthUtxos.findIndex((r) => r && `${r.txid}:${r.vout}` === key);
+  const idx = list.findIndex((r) => r && `${r.txid}:${r.vout}` === key);
   if (idx >= 0) {
-    st.stealthUtxos[idx] = {
-      ...st.stealthUtxos[idx],
+    list[idx] = {
+      ...list[idx],
       spentInTxid,
       spentAt: new Date().toISOString(),
     };
