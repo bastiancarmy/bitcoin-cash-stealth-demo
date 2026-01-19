@@ -21,6 +21,7 @@ export type ShardPointer = {
 };
 
 export type PoolState = {
+  schemaVersion?: 1 
   poolIdHex: string;
   poolVersion: string;
   shardCount: number;

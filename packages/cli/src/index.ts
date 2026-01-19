@@ -57,8 +57,6 @@ import {
   // io
   resolveDefaultPoolStatePaths,
   migrateLegacyPoolStateDirSync,
-  readPoolState,
-  writePoolState,
   POOL_STATE_STORE_KEY
 } from '@bch-stealth/pool-state';
 
@@ -88,6 +86,15 @@ import * as TxBuilder from '@bch-stealth/tx-builder';
 import { NETWORK, DUST } from './config.js';
 import { getWallets, findRepoRoot } from './wallets.js';
 import { setupPaycodesAndDerivation, extractPubKeyFromPaycode } from './paycodes.js';
+
+// Local CLI pool helpers (new refactor modules)
+import { loadStateOrEmpty, saveState } from './pool/state.js';
+import { makeChainIO } from './pool/io.js';
+import {
+  toPoolShardsState,
+  patchShardFromNextPoolState,
+  normalizeValueSats,
+} from './pool/adapters.js';
 
 // -------------------------------------------------------------------------------------
 // pool-hash-fold namespace
@@ -129,6 +136,13 @@ const {
 } = Electrum as any;
 
 const { buildRawTx, signInput, addTokenToScript } = TxBuilder as any;
+
+// Consolidated chain IO boundary (we’ll switch callsites incrementally)
+const chainIO = makeChainIO({
+  network: NETWORK,
+  electrum: Electrum as any,
+  txb: TxBuilder as any,
+});
 
 // -------------------------------------------------------------------------------------
 // Local structural types (keep wallet/tooling unblocked without depending on upstream typings)
@@ -173,19 +187,13 @@ function makeStore(): FileBackedPoolStateStore {
   return new FileBackedPoolStateStore({ filename });
 }
 
-async function readState(store: FileBackedPoolStateStore): Promise<PoolState | null> {
-  const state = await readPoolState({ store, networkDefault: NETWORK });
-
-  // If pool-state performed any migration on read, persist the migrated form.
-  if (state) {
-    await writePoolState({ store, state, networkDefault: NETWORK });
-  }
-
-  return state;
+async function readState(store: FileBackedPoolStateStore): Promise<PoolState> {
+  // Always returns a concrete PoolState and persists migrations/defaults immediately.
+  return await loadStateOrEmpty({ store, network: NETWORK });
 }
 
 async function writeState(store: FileBackedPoolStateStore, state: PoolState): Promise<void> {
-  await writePoolState({ store, state, networkDefault: NETWORK });
+  await saveState({ store, state, network: NETWORK });
 }
 
 // -------------------------------------------------------------------------------------
@@ -689,64 +697,6 @@ async function tryRepairShardsFromWallet({
 // -------------------------------------------------------------------------------------
 // Core demo steps
 // -------------------------------------------------------------------------------------
-
-function normalizeValueSats(rec: any): string {
-  // Prefer canonical pool-state field
-  if (rec?.valueSats != null) return String(rec.valueSats);
-  // Legacy fallback
-  if (rec?.value != null) return String(rec.value);
-  return '0';
-}
-
-function toPoolShardsState(st: PoolState): PoolShards.PoolState {
-  const state = ensurePoolStateDefaults(st);
-
-  if (!state.categoryHex || !state.redeemScriptHex) {
-    throw new Error('State missing categoryHex/redeemScriptHex.');
-  }
-
-  return {
-    poolIdHex: state.poolIdHex ?? bytesToHex(hash160(hexToBytes(state.categoryHex))),
-    poolVersion: String(state.poolVersion ?? 'v1_1'),
-    shardCount: state.shardCount ?? state.shards.length,
-    network: state.network ?? NETWORK,
-    categoryHex: state.categoryHex,
-    redeemScriptHex: state.redeemScriptHex,
-    shards: state.shards.map((s, i) => ({
-      index: (s as any).index ?? i,
-      txid: s.txid,
-      vout: s.vout,
-      valueSats: normalizeValueSats(s),
-      commitmentHex: s.commitmentHex,
-    })),
-  };
-}
-
-/**
- * After broadcasting a shard-tx, patch the CLI pool-state shard pointer using the builder's nextPoolState.
- * Assumes the shard output is vout=0 for import/withdraw updates (matches your current builder conventions).
- */
-function patchShardFromNextPoolState(args: {
-  poolState: PoolState;
-  shardIndex: number;
-  txid: string;
-  nextPool: PoolShards.PoolState;
-}): void {
-  const { poolState, shardIndex, txid, nextPool } = args;
-
-  const newShard = nextPool.shards[shardIndex];
-  if (!newShard) throw new Error(`patchShardFromNextPoolState: missing shard ${shardIndex} in nextPoolState`);
-
-  poolState.shards[shardIndex] = {
-    ...(poolState.shards[shardIndex] as any),
-    index: (poolState.shards[shardIndex] as any).index ?? shardIndex,
-    txid,
-    vout: 0,
-    valueSats: String(newShard.valueSats),
-    commitmentHex: newShard.commitmentHex,
-  } as any;
-}
-
 async function initShardsTx({
   state = null,
   ownerWallet,
@@ -1101,8 +1051,14 @@ async function importDepositToShard({
   depositOutpoint: DepositRecord;
   receiverWallet: WalletLike;
 }): Promise<{ txid: string }> {
+  // Normalize + guarantee optional arrays exist (safe no-op if already present)
+  const st = ensurePoolStateDefaults(poolState);
+  st.deposits ??= [];
+  st.withdrawals ??= [];
+  st.stealthUtxos ??= [];
+
   // ----- gather inputs from chain (CLI IO boundary) -----
-  const shard = poolState.shards[shardIndex];
+  const shard = st.shards[shardIndex];
   if (!shard) throw new Error(`invalid shardIndex ${shardIndex}`);
 
   const shardPrev = await getPrevOutput(shard.txid, shard.vout);
@@ -1133,12 +1089,12 @@ async function importDepositToShard({
     );
   }
 
-  if (!poolState.categoryHex || !poolState.redeemScriptHex) {
+  if (!st.categoryHex || !st.redeemScriptHex) {
     throw new Error('State missing categoryHex/redeemScriptHex. Run init first or repair state.');
-  } 
+  }
 
   // ----- call canonical builder (pool-shards) -----
-  const pool = toPoolShardsState(poolState);
+  const pool = toPoolShardsState(st, NETWORK);
 
   const shardPrevout: PoolShards.PrevoutLike = {
     txid: shard.txid,
@@ -1179,15 +1135,13 @@ async function importDepositToShard({
   const rawHex = bytesToHex(built.rawTx);
   const txid = await broadcastTx(rawHex);
 
-  // ----- patch CLI pool-state shard pointer -----
-  const newShard = built.nextPoolState.shards[shardIndex];
-  poolState.shards[shardIndex] = {
-    ...(poolState.shards[shardIndex] as any),
+  // ----- patch CLI pool-state shard pointer (canonical helper) -----
+  patchShardFromNextPoolState({
+    poolState: st,
+    shardIndex,
     txid,
-    vout: 0,
-    value: String(newShard.valueSats),
-    commitmentHex: newShard.commitmentHex,
-  } as any;
+    nextPool: built.nextPoolState,
+  });
 
   return { txid };
 }
@@ -1204,6 +1158,9 @@ async function ensureImport({
   fresh?: boolean;
 }): Promise<{ txid: string; shardIndex: number } | null> {
   const st = ensurePoolStateDefaults(state);
+  st.deposits ??= [];
+  st.withdrawals ??= [];
+  st.stealthUtxos ??= [];
 
   const dep =
     (st.lastDeposit && !st.lastDeposit.importTxid ? st.lastDeposit : null) ??
@@ -1338,7 +1295,7 @@ async function withdrawFromShard({
   });
 
   // Build canonical pool-shards PoolState view
-  const pool = toPoolShardsState(st);
+  const pool = toPoolShardsState(st, NETWORK);
 
   const shardPrevout: PoolShards.PrevoutLike = {
     txid: shard.txid,
@@ -1412,7 +1369,7 @@ async function withdrawFromShard({
 
   // patch shard pointer from builder output
   patchShardFromNextPoolState({
-    poolState,
+    poolState: st,
     shardIndex,
     txid,
     nextPool: built.nextPoolState,
@@ -1631,8 +1588,8 @@ pool
       throw new Error(`amount must be >= dust (${DUST})`);
     }
 
-    const state = (await readPoolState({ store, networkDefault: NETWORK })) ?? emptyPoolState();
-    await writePoolState({ store, state, networkDefault: NETWORK });
+    const state = (await readState(store)) ?? emptyPoolState();
+    await writeState(store, state);
 
     const { actorABaseWallet, actorAPaycodePub33, actorBPaycodePub33 } = await loadDemoActors();
 
@@ -1662,8 +1619,9 @@ pool
     assertChipnet();
     const store = makeStore();
 
-    const state = (await readPoolState({ store, networkDefault: NETWORK })) ?? emptyPoolState();
-    await writePoolState({ store, state, networkDefault: NETWORK });
+    const state = (await readState(store)) ?? emptyPoolState();
+    await writeState(store, state);
+
     if (!state?.shards?.length) throw new Error(`Run init first (state missing shards).`);
 
     const { actorBBaseWallet } = await loadDemoActors();
@@ -1713,8 +1671,9 @@ pool
     assertChipnet();
     const store = makeStore();
 
-    const state = (await readPoolState({ store, networkDefault: NETWORK })) ?? emptyPoolState();
-    await writePoolState({ store, state, networkDefault: NETWORK });
+    const state = (await readState(store)) ?? emptyPoolState();
+    await writeState(store, state);
+
     if (!state?.shards?.length) throw new Error(`Run init first (state missing shards).`);
 
     const shardIndex = Number(opts.shard);
