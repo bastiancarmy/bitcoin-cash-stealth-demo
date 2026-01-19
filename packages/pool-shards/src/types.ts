@@ -21,7 +21,12 @@ export type ShardPointer = {
 };
 
 export type PoolState = {
-  schemaVersion?: 1 
+  /**
+   * Optional, for schema alignment with @bch-stealth/pool-state (canonical v1).
+   * Builders do not depend on this field.
+   */
+  schemaVersion?: 1;
+
   poolIdHex: string;
   poolVersion: string;
   shardCount: number;
@@ -29,6 +34,14 @@ export type PoolState = {
   categoryHex: string; // 32-byte hex
   redeemScriptHex: string; // covenant redeemScript bytes (hex)
   shards: ShardPointer[];
+
+  /**
+   * Optional operational history (append-only) — included for contract alignment.
+   * Builders do not depend on these fields.
+   */
+  deposits?: unknown[];
+  withdrawals?: unknown[];
+  stealthUtxos?: unknown[];
 };
 
 // Minimal “wallet-like” signer used by tx builders (avoid CLI types)
