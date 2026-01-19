@@ -1,9 +1,7 @@
 // packages/pool-shards/src/init.ts
 import type { BuilderDeps } from './di.js';
-import { makeDefaultLockingTemplates } from './locking.js';
-import * as txbDefault from '@bch-stealth/tx-builder';
-import { bytesToHex, hexToBytes } from '@bch-stealth/utils';
 
+import { bytesToHex, hexToBytes } from '@bch-stealth/utils';
 import { DUST_SATS, deriveCategory32FromFundingTxidHex, initialShardCommitment32 } from './policy.js';
 
 import type {
@@ -15,21 +13,13 @@ import type {
   InitShardsDiagnostics,
 } from './types.js';
 
-function asBigInt(v: number | string | bigint, label: string): bigint {
-  if (typeof v === 'bigint') return v;
-  if (typeof v === 'number' && Number.isFinite(v)) return BigInt(Math.trunc(v));
-  if (typeof v === 'string') return BigInt(v);
-  throw new Error(`${label} must be number|string|bigint`);
-}
-
-function ensureBytesLen(u8: Uint8Array, n: number, label: string) {
-  if (!(u8 instanceof Uint8Array) || u8.length !== n) throw new Error(`${label} must be ${n} bytes`);
-}
-
-function normalizeRawTxBytes(raw: string | Uint8Array): Uint8Array {
-  if (raw instanceof Uint8Array) return raw;
-  return hexToBytes(raw);
-}
+import {
+  asBigInt,
+  ensureBytesLen,
+  normalizeRawTxBytes,
+  resolveBuilderDeps,
+  makeShardTokenOut,
+} from './shard_common.js';
 
 export function initShardsTx(args: {
   cfg: PoolConfig;
@@ -39,8 +29,7 @@ export function initShardsTx(args: {
   deps?: BuilderDeps;
 }): InitShardsResult {
   const { cfg, shardCount, funding, ownerWallet, deps } = args;
-  const txb = deps?.txb ?? txbDefault;
-  const locking = deps?.locking ?? makeDefaultLockingTemplates({ txb });
+  const { txb, locking } = resolveBuilderDeps(deps);
 
   if (!Number.isInteger(shardCount) || shardCount <= 0) {
     throw new Error('initShardsTx: shardCount must be a positive integer');
@@ -72,7 +61,10 @@ export function initShardsTx(args: {
 
   const redeemScriptHex = bytesToHex(redeemScript);
 
-  const changeSpk = locking.p2pkh(hexToBytes(ownerWallet.pubkeyHash160Hex));
+  const changeHash160 = hexToBytes(ownerWallet.pubkeyHash160Hex);
+  ensureBytesLen(changeHash160, 20, 'ownerWallet.pubkeyHash160Hex');
+
+  const changeSpk = locking.p2pkh(changeHash160);
 
   // output[0] = change; outputs[1..] = shard anchors
   const outputs: any[] = [{ value: 0n, scriptPubKey: changeSpk }];
@@ -88,12 +80,9 @@ export function initShardsTx(args: {
       shardCount,
     });
 
-    const tokenOut = {
-      category: category32,
-      nft: { capability: 'mutable' as const, commitment: commitment32 },
-    };
-
+    const tokenOut = makeShardTokenOut({ category32, commitment32 });
     const shardSpk = locking.shardLock({ token: tokenOut, redeemScript });
+
     outputs.push({ value: shardValue, scriptPubKey: shardSpk });
 
     const commitmentHex = bytesToHex(commitment32);
@@ -123,7 +112,7 @@ export function initShardsTx(args: {
     outputs,
   };
 
-  // funding input is P2PKH
+  // funding input is P2PKH (init currently signs directly)
   txb.signInput(tx, 0, ownerWallet.signPrivBytes, funding.scriptPubKey, funding.valueSats);
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });

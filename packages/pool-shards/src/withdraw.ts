@@ -1,41 +1,24 @@
 // packages/pool-shards/src/withdraw.ts
 import type { BuilderDeps } from './di.js';
 
-import { makeDefaultAuthProvider } from './auth.js';
-import { makeDefaultLockingTemplates } from './locking.js';
-
-import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, concat, hexToBytes, hash160, sha256, uint32le } from '@bch-stealth/utils';
 
 import { DEFAULT_CAP_BYTE, DEFAULT_CATEGORY_MODE, DEFAULT_POOL_HASH_FOLD_VERSION, DUST_SATS } from './policy.js';
-
 import { computePoolStateOut, buildPoolHashFoldUnlockingBytecode } from '@bch-stealth/pool-hash-fold';
 
-import type { PoolState, PrevoutLike, WalletLike, WithdrawResult, CategoryMode, WithdrawDiagnostics } from './types.js';
+import type { PoolState, WithdrawDiagnostics } from './types.js';
 
-function ensureBytesLen(u8: Uint8Array, n: number, label: string) {
-  if (!(u8 instanceof Uint8Array) || u8.length !== n) throw new Error(`${label} must be ${n} bytes`);
-}
-
-function asBigInt(v: number | string | bigint, label: string): bigint {
-  if (typeof v === 'bigint') return v;
-  if (typeof v === 'number' && Number.isFinite(v)) return BigInt(Math.trunc(v));
-  if (typeof v === 'string') return BigInt(v);
-  throw new Error(`${label} must be number|string|bigint`);
-}
-
-function normalizeRawTxBytes(raw: string | Uint8Array): Uint8Array {
-  if (raw instanceof Uint8Array) return raw;
-  return hexToBytes(raw);
-}
+import {
+  asBigInt,
+  ensureBytesLen,
+  normalizeRawTxBytes,
+  resolveBuilderDeps,
+  makeShardTokenOut,
+  appendWitnessInput,
+} from './shard_common.js';
 
 export function withdrawFromShard(args: any) {
   // --- Back-compat / caller normalization ---------------------------------
-  // Preferred API shapes:
-  //   - { covenantWallet, feeWallet, changeP2pkhHash160Hex } OR
-  //   - { senderWallet } (legacy)
-  // New multi-signer shape:
-  //   - { signers?: { covenantPrivBytes, feePrivBytes } }
   const a: any = args ?? {};
 
   const legacyWallet =
@@ -49,7 +32,7 @@ export function withdrawFromShard(args: any) {
     a.changeP2pkhHash160Hex = legacyWallet.pubkeyHash160Hex;
   }
 
-  // Some older shapes used pubkeyHashHex (still 20B hex) — accept it as a fallback.
+  // Some older shapes used pubkeyHashHex (still 20B hex)
   if (!a.changeP2pkhHash160Hex && legacyWallet?.pubkeyHashHex) {
     a.changeP2pkhHash160Hex = legacyWallet.pubkeyHashHex;
   }
@@ -72,7 +55,7 @@ export function withdrawFromShard(args: any) {
     a.feeWallet.signPrivBytes = a.signers.feePrivBytes;
   }
 
-  // Helpful early errors (avoid undefined.pubkeyHash160Hex / undefined.signPrivBytes)
+  // Helpful early errors
   if (!a.covenantWallet?.signPrivBytes) {
     throw new Error(
       'withdrawFromShard: missing covenantWallet.signPrivBytes (or legacy senderWallet.signPrivBytes)'
@@ -108,9 +91,7 @@ export function withdrawFromShard(args: any) {
     witnessPrivBytes,
   } = a;
 
-  const txb = deps?.txb ?? txbDefault;
-  const auth = deps?.auth ?? makeDefaultAuthProvider(txb);
-  const locking = deps?.locking ?? makeDefaultLockingTemplates({ txb });
+  const { txb, auth, locking } = resolveBuilderDeps(deps);
 
   const shard = pool.shards[shardIndex];
   if (!shard) throw new Error(`withdrawFromShard: invalid shardIndex ${shardIndex}`);
@@ -142,7 +123,8 @@ export function withdrawFromShard(args: any) {
   if (changeValue < DUST_SATS) throw new Error('withdrawFromShard: fee prevout too small after fee');
 
   // deterministic “nullifier-ish” update (no electrum required)
-  const nullifier32 = sha256(concat(stateIn32, receiverHash160, sha256(uint32le(Number(payment & 0xffffffffn)))));
+  const nullifier32 = sha256(
+    concat(stateIn32, receiverHash160, sha256(uint32le(Number(payment & 0xffffffffn)))));
   const proofBlob32 = sha256(concat(nullifier32, Uint8Array.of(0x02)));
   const limbs: Uint8Array[] = [];
 
@@ -169,16 +151,11 @@ export function withdrawFromShard(args: any) {
   // (p2shSpk retained for covenant prevout fallback behavior)
   const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
 
-  const tokenOut = {
-    category: category32,
-    nft: { capability: 'mutable' as const, commitment: stateOut32 },
-  };
-
+  const tokenOut = makeShardTokenOut({ category32, commitment32: stateOut32 });
   const shardOutSpk = locking.shardLock({ token: tokenOut, redeemScript });
 
   const paySpk = locking.p2pkh(receiverHash160);
 
-  // default change destination = feeWallet change (but CLI can override with stealth change)
   const changeHash160 = hexToBytes(changeP2pkhHash160Hex ?? feeWallet.pubkeyHash160Hex);
   ensureBytesLen(changeHash160, 20, 'changeHash160');
   const changeSpk = locking.p2pkh(changeHash160);
@@ -197,25 +174,8 @@ export function withdrawFromShard(args: any) {
     ],
   };
 
-  let witnessVin: number | undefined;
-  let witnessPrevoutCtx: any | undefined;
+  const { witnessVin, witnessPrevoutCtx } = appendWitnessInput(tx, witnessPrevout);
 
-  if (witnessPrevout) {
-    tx.inputs.push({
-      txid: witnessPrevout.txid,
-      vout: witnessPrevout.vout,
-      sequence: 0xffffffff,
-    });
-    witnessVin = tx.inputs.length - 1;
-
-    witnessPrevoutCtx = {
-      valueSats: asBigInt(witnessPrevout.valueSats, 'witnessPrevout.valueSats'),
-      scriptPubKey: witnessPrevout.scriptPubKey as Uint8Array,
-      outpoint: { txid: witnessPrevout.txid, vout: witnessPrevout.vout },
-    };
-  }
-
-  // covenant spend (provider applies extraPrefix)
   auth.authorizeCovenantInput({
     tx,
     vin: 0,
@@ -231,7 +191,6 @@ export function withdrawFromShard(args: any) {
     witnessPrevout: witnessPrevoutCtx,
   });
 
-  // fee spend (P2PKH) via provider
   auth.authorizeP2pkhInput({
     tx,
     vin: 1,
@@ -244,7 +203,7 @@ export function withdrawFromShard(args: any) {
     witnessPrevout: witnessPrevoutCtx,
   });
 
-  if (witnessPrevout && witnessVin !== undefined && witnessPrivBytes) {
+  if (witnessPrevout && witnessVin !== undefined && witnessPrivBytes && witnessPrevoutCtx) {
     auth.authorizeP2pkhInput({
       tx,
       vin: witnessVin,

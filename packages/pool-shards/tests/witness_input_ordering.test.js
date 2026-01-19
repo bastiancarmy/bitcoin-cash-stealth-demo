@@ -69,6 +69,8 @@ test('importDepositToShard: witness input appended last when provided', () => {
     shardPrevout,
     depositPrevout,
     witnessPrevout,
+    covenantWallet: { signPrivBytes: u8(32) },
+    depositWallet: { signPrivBytes: u8(32) },
     deps,
   });
 

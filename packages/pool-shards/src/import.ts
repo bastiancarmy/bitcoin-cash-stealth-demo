@@ -1,11 +1,8 @@
 // packages/pool-shards/src/import.ts
 import type { BuilderDeps } from './di.js';
 
-import { makeDefaultAuthProvider } from './auth.js';
-import { makeDefaultLockingTemplates } from './locking.js';
-
-import * as txbDefault from '@bch-stealth/tx-builder';
 import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
+import * as txbDefault from '@bch-stealth/tx-builder';
 
 import {
   DEFAULT_CAP_BYTE,
@@ -21,30 +18,16 @@ import {
   makeProofBlobV11,
 } from '@bch-stealth/pool-hash-fold';
 
-import type {
-  ImportDepositResult,
-  PoolState,
-  PrevoutLike,
-  WalletLike,
-  CategoryMode,
-  ImportDepositDiagnostics,
-} from './types.js';
+import type { PoolState, ImportDepositDiagnostics } from './types.js';
 
-function ensureBytesLen(u8: Uint8Array, n: number, label: string) {
-  if (!(u8 instanceof Uint8Array) || u8.length !== n) throw new Error(`${label} must be ${n} bytes`);
-}
-
-function asBigInt(v: number | string | bigint, label: string): bigint {
-  if (typeof v === 'bigint') return v;
-  if (typeof v === 'number' && Number.isFinite(v)) return BigInt(Math.trunc(v));
-  if (typeof v === 'string') return BigInt(v);
-  throw new Error(`${label} must be number|string|bigint`);
-}
-
-function normalizeRawTxBytes(raw: string | Uint8Array): Uint8Array {
-  if (raw instanceof Uint8Array) return raw;
-  return hexToBytes(raw);
-}
+import {
+  asBigInt,
+  ensureBytesLen,
+  normalizeRawTxBytes,
+  resolveBuilderDeps,
+  makeShardTokenOut,
+  appendWitnessInput,
+} from './shard_common.js';
 
 export function importDepositToShard(args: any) {
   // --- Back-compat / caller normalization ---------------------------------
@@ -66,8 +49,6 @@ export function importDepositToShard(args: any) {
   if (!a.depositWallet && a.covenantWallet) a.depositWallet = a.covenantWallet;
 
   // ---- Multi-signer overlay (B3g) ----------------------------------------
-  // If explicit signers provided, they override the signing keys used by each input.
-  // This keeps callsites stable while enabling correctness for stealth + covenant split.
   if (a.signers?.covenantPrivBytes) {
     if (!a.covenantWallet) a.covenantWallet = {};
     a.covenantWallet.signPrivBytes = a.signers.covenantPrivBytes;
@@ -77,7 +58,7 @@ export function importDepositToShard(args: any) {
     a.depositWallet.signPrivBytes = a.signers.depositPrivBytes;
   }
 
-  // Helpful early errors (so we don’t crash on undefined.signPrivBytes)
+  // Helpful early errors
   if (!a.covenantWallet?.signPrivBytes) {
     throw new Error(
       'importDepositToShard: missing covenantWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
@@ -95,15 +76,17 @@ export function importDepositToShard(args: any) {
     shardIndex,
     shardPrevout,
     depositPrevout,
-    witnessPrevout,
-    witnessPrivBytes,
     covenantWallet,
     depositWallet,
     feeSats,
     categoryMode,
     amountCommitment,
     deps,
+    witnessPrevout,
+    witnessPrivBytes,
   } = a;
+
+  const { txb, auth, locking } = resolveBuilderDeps(deps);
 
   const shard = pool.shards[shardIndex];
   if (!shard) throw new Error(`importDepositToShard: invalid shardIndex ${shardIndex}`);
@@ -154,19 +137,11 @@ export function importDepositToShard(args: any) {
     proofBlob32,
   });
 
-  const txb = deps?.txb ?? txbDefault;
-  const auth = deps?.auth ?? makeDefaultAuthProvider(txb);
-  const locking = deps?.locking ?? makeDefaultLockingTemplates({ txb });
-
   // shard output locking script via templates
   // (p2shSpk retained for covenant prevout fallback behavior)
-  const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
+  const p2shSpk = (deps?.txb ?? txbDefault).getP2SHScript(hash160(redeemScript));
 
-  const tokenOut = {
-    category: category32,
-    nft: { capability: 'mutable' as const, commitment: stateOut32 },
-  };
-
+  const tokenOut = makeShardTokenOut({ category32, commitment32: stateOut32 });
   const shardOutSpk = locking.shardLock({ token: tokenOut, redeemScript });
 
   const tx: any = {
@@ -179,24 +154,7 @@ export function importDepositToShard(args: any) {
     outputs: [{ value: newShardValue, scriptPubKey: shardOutSpk }],
   };
 
-  let witnessVin: number | undefined;
-  let witnessPrevoutCtx: any | undefined;
-
-  if (witnessPrevout) {
-    tx.inputs.push({
-      txid: witnessPrevout.txid,
-      vout: witnessPrevout.vout,
-      sequence: 0xffffffff,
-    });
-    witnessVin = tx.inputs.length - 1;
-
-    // Optional context for auth provider
-    witnessPrevoutCtx = {
-      valueSats: asBigInt(witnessPrevout.valueSats, 'witnessPrevout.valueSats'),
-      scriptPubKey: witnessPrevout.scriptPubKey as Uint8Array,
-      outpoint: { txid: witnessPrevout.txid, vout: witnessPrevout.vout },
-    };
-  }
+  const { witnessVin, witnessPrevoutCtx } = appendWitnessInput(tx, witnessPrevout);
 
   // covenant unlocking via provider (provider applies extraPrefix)
   auth.authorizeCovenantInput({
@@ -223,17 +181,19 @@ export function importDepositToShard(args: any) {
       valueSats: depositPrevout.valueSats,
       scriptPubKey: depositPrevout.scriptPubKey,
     },
+    witnessVin,
+    witnessPrevout: witnessPrevoutCtx,
   });
-  
-  // keeps signing optional
-  if (witnessPrevout && witnessVin !== undefined && witnessPrivBytes) {
+
+  // Optional signing for witness slot
+  if (witnessPrevout && witnessVin !== undefined && witnessPrivBytes && witnessPrevoutCtx) {
     auth.authorizeP2pkhInput({
       tx,
-      vin: 1,
-      privBytes: depositWallet.signPrivBytes,
+      vin: witnessVin,
+      privBytes: witnessPrivBytes,
       prevout: {
-        valueSats: depositPrevout.valueSats,
-        scriptPubKey: depositPrevout.scriptPubKey,
+        valueSats: witnessPrevoutCtx.valueSats,
+        scriptPubKey: witnessPrevoutCtx.scriptPubKey,
       },
       witnessVin,
       witnessPrevout: witnessPrevoutCtx,
