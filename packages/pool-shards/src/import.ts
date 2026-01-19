@@ -139,8 +139,8 @@ export function importDepositToShard(args: any) {
 
   // shard output locking script via templates
   // (p2shSpk retained for covenant prevout fallback behavior)
-  const p2shSpk = (deps?.txb ?? txbDefault).getP2SHScript(hash160(redeemScript));
-
+  const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
+  
   const tokenOut = makeShardTokenOut({ category32, commitment32: stateOut32 });
   const shardOutSpk = locking.shardLock({ token: tokenOut, redeemScript });
 
