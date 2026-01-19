@@ -55,11 +55,11 @@ import {
   upsertStealthUtxo,
   markStealthSpent,
   // io
-  POOL_STATE_STORE_KEY,
   resolveDefaultPoolStatePaths,
   migrateLegacyPoolStateDirSync,
   readPoolState,
   writePoolState,
+  POOL_STATE_STORE_KEY
 } from '@bch-stealth/pool-state';
 
 import * as PoolHashFold from '@bch-stealth/pool-hash-fold';
@@ -142,6 +142,8 @@ type WalletLike = {
   scanPrivBytes?: Uint8Array;
   spendPrivBytes?: Uint8Array;
 };
+
+type ShardOutpoint = { txid: string; vout: number };
 
 // -------------------------------------------------------------------------------------
 // Stable actors
@@ -261,13 +263,28 @@ function assertChipnet(): void {
 // -------------------------------------------------------------------------------------
 
 function emptyPoolState(): PoolState {
-  return {
-    network: NETWORK,
-    shards: [],
-    stealthUtxos: [],
-    deposits: [],
-    withdrawals: [],
-  };
+  return ensurePoolStateDefaults(
+    {
+      schemaVersion: 1,
+
+      network: NETWORK,
+      poolIdHex: 'unknown',
+      poolVersion: 'unknown',
+      categoryHex: '',
+      redeemScriptHex: '',
+
+      shardCount: 0,
+      shards: [],
+
+      // Optional history arrays (we keep them populated in the demo)
+      stealthUtxos: [],
+      deposits: [],
+      withdrawals: [],
+
+      createdAt: new Date().toISOString(),
+    },
+    NETWORK
+  );
 }
 
 // function ensurePoolStateDefaults(state?: PoolState | null): PoolState {
@@ -454,7 +471,7 @@ async function selectFundingUtxo({
   // 1) Prefer stealth UTXOs created by this demo (we can derive spending keys deterministically).
   const stealthRecs = (st?.stealthUtxos ?? [])
     .filter((r) => r && r.owner === ownerTag && !r.spentInTxid)
-    .sort((a, b) => (toBigIntSats(b.value ?? 0) > toBigIntSats(a.value ?? 0) ? 1 : -1));
+    .sort((a, b) => (toBigIntSats(b.valueSats ?? b.value ?? 0) > toBigIntSats(a.valueSats ?? a.value ?? 0) ? 1 : -1));
 
   for (const r of stealthRecs) {
     const unspent = await isP2pkhOutpointUnspent({ txid: r.txid, vout: r.vout, hash160Hex: r.hash160Hex });
@@ -493,7 +510,7 @@ async function selectFundingUtxo({
   const utxos = await getUtxos(wallet.address, NETWORK, true);
   const base = (utxos ?? [])
     .filter((u) => u && !u.token_data)
-    .sort((a, b) => (toBigIntSats(b.value ?? 0) > toBigIntSats(a.value ?? 0) ? 1 : -1));
+    .sort((a, b) => (toBigIntSats(b.valueSats ?? b.value ?? 0) > toBigIntSats(a.valueSats ?? a.value ?? 0) ? 1 : -1));
 
   for (const u of base) {
     const prev = await getPrevOutput(u.txid, u.vout);
@@ -568,7 +585,7 @@ async function ensurePoolState({
 
     if (missing.length === 0) {
       console.log(`\n[0/4] using existing shard state: ${(program.opts().stateFile as string) ?? STORE_FILE}`);
-      console.log(`      key: ${POOL_STATE_STORE_KEY}`);
+      console.log(`      key: pool.state`);
       console.log(`      shards: ${state.shards.length}`);
       return ensurePoolStateDefaults(state);
     }
@@ -597,8 +614,8 @@ async function ensurePoolState({
   });
 
   state = ensurePoolStateDefaults({
-    network: NETWORK,
     ...init,
+    network: NETWORK, // if you *want* to force it, put it after the spread
     stealthUtxos: init.stealthUtxos ?? [],
     deposits: [],
     withdrawals: [],
@@ -645,9 +662,10 @@ async function tryRepairShardsFromWallet({
       const commitmentHex = commitment instanceof Uint8Array ? bytesToHex(commitment) : 'UNKNOWN';
 
       matches.push({
+        index: 0, // will be overwritten below
         txid: u.txid,
         vout: u.vout,
-        value: BigInt(out.value).toString(),
+        valueSats: BigInt(out.value).toString(),
         commitmentHex,
       });
     } catch {}
@@ -656,7 +674,7 @@ async function tryRepairShardsFromWallet({
   if (matches.length === 0) return null;
 
   // NOTE: cannot recover original shard indices once commitments have been mutated.
-  const repairedShards: ShardPointer[] = matches.map((m, i) => ({ index: i, ...m }));
+  const repairedShards: ShardPointer[] = matches.map((m, i) => ({ ...m, index: i }));
 
   const unknown = repairedShards.filter((s) => s.commitmentHex === 'UNKNOWN').length;
   if (unknown) console.warn(`repair: ${unknown} shard commitments missing; outpoints recovered only.`);
@@ -672,10 +690,67 @@ async function tryRepairShardsFromWallet({
 // Core demo steps
 // -------------------------------------------------------------------------------------
 
+function normalizeValueSats(rec: any): string {
+  // Prefer canonical pool-state field
+  if (rec?.valueSats != null) return String(rec.valueSats);
+  // Legacy fallback
+  if (rec?.value != null) return String(rec.value);
+  return '0';
+}
+
+function toPoolShardsState(st: PoolState): PoolShards.PoolState {
+  const state = ensurePoolStateDefaults(st);
+
+  if (!state.categoryHex || !state.redeemScriptHex) {
+    throw new Error('State missing categoryHex/redeemScriptHex.');
+  }
+
+  return {
+    poolIdHex: state.poolIdHex ?? bytesToHex(hash160(hexToBytes(state.categoryHex))),
+    poolVersion: String(state.poolVersion ?? 'v1_1'),
+    shardCount: state.shardCount ?? state.shards.length,
+    network: state.network ?? NETWORK,
+    categoryHex: state.categoryHex,
+    redeemScriptHex: state.redeemScriptHex,
+    shards: state.shards.map((s, i) => ({
+      index: (s as any).index ?? i,
+      txid: s.txid,
+      vout: s.vout,
+      valueSats: normalizeValueSats(s),
+      commitmentHex: s.commitmentHex,
+    })),
+  };
+}
+
+/**
+ * After broadcasting a shard-tx, patch the CLI pool-state shard pointer using the builder's nextPoolState.
+ * Assumes the shard output is vout=0 for import/withdraw updates (matches your current builder conventions).
+ */
+function patchShardFromNextPoolState(args: {
+  poolState: PoolState;
+  shardIndex: number;
+  txid: string;
+  nextPool: PoolShards.PoolState;
+}): void {
+  const { poolState, shardIndex, txid, nextPool } = args;
+
+  const newShard = nextPool.shards[shardIndex];
+  if (!newShard) throw new Error(`patchShardFromNextPoolState: missing shard ${shardIndex} in nextPoolState`);
+
+  poolState.shards[shardIndex] = {
+    ...(poolState.shards[shardIndex] as any),
+    index: (poolState.shards[shardIndex] as any).index ?? shardIndex,
+    txid,
+    vout: 0,
+    valueSats: String(newShard.valueSats),
+    commitmentHex: newShard.commitmentHex,
+  } as any;
+}
+
 async function initShardsTx({
   state = null,
   ownerWallet,
-  ownerPaycodePub33 = null, // unused now (init builder is pure; stealth change is CLI policy if desired later)
+  ownerPaycodePub33 = null, // unused now
   shardCount,
   poolVersion,
 }: {
@@ -684,14 +759,7 @@ async function initShardsTx({
   ownerPaycodePub33?: Uint8Array | null;
   shardCount: number;
   poolVersion: any;
-}): Promise<{
-  txid: string;
-  categoryHex: string;
-  poolVersion: any;
-  redeemScriptHex: string;
-  shards: ShardPointer[];
-  stealthUtxos: StealthUtxoRecord[];
-}> {
+}): Promise<PoolState> {
   // ---- CLI IO boundary: select funding + prevout fetch ----
   const shardsTotal = SHARD_VALUE * BigInt(shardCount);
 
@@ -706,8 +774,8 @@ async function initShardsTx({
 
   // ---- Build canonical pool-shards config ----
   const poolIdHex =
-  (state as any)?.poolIdHex ??
-  bytesToHex(hash160(hexToBytes(funding.txid))); // deterministic fallback: H160(fundingTxidBytes)
+    (state as any)?.poolIdHex ??
+    bytesToHex(hash160(hexToBytes(funding.txid))); // deterministic fallback: H160(fundingTxidBytes)
 
   const cfg: PoolShards.PoolConfig = {
     network: NETWORK,
@@ -715,7 +783,6 @@ async function initShardsTx({
     poolVersion: String(poolVersion === POOL_HASH_FOLD_VERSION.V1 ? 'v1' : 'v1_1'),
     shardValueSats: SHARD_VALUE.toString(),
     defaultFeeSats: DEFAULT_FEE.toString(),
-    // IMPORTANT: pass redeemScriptHex explicitly to avoid any legacy helper usage in builders
     redeemScriptHex: bytesToHex(await getPoolHashFoldBytecode(poolVersion)),
   };
 
@@ -739,32 +806,41 @@ async function initShardsTx({
     ownerWallet: owner,
   });
 
-  const rawHex = bytesToHex(built.rawTx);
-
   // ---- CLI IO boundary: broadcast + map outpoints ----
+  const rawHex = bytesToHex(built.rawTx);
   const txid = await broadcastTx(rawHex);
 
+  // pool-shards init uses output[0]=change, outputs[1..]=shards
   const shards: ShardPointer[] = built.nextPoolState.shards.map((s: any, i: number) => ({
     index: i,
     txid,
-    vout: i + 1, // pool-shards init uses output[0]=change, outputs[1..]=shards
-    value: String(s.valueSats),
+    vout: i + 1,
+    valueSats: String(s.valueSats),
     commitmentHex: s.commitmentHex,
   }));
 
-  // NOTE: pool-shards init produces a normal P2PKH change to ownerWallet.
-  // earlier stealth-change behavior can be reintroduced later as a CLI-only policy
-  // by using a different change destination, but that requires a slightly richer init builder API.
-  const stealthUtxos: StealthUtxoRecord[] = [];
+  const poolState: PoolState = ensurePoolStateDefaults({
+    schemaVersion: 1,
 
-  return {
-    txid,
+    network: built.nextPoolState.network,
+    poolIdHex: built.nextPoolState.poolIdHex,
+    poolVersion: built.nextPoolState.poolVersion,
     categoryHex: built.nextPoolState.categoryHex,
-    poolVersion,
     redeemScriptHex: built.nextPoolState.redeemScriptHex,
+
+    shardCount: built.nextPoolState.shardCount,
     shards,
-    stealthUtxos,
-  };
+
+    // Demo keeps these arrays populated
+    stealthUtxos: [],
+    deposits: [],
+    withdrawals: [],
+
+    createdAt: new Date().toISOString(),
+    txid, // optional metadata
+  });
+
+  return poolState;
 }
 
 async function createDeposit({
@@ -836,7 +912,8 @@ async function createDeposit({
       purpose: 'deposit_change',
       txid: '<pending>',
       vout: 1,
-      value: changeValue.toString(),
+      valueSats: changeValue.toString(),
+      value: changeValue.toString(), // legacy compat
       hash160Hex: bytesToHex(changeIntent.childHash160),
       rpaContext: changeContext,
       createdAt: new Date().toISOString(),
@@ -886,7 +963,8 @@ async function createDeposit({
     deposit: {
       txid,
       vout: 0,
-      value: amount.toString(),
+      valueSats: amount.toString(),
+      value: amount.toString(), // legacy compat
       receiverRpaHash160Hex: bytesToHex(payIntent.childHash160),
       createdAt: new Date().toISOString(),
       rpaContext: payContext,
@@ -1060,21 +1138,7 @@ async function importDepositToShard({
   } 
 
   // ----- call canonical builder (pool-shards) -----
-  const pool: PoolShards.PoolState = {
-    poolIdHex: (poolState as any).poolIdHex ?? bytesToHex(hash160(hexToBytes(poolState.categoryHex))), // fallback
-    poolVersion: String((poolState as any).poolVersion ?? 'v1_1'),
-    shardCount: poolState.shards.length,
-    network: NETWORK,
-    categoryHex: poolState.categoryHex,
-    redeemScriptHex: poolState.redeemScriptHex,
-    shards: poolState.shards.map((s, i) => ({
-      index: (s as any).index ?? i,
-      txid: s.txid,
-      vout: s.vout,
-      valueSats: String((s as any).valueSats ?? (s as any).value),
-      commitmentHex: s.commitmentHex,
-    })),
-  };
+  const pool = toPoolShardsState(poolState);
 
   const shardPrevout: PoolShards.PrevoutLike = {
     txid: shard.txid,
@@ -1274,21 +1338,7 @@ async function withdrawFromShard({
   });
 
   // Build canonical pool-shards PoolState view
-  const pool: PoolShards.PoolState = {
-    poolIdHex: (st as any).poolIdHex ?? bytesToHex(hash160(hexToBytes(st.categoryHex))),
-    poolVersion: String((st as any).poolVersion ?? 'v1_1'),
-    shardCount: st.shards.length,
-    network: NETWORK,
-    categoryHex: st.categoryHex,
-    redeemScriptHex: st.redeemScriptHex,
-    shards: st.shards.map((s, i) => ({
-      index: (s as any).index ?? i,
-      txid: s.txid,
-      vout: s.vout,
-      valueSats: String((s as any).valueSats ?? (s as any).value),
-      commitmentHex: s.commitmentHex,
-    })),
-  };
+  const pool = toPoolShardsState(st);
 
   const shardPrevout: PoolShards.PrevoutLike = {
     txid: shard.txid,
@@ -1332,6 +1382,9 @@ async function withdrawFromShard({
   const rawHex = bytesToHex(built.rawTx);
   const txid = await broadcastTx(rawHex);
 
+  const newShard = built.nextPoolState.shards[shardIndex];
+  if (!newShard) throw new Error(`withdrawFromShard: builder missing shard ${shardIndex}`);
+
   console.log(
     `[withdraw] payment (stealth) -> outpoint ${txid}:1 value=${payment.toString()} sats hash160=${bytesToHex(
       payIntent.childHash160
@@ -1340,12 +1393,15 @@ async function withdrawFromShard({
 
   // record change as stealth UTXO (if it should exist)
   // (PoolShards builder always emits change output[2] here; your fee policy prevents dust)
+  const changeValueSats = String(BigInt(feePrev.value) - BigInt(DEFAULT_FEE));
+
   const changeRec: StealthUtxoRecord = {
     owner: senderTag,
     purpose: 'withdraw_change',
     txid,
     vout: 2,
-    value: String(BigInt(feePrev.value) - BigInt(DEFAULT_FEE)),
+    valueSats: changeValueSats,
+    value: changeValueSats, // legacy compat
     hash160Hex: bytesToHex(changeIntent.childHash160),
     rpaContext: changeContext,
     createdAt: new Date().toISOString(),
@@ -1355,16 +1411,15 @@ async function withdrawFromShard({
   if (feeUtxo.source === 'stealth') markStealthSpent(st, feeUtxo.txid, feeUtxo.vout, txid);
 
   // patch shard pointer from builder output
-  const newShard = built.nextPoolState.shards[shardIndex];
-  st.shards[shardIndex] = {
-    ...(st.shards[shardIndex] as any),
+  patchShardFromNextPoolState({
+    poolState,
+    shardIndex,
     txid,
-    vout: 0,
-    value: String(newShard.valueSats),
-    commitmentHex: newShard.commitmentHex,
-  } as any;
+    nextPool: built.nextPoolState,
+  });
 
   // record withdrawal
+  st.withdrawals ??= [];
   st.withdrawals.push({
     txid,
     shardIndex,
@@ -1398,6 +1453,7 @@ async function ensureWithdraw({
   fresh?: boolean;
 }): Promise<{ txid: string }> {
   const st = ensurePoolStateDefaults(state);
+  st.withdrawals ??= [];
 
   const receiverPaycodePub33Hex = bytesToHex(receiverPaycodePub33);
 
@@ -1410,7 +1466,8 @@ async function ensureWithdraw({
       if (w.receiverPaycodePub33Hex !== receiverPaycodePub33Hex) continue;
 
       const cur = st.shards[shardIndex];
-      if (cur?.txid === w.shardAfter?.txid && cur?.vout === w.shardAfter?.vout) {
+      const after = w.shardAfter as ShardOutpoint | undefined;
+      if (cur?.txid === after?.txid && cur?.vout === after?.vout) {
         console.log(`[withdraw] already done (state): tx ${w.txid}`);
         return { txid: w.txid };
       }
@@ -1535,37 +1592,29 @@ pool
   .action(async (opts) => {
     assertChipnet();
     const store = makeStore();
-
+  
     const shardCount = Number(opts.shards);
     if (!Number.isFinite(shardCount) || shardCount < 2) throw new Error('shards must be >= 2');
-
+  
     const { actorBBaseWallet, actorBPaycodePub33 } = await loadDemoActors();
-
+  
     const poolVersion =
       program.opts().poolVersion === 'v1' ? POOL_HASH_FOLD_VERSION.V1 : POOL_HASH_FOLD_VERSION.V1_1;
-
-    const init = await initShardsTx({
+  
+    const state = await initShardsTx({
       state: null,
       ownerWallet: actorBBaseWallet,
       ownerPaycodePub33: actorBPaycodePub33,
       shardCount,
       poolVersion,
     });
-
-    const state = ensurePoolStateDefaults({
-      network: NETWORK,
-      ...init,
-      deposits: [],
-      withdrawals: [],
-      createdAt: new Date().toISOString(),
-    });
-
+  
     await writeState(store, state);
-
-    console.log(`✅ init txid: ${init.txid}`);
+  
+    console.log(`✅ init txid: ${state.txid ?? '<unknown>'}`);
     console.log(`   shards: ${shardCount}`);
-    console.log(`   state saved: ${(program.opts().stateFile as string) ?? STORE_FILE} (${POOL_STATE_STORE_KEY})`);
-  });
+    console.log(`   state saved: ${(program.opts().stateFile as string) ?? STORE_FILE}`);
+  })
 
 // --- pool deposit -----------------------------------------------------------
 
