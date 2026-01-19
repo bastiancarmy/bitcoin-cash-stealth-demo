@@ -104,6 +104,8 @@ export function withdrawFromShard(args: any) {
     amountCommitment,
     categoryMode,
     deps,
+    witnessPrevout,
+    witnessPrivBytes,
   } = a;
 
   const txb = deps?.txb ?? txbDefault;
@@ -195,6 +197,24 @@ export function withdrawFromShard(args: any) {
     ],
   };
 
+  let witnessVin: number | undefined;
+  let witnessPrevoutCtx: any | undefined;
+
+  if (witnessPrevout) {
+    tx.inputs.push({
+      txid: witnessPrevout.txid,
+      vout: witnessPrevout.vout,
+      sequence: 0xffffffff,
+    });
+    witnessVin = tx.inputs.length - 1;
+
+    witnessPrevoutCtx = {
+      valueSats: asBigInt(witnessPrevout.valueSats, 'witnessPrevout.valueSats'),
+      scriptPubKey: witnessPrevout.scriptPubKey as Uint8Array,
+      outpoint: { txid: witnessPrevout.txid, vout: witnessPrevout.vout },
+    };
+  }
+
   // covenant spend (provider applies extraPrefix)
   auth.authorizeCovenantInput({
     tx,
@@ -207,6 +227,8 @@ export function withdrawFromShard(args: any) {
     },
     amountCommitment: amountCommitment ?? 0n,
     extraPrefix: shardUnlockPrefix,
+    witnessVin,
+    witnessPrevout: witnessPrevoutCtx,
   });
 
   // fee spend (P2PKH) via provider
@@ -218,7 +240,23 @@ export function withdrawFromShard(args: any) {
       valueSats: feePrevout.valueSats,
       scriptPubKey: feePrevout.scriptPubKey,
     },
+    witnessVin,
+    witnessPrevout: witnessPrevoutCtx,
   });
+
+  if (witnessPrevout && witnessVin !== undefined && witnessPrivBytes) {
+    auth.authorizeP2pkhInput({
+      tx,
+      vin: witnessVin,
+      privBytes: witnessPrivBytes,
+      prevout: {
+        valueSats: witnessPrevoutCtx.valueSats,
+        scriptPubKey: witnessPrevoutCtx.scriptPubKey,
+      },
+      witnessVin,
+      witnessPrevout: witnessPrevoutCtx,
+    });
+  }
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);

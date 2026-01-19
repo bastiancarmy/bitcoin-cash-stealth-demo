@@ -7,12 +7,20 @@ export type PrevoutAuthLike = {
   scriptPubKey: Uint8Array;
 };
 
+export type WitnessContext = {
+  // If a tx includes a “witness/proof input”, builders should pass its vin here.
+  witnessVin?: number;
+
+  // Optional richer context (useful for future introspection providers)
+  witnessPrevout?: (PrevoutAuthLike & { outpoint?: { txid: string; vout: number } }) | undefined;
+};
+
 export type AuthorizeP2pkhInputArgs = {
   tx: any;
   vin: number;
   privBytes: Uint8Array;
   prevout: PrevoutAuthLike;
-};
+} & WitnessContext;
 
 export type AuthorizeCovenantInputArgs = {
   tx: any;
@@ -27,7 +35,7 @@ export type AuthorizeCovenantInputArgs = {
 
   // Pool hash-fold unlocking prefix (builder computes; provider applies)
   extraPrefix?: Uint8Array;
-};
+} & WitnessContext;
 
 export type AuthProvider = {
   authorizeP2pkhInput(args: AuthorizeP2pkhInputArgs): void;

@@ -95,6 +95,8 @@ export function importDepositToShard(args: any) {
     shardIndex,
     shardPrevout,
     depositPrevout,
+    witnessPrevout,
+    witnessPrivBytes,
     covenantWallet,
     depositWallet,
     feeSats,
@@ -177,6 +179,25 @@ export function importDepositToShard(args: any) {
     outputs: [{ value: newShardValue, scriptPubKey: shardOutSpk }],
   };
 
+  let witnessVin: number | undefined;
+  let witnessPrevoutCtx: any | undefined;
+
+  if (witnessPrevout) {
+    tx.inputs.push({
+      txid: witnessPrevout.txid,
+      vout: witnessPrevout.vout,
+      sequence: 0xffffffff,
+    });
+    witnessVin = tx.inputs.length - 1;
+
+    // Optional context for auth provider
+    witnessPrevoutCtx = {
+      valueSats: asBigInt(witnessPrevout.valueSats, 'witnessPrevout.valueSats'),
+      scriptPubKey: witnessPrevout.scriptPubKey as Uint8Array,
+      outpoint: { txid: witnessPrevout.txid, vout: witnessPrevout.vout },
+    };
+  }
+
   // covenant unlocking via provider (provider applies extraPrefix)
   auth.authorizeCovenantInput({
     tx,
@@ -189,6 +210,8 @@ export function importDepositToShard(args: any) {
     },
     amountCommitment: amountCommitment ?? 0n,
     extraPrefix: shardUnlockPrefix,
+    witnessVin,
+    witnessPrevout: witnessPrevoutCtx,
   });
 
   // deposit spend via provider
@@ -201,6 +224,21 @@ export function importDepositToShard(args: any) {
       scriptPubKey: depositPrevout.scriptPubKey,
     },
   });
+  
+  // keeps signing optional
+  if (witnessPrevout && witnessVin !== undefined && witnessPrivBytes) {
+    auth.authorizeP2pkhInput({
+      tx,
+      vin: 1,
+      privBytes: depositWallet.signPrivBytes,
+      prevout: {
+        valueSats: depositPrevout.valueSats,
+        scriptPubKey: depositPrevout.scriptPubKey,
+      },
+      witnessVin,
+      witnessPrevout: witnessPrevoutCtx,
+    });
+  }
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
