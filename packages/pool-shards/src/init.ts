@@ -2,6 +2,16 @@
 import type { BuilderDeps } from './di.js';
 
 import { bytesToHex, hexToBytes } from '@bch-stealth/utils';
+
+import {
+  asBigInt,
+  ensureBytesLen,
+  normalizeRawTxBytes,
+  resolveBuilderDeps,
+  appendWitnessInput,
+  makeShardTokenOut,
+} from './shard_common.js';
+
 import { DUST_SATS, deriveCategory32FromFundingTxidHex, initialShardCommitment32 } from './policy.js';
 
 import type {
@@ -13,23 +23,21 @@ import type {
   InitShardsDiagnostics,
 } from './types.js';
 
-import {
-  asBigInt,
-  ensureBytesLen,
-  normalizeRawTxBytes,
-  resolveBuilderDeps,
-  makeShardTokenOut,
-} from './shard_common.js';
-
 export function initShardsTx(args: {
   cfg: PoolConfig;
   shardCount: number;
   funding: PrevoutLike;
   ownerWallet: WalletLike;
+
+  // Optional “proof/witness carrier” input, appended last when provided
+  witnessPrevout?: PrevoutLike;
+  witnessPrivBytes?: Uint8Array;
+
   deps?: BuilderDeps;
 }): InitShardsResult {
-  const { cfg, shardCount, funding, ownerWallet, deps } = args;
-  const { txb, locking } = resolveBuilderDeps(deps);
+  const { cfg, shardCount, funding, ownerWallet, witnessPrevout, witnessPrivBytes, deps } = args;
+
+  const { txb, auth, locking } = resolveBuilderDeps(deps);
 
   if (!Number.isInteger(shardCount) || shardCount <= 0) {
     throw new Error('initShardsTx: shardCount must be a positive integer');
@@ -61,9 +69,9 @@ export function initShardsTx(args: {
 
   const redeemScriptHex = bytesToHex(redeemScript);
 
+  // change output
   const changeHash160 = hexToBytes(ownerWallet.pubkeyHash160Hex);
   ensureBytesLen(changeHash160, 20, 'ownerWallet.pubkeyHash160Hex');
-
   const changeSpk = locking.p2pkh(changeHash160);
 
   // output[0] = change; outputs[1..] = shard anchors
@@ -98,10 +106,12 @@ export function initShardsTx(args: {
   }
 
   const totalShardValue = shardValue * BigInt(shardCount);
-  const changeValue = funding.valueSats - totalShardValue - fee;
+  const changeValue = asBigInt(funding.valueSats as any, 'funding.valueSats') - totalShardValue - fee;
 
   if (changeValue < DUST_SATS) {
-    throw new Error(`initShardsTx: insufficient change after fee; got ${changeValue.toString()} sats`);
+    throw new Error(
+      `initShardsTx: insufficient change after fee; got ${changeValue.toString()} sats`
+    );
   }
   outputs[0].value = changeValue;
 
@@ -112,8 +122,36 @@ export function initShardsTx(args: {
     outputs,
   };
 
-  // funding input is P2PKH (init currently signs directly)
-  txb.signInput(tx, 0, ownerWallet.signPrivBytes, funding.scriptPubKey, funding.valueSats);
+  // If present, append witness input LAST before any signing (stable ordering).
+  const { witnessVin, witnessPrevoutCtx } = appendWitnessInput(tx, witnessPrevout);
+
+  // Funding input is P2PKH — route through AuthProvider for consistency
+  auth.authorizeP2pkhInput({
+    tx,
+    vin: 0,
+    privBytes: ownerWallet.signPrivBytes,
+    prevout: {
+      valueSats: asBigInt(funding.valueSats as any, 'funding.valueSats'),
+      scriptPubKey: funding.scriptPubKey as Uint8Array,
+    },
+    witnessVin,
+    witnessPrevout: witnessPrevoutCtx,
+  });
+
+  // Optional witness signing (same “sign if priv provided” convention as import/withdraw)
+  if (witnessVin !== undefined && witnessPrevoutCtx && witnessPrivBytes) {
+    auth.authorizeP2pkhInput({
+      tx,
+      vin: witnessVin,
+      privBytes: witnessPrivBytes,
+      prevout: {
+        valueSats: witnessPrevoutCtx.valueSats,
+        scriptPubKey: witnessPrevoutCtx.scriptPubKey,
+      },
+      witnessVin,
+      witnessPrevout: witnessPrevoutCtx,
+    });
+  }
 
   const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
