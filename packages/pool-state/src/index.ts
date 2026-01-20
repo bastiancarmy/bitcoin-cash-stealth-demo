@@ -31,5 +31,13 @@ export {
 
 export { FileBackedPoolStateStore } from './filestore.js';
 
+export { repairFromChain } from './repair.js';
+export type {
+  RepairFromChainOptions,
+  RepairFromChainResult,
+  RepairDiagnostics,
+  RepairDiagnosticsReceived,
+} from './repair.js';
+
 // Optional legacy file importer (kept for MVP transition)
 export { importLegacyShardedPoolState } from './legacy.js';
