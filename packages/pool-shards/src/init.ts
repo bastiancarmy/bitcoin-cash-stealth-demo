@@ -23,6 +23,17 @@ import type {
   InitShardsDiagnostics,
 } from './types.js';
 
+function cleanHex(input: unknown, label: string): string {
+  const s = String(input ?? '').trim();
+  const h = s.startsWith('0x') ? s.slice(2) : s;
+
+  if (h.length === 0) throw new Error(`[pool-shards] ${label} is empty`);
+  if (h.length % 2 !== 0) throw new Error(`[pool-shards] ${label} hex must be even length (got "${s}")`);
+  if (!/^[0-9a-f]+$/i.test(h)) throw new Error(`[pool-shards] ${label} must be hex (got "${s}")`);
+
+  return h;
+}
+
 export function initShardsTx(args: {
   cfg: PoolConfig;
   shardCount: number;
@@ -43,7 +54,7 @@ export function initShardsTx(args: {
     throw new Error('initShardsTx: shardCount must be a positive integer');
   }
 
-  const poolId = hexToBytes(cfg.poolIdHex);
+  const poolId = hexToBytes(cleanHex(cfg.poolIdHex, 'cfg.poolIdHex'));
   ensureBytesLen(poolId, 20, 'poolId');
 
   const shardValue = asBigInt(cfg.shardValueSats, 'cfg.shardValueSats');

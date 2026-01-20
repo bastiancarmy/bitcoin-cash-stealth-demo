@@ -90,6 +90,16 @@ function toBigIntSats(x: any): bigint {
   return typeof x === 'bigint' ? x : BigInt(x);
 }
 
+function errToString(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === 'string') return e;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
+
 export async function selectFundingUtxo(args: {
   state?: PoolState | null;
   wallet: WalletLike;
@@ -99,7 +109,7 @@ export async function selectFundingUtxo(args: {
     isP2pkhOutpointUnspent: (o: { txid: string; vout: number; hash160Hex: string }) => Promise<boolean>;
     getPrevOutput: (txid: string, vout: number) => Promise<any>;
   };
-  getUtxos: (address: string, network: string, includeUnconfirmed: boolean) => Promise<any[]>;
+  getUtxos: (address: string, includeUnconfirmed: boolean, network: string) => Promise<any[]>;
   network: string;
   dustSats: bigint;
 }): Promise<{
@@ -173,7 +183,35 @@ export async function selectFundingUtxo(args: {
     };
   }
 
-  const utxos = await getUtxos(wallet.address, network, true);
+  const dbg = process.env.BCH_STEALTH_DEBUG_FUNDING === '1';
+
+  // Try the expected signature first: (address, network, includeUnconfirmed)
+  let utxos: any[] = [];
+  try {
+    const utxos = await getUtxos(wallet.address, true, network);
+  } catch (e) {
+    if (dbg) {
+      console.log(`[funding] getUtxos(address, network, true) threw: ${errToString(e)}`);
+    }
+  }
+
+  // If empty, try the common alternate signature: (address, includeUnconfirmed, network)
+  if (!Array.isArray(utxos) || utxos.length === 0) {
+    try {
+      utxos = await (getUtxos as any)(wallet.address, true, network);
+    } catch (e) {
+      if (dbg) {
+        console.log(`[funding] getUtxos(address, true, network) threw: ${errToString(e)}`);
+      }
+    }
+  }
+
+  if (dbg) {
+    const n = Array.isArray(utxos) ? utxos.length : 0;
+    console.log(`[funding] base getUtxos(${wallet.address}, network=${network}) -> ${n} utxos`);
+    if (n > 0) console.log(`[funding] sample utxo keys: ${Object.keys(utxos[0] ?? {}).sort().join(', ')}`);
+  }
+
   const base = (utxos ?? [])
     .filter((u) => u && !u.token_data)
     .sort((a, b) =>

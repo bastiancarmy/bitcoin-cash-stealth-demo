@@ -10,7 +10,7 @@ export type WalletLike = {
   spendPrivBytes?: Uint8Array;
 };
 
-export type Actors = {
+export type PoolOpActors = {
   actorABaseWallet: WalletLike;
   actorBBaseWallet: WalletLike;
   actorAPaycodePub33: Uint8Array;
@@ -37,14 +37,13 @@ export type ChainIO = {
 export type PoolOpContext = {
   network: string;
   store: FileBackedPoolStateStore;
-
   chainIO: ChainIO;
-
-  // required by selectFundingUtxo (CLI boundary)
-  getUtxos: (address: string, network: string, includeUnconfirmed: boolean) => Promise<any[]>;
-
-  actors: Actors;
-
+  getUtxos: any;
   poolVersion: any;
-  config: PoolOpConfig;
+  config: {
+    DUST: bigint | number;
+    DEFAULT_FEE: bigint;
+    SHARD_VALUE: bigint;
+  };
+  actors: PoolOpActors;
 };

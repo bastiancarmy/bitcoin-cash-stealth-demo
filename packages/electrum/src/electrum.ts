@@ -36,14 +36,18 @@ function sleep(ms: number): Promise<void> {
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label = 'Operation timeout'): Promise<T> {
-  const timeoutPromise = new Promise<T>((_, reject) => {
-    const id = setTimeout(() => {
-      clearTimeout(id);
-      reject(new Error(label));
-    }, ms);
+  let id: ReturnType<typeof setTimeout> | undefined;
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    id = setTimeout(() => reject(new Error(label)), ms);
   });
-  return Promise.race([p, timeoutPromise]);
+
+  // Ensure the timer never keeps the process alive after p finishes.
+  return Promise.race([p, timeoutPromise]).finally(() => {
+    if (id !== undefined) clearTimeout(id);
+  }) as Promise<T>;
 }
+
 
 function isWsProtocol(proto: string): boolean {
   const p = proto.toLowerCase();

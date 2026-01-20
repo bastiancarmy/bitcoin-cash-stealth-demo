@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * Sharded per-user pool demo (Phase 2.5 scaffolding)
  * -------------------------------------------------
@@ -381,33 +382,7 @@ function resolvePoolVersionFlag(): any {
 async function makePoolCtx(): Promise<PoolOpContext> {
   const store = makeStore();
 
-  // Electrum client/adapter: handle both patterns:
-  // 1) Electrum is a module with functions like broadcastTx/getTxDetails/etc.
-  // 2) Electrum exports a factory (makeClient/createClient/connect/etc.)
-  const electrum: any = await (async () => {
-    const mod: any = Electrum as any;
-
-    // common factory names across refactors
-    const factory =
-      mod.makeClient ??
-      mod.createClient ??
-      mod.connect ??
-      mod.makeElectrumClient ??
-      mod.createElectrumClient;
-
-    if (typeof factory === 'function') {
-      // best effort: most factories accept ({ network }) or (network)
-      try {
-        return await factory({ network: NETWORK });
-      } catch {
-        return await factory(NETWORK);
-      }
-    }
-
-    // fallback: treat module itself as the API surface (broadcastTx/getTxDetails/...)
-    return mod;
-  })();
-
+  const electrum: any = Electrum as any;
   const chainIO = makeChainIO({ network: NETWORK, electrum });
 
   const actors = await loadDemoActors();
@@ -435,8 +410,97 @@ async function makePoolCtx(): Promise<PoolOpContext> {
 async function sweepDepositDebug(args: {
   depositOutpoint: DepositRecord;
   receiverWallet: WalletLike;
-  chainIO: { broadcastRawTx: (hex: string) => Promise<string>; getPrevOutput: (txid: string, vout: number) => Promise<any> };
-}) { /* ... */ }
+  chainIO: {
+    broadcastRawTx: (hex: string) => Promise<string>;
+    getPrevOutput: (txid: string, vout: number) => Promise<any>;
+  };
+}): Promise<string | null> {
+  const { depositOutpoint, receiverWallet, chainIO } = args;
+
+  // Minimal placeholder so the CLI compiles/runs even if you haven't re-homed the full
+  // sweep implementation yet. Replace this body with your real sweep logic.
+  //
+  // Expected behavior:
+  // - build a tx spending depositOutpoint to receiverWallet.address (or another target)
+  // - sign and broadcast via chainIO.broadcastRawTx(rawHex)
+  //
+  // For now: throw with a clear message so the flag is not silently ignored.
+  throw new Error(
+    `[sweep-debug] sweepDepositDebug is stubbed. Re-home the previous sweep implementation here.\n` +
+      `Requested outpoint: ${depositOutpoint.txid}:${depositOutpoint.vout}`
+  );
+
+  // return txid;
+}
+
+// --- pool init --------------------------------------------------------------
+
+pool
+  .command('init')
+  .option('--shards <n>', 'number of shards', '8')
+  .action(async (opts) => {
+    assertChipnet();
+
+    const shards = Number(opts.shards);
+    if (!Number.isFinite(shards) || shards < 2) throw new Error('shards must be >= 2');
+
+    const ctx = await makePoolCtx();
+    const res = await runInit(ctx, { shards });
+
+    console.log(`✅ init txid: ${res.txid ?? res.state?.txid ?? '<unknown>'}`);
+    console.log(`   shards: ${shards}`);
+    console.log(`   state saved: ${(program.opts().stateFile as string) ?? STORE_FILE}`);
+  });
+
+// --- pool deposit -----------------------------------------------------------
+
+pool
+  .command('deposit')
+  .option('--amount <sats>', 'deposit amount in sats', '120000')
+  .option('--fresh', 'force a new deposit even if one exists', false)
+  .action(async (opts) => {
+    assertChipnet();
+
+    const amountSats = Number(opts.amount);
+    if (!Number.isFinite(amountSats) || amountSats < Number(DUST)) {
+      throw new Error(`amount must be >= dust (${DUST})`);
+    }
+
+    const ctx = await makePoolCtx();
+
+    // keep flag for UX; current op may ignore it
+    void opts.fresh;
+
+    const res = await runDeposit(ctx, { amountSats });
+
+    console.log(`✅ deposit txid: ${res.txid}`);
+    console.log(`   state saved: ${(program.opts().stateFile as string) ?? STORE_FILE}`);
+  });
+
+// --- pool withdraw ----------------------------------------------------------
+
+pool
+  .command('withdraw')
+  .option('--shard <i>', 'shard index', '0')
+  .option('--amount <sats>', 'withdraw amount in sats', '50000')
+  .option('--fresh', 'force a new withdrawal even if already recorded', false)
+  .action(async (opts) => {
+    assertChipnet();
+
+    const shardIndex = Number(opts.shard);
+    const amountSats = Number(opts.amount);
+
+    if (!Number.isFinite(shardIndex) || shardIndex < 0) throw new Error(`invalid --shard: ${String(opts.shard)}`);
+    if (!Number.isFinite(amountSats) || amountSats < Number(DUST)) {
+      throw new Error(`amount must be >= dust (${DUST})`);
+    }
+
+    const ctx = await makePoolCtx();
+    const res = await runWithdraw(ctx, { shardIndex, amountSats, fresh: !!opts.fresh });
+
+    console.log(`✅ withdraw txid: ${res.txid}`);
+    console.log(`   state saved: ${(program.opts().stateFile as string) ?? STORE_FILE}`);
+  });
 
 pool
   .command('import')
@@ -450,6 +514,8 @@ pool
 
     // --- keep sweep debug inline for now ---
     if (opts.sweep) {
+      if (!ctx.actors) throw new Error('[import] ctx.actors missing. makePoolCtx must populate actors.');
+
       const state = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
       await saveState({ store: ctx.store, state, networkDefault: ctx.network }); // persist migrations/defaults
 
@@ -466,12 +532,10 @@ pool
 
       console.log(`\n[sweep-debug] sweeping deposit outpoint: ${dep.txid}:${dep.vout}`);
 
-      // NOTE: assumes you still have sweepDepositDebug available in index.ts scope.
-      // If it currently uses a removed global `chainIO`, change it to accept ctx.chainIO.
       const sweepTxid = await sweepDepositDebug({
         depositOutpoint: dep,
         receiverWallet: ctx.actors.actorBBaseWallet,
-        chainIO: ctx.chainIO, // <-- pass IO explicitly (or pass ctx)
+        chainIO: ctx.chainIO,
       });
 
       upsertDeposit(state, { ...dep, spentTxid: sweepTxid ?? 'unknown', spentAt: new Date().toISOString() });
@@ -521,13 +585,24 @@ pool
 
     const ctx = await makePoolCtx();
 
+    // NOTE: runHappyPath opts currently does not include `fresh`.
+    // Keep the flag parsed for CLI UX, but ignore it here unless/until runHappyPath supports it.
+    void opts.fresh;
+
     await runHappyPath(ctx, {
       shards,
       depositSats,
       withdrawSats,
-      fresh: !!opts.fresh,
     });
 
     console.log('\n✅ done');
     console.log(`state saved: ${(program.opts().stateFile as string) ?? STORE_FILE} (${POOL_STATE_STORE_KEY})`);
   });
+
+// --- MUST await parseAsync or Node may exit before Commander prints/help runs ---
+(async () => {
+  await program.parseAsync(process.argv);
+})().catch((err) => {
+  console.error('❌', err?.stack || err?.message || err);
+  process.exitCode = 1;
+});

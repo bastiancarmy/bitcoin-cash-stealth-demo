@@ -8,20 +8,39 @@ import { bytesToHex, hash160, hexToBytes } from '@bch-stealth/utils';
 import type { PoolOpContext } from '../context.js';
 import { loadStateOrEmpty, saveState, selectFundingUtxo } from '../state.js';
 
+function cleanHexMaybe(x: unknown): string | null {
+  if (typeof x !== 'string') return null;
+  const s = x.trim();
+  if (!s) return null;
+  const h = s.startsWith('0x') ? s.slice(2) : s;
+  if (h.length % 2 !== 0) return null;
+  if (!/^[0-9a-f]+$/i.test(h)) return null;
+  return h.toLowerCase();
+}
+
+function cleanHexLenMaybe(x: unknown, bytesLen: number): string | null {
+  const h = cleanHexMaybe(x);
+  if (!h) return null;
+  return h.length === bytesLen * 2 ? h : null;
+}
+
+// 20 bytes => 40 hex chars
+function cleanHex20Maybe(x: unknown): string | null {
+  const h = cleanHexMaybe(x);
+  if (!h) return null;
+  return h.length === 40 ? h : null;
+}
+
 // This is used by init to fetch the redeem script bytecode.
 async function getPoolHashFoldBytecode(poolVersion: any): Promise<Uint8Array> {
-  // Keep this defensive: pool-hash-fold has varied export shapes during refactors.
   const m: any = await import('@bch-stealth/pool-hash-fold');
   if (typeof m.getPoolHashFoldBytecode === 'function') return await m.getPoolHashFoldBytecode(poolVersion);
   if (typeof m.getPoolHashFoldScript === 'function') return await m.getPoolHashFoldScript(poolVersion);
   if (typeof m.getRedeemScript === 'function') return await m.getRedeemScript(poolVersion);
   if (typeof m.loadPoolHashFoldBytecode === 'function') return await m.loadPoolHashFoldBytecode(poolVersion);
 
-  const keys = Object.keys(m).sort().join(', ');
   throw new Error(
-    `[init] Unable to load pool-hash-fold bytecode. Expected one of: ` +
-      `getPoolHashFoldBytecode | getPoolHashFoldScript | getRedeemScript | loadPoolHashFoldBytecode. ` +
-      `Available: ${keys}`
+    `[init] Unable to load pool-hash-fold bytecode. Available: ${Object.keys(m).sort().join(', ')}`
   );
 }
 
@@ -34,8 +53,15 @@ export async function runInit(
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
   const st = ensurePoolStateDefaults(st0);
 
-  if (!fresh && Array.isArray(st.shards) && st.shards.length > 0) {
-    // already initialized
+  const alreadyInitialized =
+    Array.isArray(st.shards) &&
+    st.shards.length > 0 &&
+    typeof st.categoryHex === 'string' &&
+    st.categoryHex.length > 0 &&
+    typeof st.redeemScriptHex === 'string' &&
+    st.redeemScriptHex.length > 0;
+
+  if (!fresh && alreadyInitialized) {
     return { state: st };
   }
 
@@ -44,7 +70,6 @@ export async function runInit(
 
   const DUST = BigInt(ctx.config.DUST);
   const SHARD_VALUE = BigInt(ctx.config.SHARD_VALUE);
-
   const shardsTotal = SHARD_VALUE * BigInt(shardCount);
 
   const funding = await selectFundingUtxo({
@@ -57,11 +82,22 @@ export async function runInit(
     network: ctx.network,
     dustSats: DUST,
   });
+  // ---- poolIdHex (MUST be 20 bytes / 40 hex) --------------------------------
+  const statePoolIdHex = cleanHexLenMaybe((st as any)?.poolIdHex, 20);
 
-  const poolIdHex =
-    (st as any)?.poolIdHex ??
-    bytesToHex(hash160(hexToBytes(funding.txid))); // deterministic fallback
+  const fundingTxidHex = cleanHexLenMaybe(funding.txid, 32);
+  if (!fundingTxidHex) {
+    throw new Error(
+      `[init] funding txid is not a 32-byte hex string: ${String(funding.txid)}\n` +
+      `This usually means your Electrum/getUtxos wiring is returning placeholder data.\n` +
+      `Fix electrum connectivity or getUtxos adapter before running init.`
+    );
+  }
 
+  // Deterministic fallback: poolId = HASH160(fundingTxid)
+  const fallbackPoolIdHex = bytesToHex(hash160(hexToBytes(fundingTxidHex)));
+
+  const poolIdHex = statePoolIdHex ?? fallbackPoolIdHex;
   const cfg: PoolShards.PoolConfig = {
     network: ctx.network,
     poolIdHex,
@@ -77,6 +113,7 @@ export async function runInit(
     valueSats: BigInt(funding.prevOut.value),
     scriptPubKey: funding.prevOut.scriptPubKey,
   };
+  console.log(`[init] funding outpoint: ${funding.txid}:${funding.vout}`);
 
   const owner: PoolShards.WalletLike = {
     signPrivBytes: funding.signPrivBytes,
@@ -93,7 +130,6 @@ export async function runInit(
   const rawHex = bytesToHex(built.rawTx);
   const txid = await ctx.chainIO.broadcastRawTx(rawHex);
 
-  // pool-shards init uses output[0]=change, outputs[1..]=shards
   const shardsPtrs: ShardPointer[] = built.nextPoolState.shards.map((s: any, i: number) => ({
     index: i,
     txid,
@@ -102,23 +138,18 @@ export async function runInit(
     commitmentHex: s.commitmentHex,
   }));
 
+  // Preserve existing arrays if we’re re-initializing a partially populated file (unless you want to wipe them).
   const next: PoolState = ensurePoolStateDefaults({
+    ...st,
     schemaVersion: 1,
-
     network: built.nextPoolState.network,
     poolIdHex: built.nextPoolState.poolIdHex,
     poolVersion: built.nextPoolState.poolVersion,
     categoryHex: built.nextPoolState.categoryHex,
     redeemScriptHex: built.nextPoolState.redeemScriptHex,
-
     shardCount: built.nextPoolState.shardCount,
     shards: shardsPtrs,
-
-    stealthUtxos: [],
-    deposits: [],
-    withdrawals: [],
-
-    createdAt: new Date().toISOString(),
+    createdAt: (st as any).createdAt ?? new Date().toISOString(),
     txid,
   } as any);
 

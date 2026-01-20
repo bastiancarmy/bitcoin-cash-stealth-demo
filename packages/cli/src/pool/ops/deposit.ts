@@ -18,10 +18,12 @@ function p2pkhLockingBytecode(hash160: Uint8Array): Uint8Array {
 
 export async function runDeposit(
   ctx: PoolOpContext,
-  opts: { amountSats: number }
+  opts: { amountSats: number; changeMode?: 'auto' | 'transparent' | 'stealth' }
 ): Promise<{ txid: string; deposit: DepositRecord; change: StealthUtxoRecord | null }> {
   const amountSats = Number(opts.amountSats);
-  if (!Number.isFinite(amountSats) || amountSats <= 0) throw new Error(`[deposit] invalid amount: ${String(opts.amountSats)}`);
+  if (!Number.isFinite(amountSats) || amountSats <= 0) {
+    throw new Error(`[deposit] invalid amount: ${String(opts.amountSats)}`);
+  }
 
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
   const st = ensurePoolStateDefaults(st0);
@@ -48,6 +50,7 @@ export async function runDeposit(
   const prev = senderUtxo.prevOut;
   const inputValue = BigInt(prev.value);
 
+  // Payment is always stealth (RPA-derived) in this op.
   const { payment, change } = deriveStealthOutputsForPaymentAndChange({
     senderWallet,
     senderPaycodePub33: ctx.actors.actorAPaycodePub33,
@@ -57,6 +60,20 @@ export async function runDeposit(
   });
 
   const outSpk = p2pkhLockingBytecode(payment.childHash160);
+
+  // Change policy:
+  // - base funding -> transparent change (sender base P2PKH)
+  // - stealth funding -> stealth change (recorded)
+  const requestedMode = opts.changeMode ?? 'auto';
+  const effectiveMode: 'transparent' | 'stealth' =
+    requestedMode === 'auto' ? (senderUtxo.source === 'stealth' ? 'stealth' : 'transparent') : requestedMode;
+
+
+  if (process.env.BCH_STEALTH_DEBUG_DEPOSIT) {
+    console.log(`[deposit] funding source=${senderUtxo.source} changeMode=${effectiveMode}`);
+  }
+    
+  const changeSpkTransparent = p2pkhLockingBytecode(senderWallet.hash160);
   const changeSpkStealth = p2pkhLockingBytecode(change.childHash160);
 
   const feeRate = await ctx.chainIO.getFeeRateOrFallback();
@@ -69,17 +86,22 @@ export async function runDeposit(
 
   let changeRec: StealthUtxoRecord | null = null;
   if (changeValue >= DUST) {
-    outputs.push({ value: changeValue, scriptPubKey: changeSpkStealth });
-
-    changeRec = makeStealthUtxoRecord({
-      owner: senderTag,
-      purpose: 'deposit_change',
-      txid: '<pending>',
-      vout: 1,
-      valueSats: changeValue,
-      childHash160: change.childHash160,
-      rpaContext: change.rpaContext,
+    outputs.push({
+      value: changeValue,
+      scriptPubKey: effectiveMode === 'stealth' ? changeSpkStealth : changeSpkTransparent,
     });
+
+    if (effectiveMode === 'stealth') {
+      changeRec = makeStealthUtxoRecord({
+        owner: senderTag,
+        purpose: 'deposit_change',
+        txid: '<pending>',
+        vout: 1,
+        valueSats: changeValue,
+        childHash160: change.childHash160,
+        rpaContext: change.rpaContext,
+      });
+    }
   } else {
     changeValue = 0n;
   }
