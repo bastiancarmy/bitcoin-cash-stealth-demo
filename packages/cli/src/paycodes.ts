@@ -65,3 +65,28 @@ export function setupPaycodesAndDerivation(alice: Wallet, bob: Wallet): PaycodeS
 
   return { alicePaycode, bobPaycode };
 }
+
+type FundingActor = {
+  id: string;          // stable internal id (e.g. "user", "wallet_a", "wallet_b")
+  label: string;       // display label (e.g. "Wallet A")
+  baseAddress: string; // funding fallback address
+};
+
+export function printFundingHelp(args: {
+  network: string;
+  actorA: FundingActor;
+  actorB: FundingActor;
+}) {
+  const { network, actorA, actorB } = args;
+
+  console.log(`\n[funding] Network: ${network}`);
+  console.log(`[funding] Fund ONE of these base P2PKH addresses if you see "No funding UTXO available":`);
+  console.log(`  - ${actorA.label} (${actorA.id}) base P2PKH: ${actorA.baseAddress}`);
+  console.log(`  - ${actorB.label} (${actorB.id}) base P2PKH: ${actorB.baseAddress}`);
+
+  console.log(`\n[funding] Notes:`);
+  console.log(`  - Change will often go to stealth (paycode-derived) P2PKH outputs.`);
+  console.log(`  - External wallets won’t track those outputs.`);
+  console.log(`  - The CLI can spend them IF they are recorded in the state file (stealthUtxos).`);
+  console.log(`  - Keep reusing the same --state-file between runs.`);
+}

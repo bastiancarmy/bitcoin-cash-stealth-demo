@@ -26,10 +26,10 @@ export type PoolContext = {
   // chain boundary
   chain: {
     getPrevOutput: (txid: string, vout: number) => Promise<any>;
-    pickFeeRateOrFallback: () => Promise<number>;
+    getFeeRateOrFallback: () => Promise<number>;
     broadcastRawTx: (rawHex: string) => Promise<string>;
-    isP2pkhOutpointUnspent: (args: { scripthashHex: string; txid: string; vout: number }) => Promise<boolean>;
-    waitForP2pkhOutpointUnspent: (
+    isOutpointUnspentByScripthash: (args: { scripthashHex: string; txid: string; vout: number }) => Promise<boolean>;
+    waitForOutpointUnspentByScripthash: (
       args: { scripthashHex: string; txid: string; vout: number },
       opts?: { attempts?: number; delayMs?: number }
     ) => Promise<boolean>;

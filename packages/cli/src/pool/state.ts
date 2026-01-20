@@ -1,51 +1,43 @@
 // packages/cli/src/pool/state.ts
-import type { FileBackedPoolStateStore, PoolState } from '@bch-stealth/pool-state';
-import { ensurePoolStateDefaults, readPoolState, writePoolState } from '@bch-stealth/pool-state';
+import type { PoolState } from '@bch-stealth/pool-state';
+import type { FileBackedPoolStateStore } from '@bch-stealth/pool-state';
+import { ensurePoolStateDefaults } from '@bch-stealth/pool-state';
+import { readPoolState, writePoolState } from '@bch-stealth/pool-state';
 
-export function emptyPoolState(network: string): PoolState {
-  return ensurePoolStateDefaults(
-    {
-      schemaVersion: 1,
-      network,
-      poolIdHex: 'unknown',
-      poolVersion: 'unknown',
-      categoryHex: '',
-      redeemScriptHex: '',
-      shardCount: 0,
-      shards: [],
-      stealthUtxos: [],
-      deposits: [],
-      withdrawals: [],
-      createdAt: new Date().toISOString(),
-    } as any,
-    network
-  );
+export function emptyPoolState(): PoolState {
+  // Minimal empty v1 shape; ensurePoolStateDefaults will fill defaults when saving/loading.
+  return ensurePoolStateDefaults({
+    schemaVersion: 1,
+    network: '',
+    poolIdHex: '',
+    poolVersion: '',
+    categoryHex: '',
+    redeemScriptHex: '',
+    shardCount: 0,
+    shards: [],
+    deposits: [],
+    withdrawals: [],
+    stealthUtxos: [],
+  } as any);
 }
 
-/**
- * Reads state, applies defaults, and persists any migrations immediately.
- * (So callers can assume the store is always “up to date” after load.)
- */
 export async function loadStateOrEmpty(args: {
   store: FileBackedPoolStateStore;
-  network: string;
+  networkDefault: string;
 }): Promise<PoolState> {
-  const { store, network } = args;
+  const { store, networkDefault } = args;
 
-  const st = (await readPoolState({ store, networkDefault: network })) ?? emptyPoolState(network);
-  const state = ensurePoolStateDefaults(st, network);
-
-  // persist migrations/defaults once on load
-  await writePoolState({ store, state, networkDefault: network });
-
-  return state;
+  const st = (await readPoolState({ store, networkDefault })) ?? emptyPoolState();
+  // Persist forward-migrations (idempotent)
+  await writePoolState({ store, state: st, networkDefault });
+  return ensurePoolStateDefaults(st, networkDefault);
 }
 
 export async function saveState(args: {
   store: FileBackedPoolStateStore;
   state: PoolState;
-  network: string;
+  networkDefault: string;
 }): Promise<void> {
-  const { store, state, network } = args;
-  await writePoolState({ store, state: ensurePoolStateDefaults(state, network), networkDefault: network });
+  const { store, state, networkDefault } = args;
+  await writePoolState({ store, state, networkDefault });
 }

@@ -340,3 +340,31 @@ export function ensureEvenYPriv(privBytes: Uint8Array): Uint8Array {
   }
   return privBytes;
 }
+
+import type { WalletId } from './pool/wallet_ids.js';
+import { WALLET_A, WALLET_B } from './pool/wallet_ids.js';
+
+function canonicalizeOwnerId(owner: unknown): WalletId | null {
+  const s = String(owner ?? '').toLowerCase().trim();
+
+  // canonical
+  if (s === WALLET_A.id) return WALLET_A.id;
+  if (s === WALLET_B.id) return WALLET_B.id;
+
+  // legacy aliases
+  if (s === 'alice' || s === 'actor_a' || s === 'a') return WALLET_A.id;
+  if (s === 'bob' || s === 'actor_b' || s === 'b') return WALLET_B.id;
+
+  return null;
+}
+
+function normalizeOwnersInState(st: any): void {
+  if (!st || typeof st !== 'object') return;
+  if (!Array.isArray(st.stealthUtxos)) return;
+
+  for (const r of st.stealthUtxos) {
+    if (!r || typeof r !== 'object') continue;
+    const canon = canonicalizeOwnerId((r as any).owner);
+    if (canon) (r as any).owner = canon;
+  }
+}

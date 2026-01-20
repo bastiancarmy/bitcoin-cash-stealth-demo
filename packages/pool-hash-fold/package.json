@@ -21,7 +21,8 @@
   },
   "dependencies": {
     "@bch-stealth/tx-builder": "workspace:^",
-    "@bch-stealth/utils": "workspace:^"
+    "@bch-stealth/utils": "workspace:^",
+    "@bitauth/libauth": "3.1.0-next.8"
   },
   "devDependencies": {
     "typescript": "^5.9.3"
