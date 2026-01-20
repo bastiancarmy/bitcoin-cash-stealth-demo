@@ -39,4 +39,4 @@ wallets.local.json
 repomix-output*
 doc/
 packages/cli/wallets.local.json
-.bch-stealth/wallets.local.json
+.bch-stealth/
