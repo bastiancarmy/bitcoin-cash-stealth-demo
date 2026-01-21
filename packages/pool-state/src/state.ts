@@ -48,9 +48,36 @@ export type DepositRecord = {
    */
   value?: string;
 
+  /**
+   * For RPA deposits: the derived stealth receiver hash160 (P2PKH).
+   * For base deposits: we still set this to the P2PKH hash160 from the deposit output,
+   * so existing "isP2pkhOutpointUnspent" checks keep working.
+   */
   receiverRpaHash160Hex: string;
+
   createdAt: string;
-  rpaContext: RpaContext;
+
+  /**
+   * RPA-only metadata. Base deposits will have this absent.
+   */
+  rpaContext?: RpaContext;
+
+  /**
+   * Non-consensus classification. If absent, treat as 'rpa' for old files.
+   */
+  depositKind?: 'rpa' | 'base_p2pkh';
+
+  /**
+   * For base deposits: record the actual P2PKH hash160 (same as receiverRpaHash160Hex),
+   * explicitly to avoid implying stealth.
+   */
+  baseP2pkhHash160Hex?: string;
+
+  /**
+   * Optional warnings/notes for operators.
+   */
+  warnings?: string[];
+
   importTxid?: string;
   importedIntoShard?: number;
   spentTxid?: string;

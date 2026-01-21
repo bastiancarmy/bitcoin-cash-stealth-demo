@@ -1,5 +1,5 @@
 // packages/cli/src/pool/ops/withdraw.ts
-import type { PoolState, StealthUtxoRecord } from '@bch-stealth/pool-state';
+import type { StealthUtxoRecord } from '@bch-stealth/pool-state';
 import { ensurePoolStateDefaults, upsertStealthUtxo, markStealthSpent } from '@bch-stealth/pool-state';
 
 import * as PoolShards from '@bch-stealth/pool-shards';
@@ -9,6 +9,47 @@ import type { PoolOpContext } from '../context.js';
 import { loadStateOrEmpty, saveState, selectFundingUtxo } from '../state.js';
 import { toPoolShardsState, patchShardFromNextPoolState } from '../adapters.js';
 import { deriveStealthP2pkhLock } from '../stealth.js';
+
+function shouldDebug(): boolean {
+  return (
+    process.env.BCH_STEALTH_DEBUG_WITHDRAW === '1' ||
+    process.env.BCH_STEALTH_DEBUG_WITHDRAW === 'true' ||
+    process.env.BCH_STEALTH_DEBUG_WITHDRAW === 'yes'
+  );
+}
+
+function normalizeMode(mode: unknown): string | null {
+  if (mode == null) return null;
+  const s = String(mode).trim();
+  return s.length ? s : null;
+}
+
+function scriptContainsHash160(scriptPubKey: Uint8Array, h160: Uint8Array): boolean {
+  const spkHex = bytesToHex(scriptPubKey).toLowerCase();
+  const needle = bytesToHex(h160).toLowerCase();
+  return spkHex.includes(needle);
+}
+
+function pickCovenantSignerWallet(ctx: PoolOpContext, shardScriptPubKey: Uint8Array) {
+  const a = ctx.actors.actorABaseWallet;
+  const b = ctx.actors.actorBBaseWallet;
+
+  const hasA = scriptContainsHash160(shardScriptPubKey, a.hash160);
+  const hasB = scriptContainsHash160(shardScriptPubKey, b.hash160);
+
+  if (shouldDebug()) {
+    console.log(`[withdraw:debug] covenant signer search: contains(A.h160)=${hasA} contains(B.h160)=${hasB}`);
+    console.log(`[withdraw:debug] A.h160=${bytesToHex(a.hash160)} B.h160=${bytesToHex(b.hash160)}`);
+  }
+
+  if (hasA && !hasB) return { wallet: a, ownerTag: 'A' as const };
+  if (hasB && !hasA) return { wallet: b, ownerTag: 'B' as const };
+
+  if (shouldDebug()) {
+    console.log(`[withdraw:debug] WARNING: ambiguous covenant signer (both/neither h160 found). Defaulting to actor B.`);
+  }
+  return { wallet: b, ownerTag: 'B' as const };
+}
 
 export async function runWithdraw(
   ctx: PoolOpContext,
@@ -31,6 +72,10 @@ export async function runWithdraw(
   if (!shard) throw new Error(`Unknown shard index ${shardIndex}`);
 
   const shardPrev = await ctx.chainIO.getPrevOutput(shard.txid, shard.vout);
+
+  // ✅ Covenant signer must match the h160 embedded in the shard locking script.
+  const covenantSigner = pickCovenantSignerWallet(ctx, shardPrev.scriptPubKey);
+  const covenantSignerWallet = covenantSigner.wallet;
 
   const payment = BigInt(amountSats);
   if (payment < BigInt(ctx.config.DUST)) throw new Error('withdraw amount below dust');
@@ -63,7 +108,7 @@ export async function runWithdraw(
 
   const { intent: payIntent, rpaContext: payContext } = deriveStealthP2pkhLock({
     senderWallet,
-    receiverPaycodePub33: ctx.actors.actorAPaycodePub33, // receiver is A in demo withdraw flow (adjust if yours differs)
+    receiverPaycodePub33: ctx.actors.actorAPaycodePub33,
     prevoutTxidHex: feeUtxo.txid,
     prevoutN: feeUtxo.vout,
     index: 0,
@@ -86,14 +131,25 @@ export async function runWithdraw(
     scriptPubKey: shardPrev.scriptPubKey,
   };
 
+  const forcedMode = normalizeMode(process.env.BCH_STEALTH_CATEGORY_MODE);
+
+  if (shouldDebug()) {
+    console.log(
+      `\n[withdraw:debug] shard=${shardIndex} payment=${payment.toString()} fee=${String(ctx.config.DEFAULT_FEE)}`
+    );
+    console.log(`[withdraw:debug] categoryMode=${forcedMode ?? '<default>'}`);
+    console.log(`[withdraw:debug] covenantSigner=${covenantSigner.ownerTag}`);
+  }
+
   const built = PoolShards.withdrawFromShard({
     pool,
     shardIndex,
     shardPrevout,
     feePrevout: feePrevouts.shards,
     covenantWallet: {
-      signPrivBytes: senderWallet.privBytes,
-      pubkeyHash160Hex: bytesToHex(senderWallet.hash160),
+      // ✅ FIX: sign with the wallet whose h160 is embedded in the shard covenant script
+      signPrivBytes: covenantSignerWallet.privBytes,
+      pubkeyHash160Hex: bytesToHex(covenantSignerWallet.hash160),
     },
     feeWallet: {
       signPrivBytes: feeUtxo.signPrivBytes,
@@ -103,6 +159,7 @@ export async function runWithdraw(
     amountSats: payment,
     feeSats: BigInt(ctx.config.DEFAULT_FEE),
     changeP2pkhHash160Hex: bytesToHex(changeIntent.childHash160),
+    categoryMode: forcedMode ?? undefined,
   } as any);
 
   const rawHex = bytesToHex(built.rawTx);

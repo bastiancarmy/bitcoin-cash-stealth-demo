@@ -115,8 +115,8 @@ export function importDepositToShard(args: any) {
   const noteHash32 = outpointHash32(depositPrevout.txid, depositPrevout.vout);
   const proofBlob32 = makeProofBlobV11(noteHash32);
 
-  // demo convention: limbs = [noteHash32]
-  const limbs: Uint8Array[] = [noteHash32];
+  // v1.1 covenant expects noteHash32 + proofBlob32; no limbs for Phase 2 import
+  const limbs: Uint8Array[] = [];
 
   const effectiveCategoryMode = categoryMode ?? DEFAULT_CATEGORY_MODE;
 

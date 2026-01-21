@@ -1,5 +1,5 @@
 // packages/cli/src/pool/ops/deposit.ts
-import type { DepositRecord, PoolState, StealthUtxoRecord } from '@bch-stealth/pool-state';
+import type { DepositRecord, StealthUtxoRecord } from '@bch-stealth/pool-state';
 import { ensurePoolStateDefaults, upsertDeposit, upsertStealthUtxo, markStealthSpent } from '@bch-stealth/pool-state';
 
 import { bytesToHex } from '@bch-stealth/utils';
@@ -16,9 +16,18 @@ function p2pkhLockingBytecode(hash160: Uint8Array): Uint8Array {
   return Uint8Array.from([0x76, 0xa9, 0x14, ...hash160, 0x88, 0xac]);
 }
 
+function shouldDebug(): boolean {
+  const v = String(process.env.BCH_STEALTH_DEBUG_DEPOSIT ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
 export async function runDeposit(
   ctx: PoolOpContext,
-  opts: { amountSats: number; changeMode?: 'auto' | 'transparent' | 'stealth' }
+  opts: {
+    amountSats: number;
+    changeMode?: 'auto' | 'transparent' | 'stealth';
+    depositMode?: 'rpa' | 'base'; // NEW
+  }
 ): Promise<{ txid: string; deposit: DepositRecord; change: StealthUtxoRecord | null }> {
   const amountSats = Number(opts.amountSats);
   if (!Number.isFinite(amountSats) || amountSats <= 0) {
@@ -50,7 +59,21 @@ export async function runDeposit(
   const prev = senderUtxo.prevOut;
   const inputValue = BigInt(prev.value);
 
-  // Payment is always stealth (RPA-derived) in this op.
+  const requestedDepositMode = (opts.depositMode ?? 'rpa') as 'rpa' | 'base';
+  const depositMode: 'rpa' | 'base' = requestedDepositMode === 'base' ? 'base' : 'rpa';
+
+  // ------------------------------------------------------------
+  // Payment selection:
+  // - rpa: current behavior (RPA-derived P2PKH)
+  // - base: pay directly to actorB base P2PKH (not stealth)
+  // ------------------------------------------------------------
+  let paymentSpk: Uint8Array;
+  let paymentHash160: Uint8Array;
+  let paymentRpaContext: any | null = null;
+  let depositKind: 'rpa' | 'base_p2pkh' = 'rpa';
+
+  // Change derivation: we can still derive stealth intents for change when requested/auto,
+  // even if the *deposit output* is base. (Change is a separate policy decision.)
   const { payment, change } = deriveStealthOutputsForPaymentAndChange({
     senderWallet,
     senderPaycodePub33: ctx.actors.actorAPaycodePub33,
@@ -59,7 +82,18 @@ export async function runDeposit(
     prevoutN: senderUtxo.vout,
   });
 
-  const outSpk = p2pkhLockingBytecode(payment.childHash160);
+  if (depositMode === 'rpa') {
+    paymentHash160 = payment.childHash160;
+    paymentSpk = p2pkhLockingBytecode(paymentHash160);
+    paymentRpaContext = payment.rpaContext;
+    depositKind = 'rpa';
+  } else {
+    // base deposit to actor B's base address (P2PKH)
+    paymentHash160 = ctx.actors.actorBBaseWallet.hash160;
+    paymentSpk = p2pkhLockingBytecode(paymentHash160);
+    paymentRpaContext = null;
+    depositKind = 'base_p2pkh';
+  }
 
   // Change policy:
   // - base funding -> transparent change (sender base P2PKH)
@@ -68,11 +102,10 @@ export async function runDeposit(
   const effectiveMode: 'transparent' | 'stealth' =
     requestedMode === 'auto' ? (senderUtxo.source === 'stealth' ? 'stealth' : 'transparent') : requestedMode;
 
-
-  if (process.env.BCH_STEALTH_DEBUG_DEPOSIT) {
-    console.log(`[deposit] funding source=${senderUtxo.source} changeMode=${effectiveMode}`);
+  if (shouldDebug()) {
+    console.log(`[deposit] depositMode=${depositMode} funding=${senderUtxo.source} changeMode=${effectiveMode}`);
   }
-    
+
   const changeSpkTransparent = p2pkhLockingBytecode(senderWallet.hash160);
   const changeSpkStealth = p2pkhLockingBytecode(change.childHash160);
 
@@ -82,7 +115,7 @@ export async function runDeposit(
 
   let changeValue = inputValue - amount - feeFloor;
 
-  const outputs: any[] = [{ value: amount, scriptPubKey: outSpk }];
+  const outputs: any[] = [{ value: amount, scriptPubKey: paymentSpk }];
 
   let changeRec: StealthUtxoRecord | null = null;
   if (changeValue >= DUST) {
@@ -132,14 +165,30 @@ export async function runDeposit(
 
   if (changeRec) changeRec.txid = txid;
 
+  const warnings: string[] = [];
+  if (depositKind === 'base_p2pkh') {
+    warnings.push('BASE_P2PKH_DEPOSIT_NOT_STEALTH');
+    warnings.push('If using this for privacy, mix coins externally before deposit/import (e.g. CashFusion).');
+  }
+
   const deposit: DepositRecord = {
     txid,
     vout: 0,
     valueSats: amount.toString(),
     value: amount.toString(), // legacy compat
-    receiverRpaHash160Hex: bytesToHex(payment.childHash160),
+
+    // keep this field populated so existing unspent checks work:
+    receiverRpaHash160Hex: bytesToHex(paymentHash160),
+
     createdAt: new Date().toISOString(),
-    rpaContext: payment.rpaContext,
+
+    // rpa-only
+    rpaContext: paymentRpaContext ?? undefined,
+
+    // NEW metadata (safe; requires your DepositRecord update in pool-state)
+    depositKind,
+    baseP2pkhHash160Hex: depositKind === 'base_p2pkh' ? bytesToHex(paymentHash160) : undefined,
+    warnings: warnings.length ? warnings : undefined,
   } as any;
 
   upsertDeposit(st, deposit);

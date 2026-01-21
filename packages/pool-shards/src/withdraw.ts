@@ -126,6 +126,7 @@ export function withdrawFromShard(args: any) {
   const nullifier32 = sha256(
     concat(stateIn32, receiverHash160, sha256(uint32le(Number(payment & 0xffffffffn)))));
   const proofBlob32 = sha256(concat(nullifier32, Uint8Array.of(0x02)));
+  // v1.1 covenant expects noteHash32 + proofBlob32; no limbs for Phase 2 withdraw
   const limbs: Uint8Array[] = [];
 
   const effectiveCategoryMode = categoryMode ?? DEFAULT_CATEGORY_MODE;

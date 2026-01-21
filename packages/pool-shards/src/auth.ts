@@ -1,6 +1,7 @@
 // packages/pool-shards/src/auth.ts
 import { bytesToHex, hexToBytes } from '@bch-stealth/utils';
 import type { TxBuilderLike } from './di.js';
+import { maybeLogCovenantSpendDossier } from './debug/covenant_spend_dossier.js';
 
 export type PrevoutAuthLike = {
   valueSats: bigint;
@@ -8,10 +9,7 @@ export type PrevoutAuthLike = {
 };
 
 export type WitnessContext = {
-  // If a tx includes a “witness/proof input”, builders should pass its vin here.
   witnessVin?: number;
-
-  // Optional richer context (useful for future introspection providers)
   witnessPrevout?: (PrevoutAuthLike & { outpoint?: { txid: string; vout: number } }) | undefined;
 };
 
@@ -29,11 +27,9 @@ export type AuthorizeCovenantInputArgs = {
   redeemScript: Uint8Array;
   prevout: PrevoutAuthLike;
 
-  // For your current covenant signing routine:
   amountCommitment?: bigint;
   hashtype?: number;
 
-  // Pool hash-fold unlocking prefix (builder computes; provider applies)
   extraPrefix?: Uint8Array;
 } & WitnessContext;
 
@@ -44,20 +40,27 @@ export type AuthProvider = {
 
 export function makeDefaultAuthProvider(txb: TxBuilderLike): AuthProvider {
   return {
-    authorizeP2pkhInput({ tx, vin, privBytes, prevout }) {
+    authorizeP2pkhInput(args: AuthorizeP2pkhInputArgs) {
+      const { tx, vin, privBytes, prevout } = args;
       txb.signInput(tx, vin, privBytes, prevout.scriptPubKey, prevout.valueSats);
     },
 
-    authorizeCovenantInput({
-      tx,
-      vin,
-      covenantPrivBytes,
-      redeemScript,
-      prevout,
-      amountCommitment,
-      hashtype,
-      extraPrefix,
-    }) {
+    authorizeCovenantInput(args: AuthorizeCovenantInputArgs) {
+      const {
+        tx,
+        vin,
+        covenantPrivBytes,
+        redeemScript,
+        prevout,
+        amountCommitment,
+        hashtype,
+        extraPrefix,
+        witnessPrevout,
+      } = args;
+
+      const ht = hashtype ?? 0x41;
+      const amt = amountCommitment ?? 0n;
+
       txb.signCovenantInput(
         tx,
         vin,
@@ -65,14 +68,30 @@ export function makeDefaultAuthProvider(txb: TxBuilderLike): AuthProvider {
         redeemScript,
         prevout.valueSats,
         prevout.scriptPubKey,
-        amountCommitment ?? 0n,
-        hashtype
+        amt,
+        ht
       );
 
       if (extraPrefix && extraPrefix.length) {
-        const base = hexToBytes(tx.inputs[vin].scriptSig);
-        tx.inputs[vin].scriptSig = bytesToHex(new Uint8Array([...extraPrefix, ...base]));
+        const cur = tx.inputs?.[vin]?.scriptSig;
+        const base =
+          cur instanceof Uint8Array ? cur : typeof cur === 'string' ? hexToBytes(cur) : new Uint8Array();
+        tx.inputs[vin].scriptSig = new Uint8Array([...extraPrefix, ...base]);
       }
+
+      // ---- B451 dossier (after prefix applied) ----
+      maybeLogCovenantSpendDossier({
+        tx,
+        vin,
+        redeemScript,
+        prevout: {
+          ...prevout,
+          outpoint: witnessPrevout?.outpoint,
+        },
+        amountCommitment: amt,
+        hashtype: ht,
+        extraPrefix,
+      });
     },
   };
 }

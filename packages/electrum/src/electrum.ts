@@ -241,30 +241,17 @@ export async function getPrevoutScriptAndValue(
 ): Promise<Prevout> {
   const client = await connectElectrum(network);
   try {
-    // Try verbose first
-    let tx: any = await client.request('blockchain.transaction.get', txid, true);
-
-    if (typeof tx === 'object' && tx && tx.vout) {
-      const out = tx.vout[vout];
-
-      let valueSats: number;
-      if (typeof out.value_satoshi === 'number') valueSats = out.value_satoshi;
-      else if (typeof out.value === 'number') valueSats = Math.round(out.value * 1e8);
-      else if (typeof out.value === 'string') valueSats = Math.round(parseFloat(out.value) * 1e8);
-      else throw new Error('Unsupported verbose tx format for value');
-
-      const scriptHex = out.scriptPubKey?.hex || out.scriptPubKey;
-      if (!scriptHex) throw new Error('Missing scriptPubKey in verbose tx');
-
-      return { scriptPubKey: hexToBytes(scriptHex), value: valueSats };
-    }
-
-    // Fallback: raw tx hex
+    // IMPORTANT:
+    // Always use raw tx hex so scriptPubKey includes the CashTokens prefix (0xef…).
+    // Verbose mode often splits tokens into token_data and returns scriptPubKey without the prefix.
+    let tx = await client.request('blockchain.transaction.get', txid);
     if (typeof tx !== 'string') {
-      tx = await client.request('blockchain.transaction.get', txid);
-      if (typeof tx !== 'string') throw new Error('Unexpected electrum response for transaction.get');
+      // Some servers might require the (txid, false) form; try that before failing.
+      tx = await client.request('blockchain.transaction.get', txid, false);
     }
+    if (typeof tx !== 'string') throw new Error('Unexpected electrum response for transaction.get');
 
+    // ---- keep your existing raw parsing code exactly as-is ----
     const bytes = hexToBytes(tx);
     let pos = 0;
 
@@ -276,15 +263,12 @@ export async function getPrevoutScriptAndValue(
     pos += inCount.length;
 
     for (let i = 0; i < inCount.value; i++) {
-      // outpoint (32 txid + 4 vout)
       pos += 32 + 4;
 
-      // scriptSig
       const scrLen = decodeVarInt(bytes, pos);
       pos += scrLen.length;
       pos += scrLen.value;
 
-      // sequence
       pos += 4;
     }
 
@@ -295,18 +279,17 @@ export async function getPrevoutScriptAndValue(
     if (vout >= outCount.value) throw new Error('vout index out of range');
 
     for (let i = 0; i < outCount.value; i++) {
-      // value (8 bytes LE)
       const valueLE = bytes.slice(pos, pos + 8);
       const value = Number(bytesToBigInt(reverseBytes(valueLE)));
       pos += 8;
 
-      // scriptPubKey (varint length + bytes)
       const scrLen = decodeVarInt(bytes, pos);
       pos += scrLen.length;
 
       const script = bytes.slice(pos, pos + scrLen.value);
+      // TEMP DEBUG
+      console.log('[getPrevoutScriptAndValue] spk prefix:', bytesToHex(script.slice(0, 4)));
       pos += scrLen.value;
-
       if (i === vout) return { scriptPubKey: script, value };
     }
 

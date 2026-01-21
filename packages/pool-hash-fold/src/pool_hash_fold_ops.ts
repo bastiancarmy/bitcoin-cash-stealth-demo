@@ -25,7 +25,18 @@ import {
 import { POOL_HASH_FOLD_VERSION, type PoolHashFoldVersion } from './pool_hash_fold_script.js';
 
 export type PoolHashFoldLimb = Uint8Array | number | bigint;
-export type PoolHashFoldCategoryMode = 'none' | 'reverse';
+export type PoolHashFoldCategoryMode =
+  | 'reverse'
+  | 'direct'
+  | 'raw'
+  | 'none'
+  | 'rev'
+  | 'reversed'
+  | 'asis'
+  | 'as-is'
+  | 'as_is'
+  | 'forward'
+  | 'normal';
 
 export type ComputePoolStateOutParams =
   | {
@@ -61,6 +72,34 @@ export type BuildPoolHashFoldUnlockingBytecodeParams =
       noteHash32: Uint8Array;
       proofBlob32: Uint8Array;
     };
+
+type NormalizedCategoryMode = 'reverse' | 'direct';
+
+function normalizeCategoryMode(mode: unknown): NormalizedCategoryMode {
+  if (mode == null) return 'reverse'; // keep existing default behavior (v1.1 expects reverse by default)
+
+  const s = String(mode).trim().toLowerCase();
+  if (!s) return 'reverse';
+
+  // "reverse" mode (common)
+  if (s === 'reverse' || s === 'rev' || s === 'reversed') return 'reverse';
+
+  // "direct" (no reverse) — accept common synonyms/aliases
+  if (
+    s === 'direct' ||
+    s === 'raw' ||
+    s === 'none' ||
+    s === 'asis' ||
+    s === 'as-is' ||
+    s === 'as_is' ||
+    s === 'forward' ||
+    s === 'normal'
+  ) {
+    return 'direct';
+  }
+
+  throw new Error(`unknown categoryMode: ${String(mode)}`);
+}
 
 // Small helper: allow calling assertLen on values that might be undefined from destructuring
 function assertLen(u8: unknown, n: number, label: string): asserts u8 is Uint8Array {
@@ -181,16 +220,12 @@ export function computePoolStateOut(params: ComputePoolStateOutParams): Uint8Arr
     throw new Error('capByte must be 0..255');
   }
 
-  const categoryMode: PoolHashFoldCategoryMode = p.categoryMode ?? 'reverse';
+  // v1.1 category normalization:
+  // - default: "reverse"
+  // - accepts aliases like "raw" => direct (no reverse)
+  const mode = normalizeCategoryMode((p as any).categoryMode);
 
-  const catNorm =
-    categoryMode === 'none'
-      ? p.category32
-      : categoryMode === 'reverse'
-        ? reverseBytes(p.category32)
-        : (() => {
-            throw new Error(`unknown categoryMode: ${categoryMode}`);
-          })();
+  const catNorm = mode === 'reverse' ? reverseBytes(p.category32) : p.category32;
 
   const inCatCap33 = concat(catNorm, Uint8Array.of(capByte));
 

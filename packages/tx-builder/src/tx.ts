@@ -598,11 +598,6 @@ export function signCovenantInput(
 
   tx.inputs[inputIndex].scriptSig = unlocking;
 
-  // Optional debug
-  console.log('COVENANT preimage (hex):', bytesToHex(preimage));
-  console.log('COVENANT sighash  (hex):', bytesToHex(sighash));
-  console.log('COVENANT sig65    (hex):', bytesToHex(sig65));
-
   return tx;
 }
 

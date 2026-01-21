@@ -1,4 +1,4 @@
-// src/wallets.ts
+// packages/cli/src/wallets.ts
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { hexToBytes, bytesToHex, ensureEvenYPriv, hash160 } from '@bch-stealth/utils';
 import { promptPrivKey, promptYesNo } from './prompts.js';
