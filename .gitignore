@@ -40,3 +40,6 @@ repomix-output*
 doc/
 packages/cli/wallets.local.json
 .bch-stealth/
+# TypeScript incremental build cache
+tsconfig.tsbuildinfo
+*.tsbuildinfo
