@@ -436,9 +436,12 @@ async function sweepDepositDebug(args: {
 
 // --- pool init --------------------------------------------------------------
 
+// --- pool init --------------------------------------------------------------
+
 pool
   .command('init')
   .option('--shards <n>', 'number of shards', '8')
+  .option('--fresh', 'force a new init (creates new shards)', false)
   .action(async (opts) => {
     assertChipnet();
 
@@ -446,10 +449,11 @@ pool
     if (!Number.isFinite(shards) || shards < 2) throw new Error('shards must be >= 2');
 
     const ctx = await makePoolCtx();
-    const res = await runInit(ctx, { shards });
+    const res = await runInit(ctx, { shards, fresh: !!opts.fresh });
 
     console.log(`✅ init txid: ${res.txid ?? res.state?.txid ?? '<unknown>'}`);
     console.log(`   shards: ${shards}`);
+    console.log(`   fresh: ${!!opts.fresh}`);
     console.log(`   state saved: ${(program.opts().stateFile as string) ?? STORE_FILE}`);
   });
 

@@ -1,5 +1,5 @@
 // packages/cli/src/pool/ops/withdraw.ts
-import type { StealthUtxoRecord } from '@bch-stealth/pool-state';
+import type { StealthUtxoRecord, PoolState } from '@bch-stealth/pool-state';
 import { ensurePoolStateDefaults, upsertStealthUtxo, markStealthSpent } from '@bch-stealth/pool-state';
 
 import * as PoolShards from '@bch-stealth/pool-shards';
@@ -24,31 +24,46 @@ function normalizeMode(mode: unknown): string | null {
   return s.length ? s : null;
 }
 
-function scriptContainsHash160(scriptPubKey: Uint8Array, h160: Uint8Array): boolean {
-  const spkHex = bytesToHex(scriptPubKey).toLowerCase();
-  const needle = bytesToHex(h160).toLowerCase();
-  return spkHex.includes(needle);
-}
+function resolveCovenantSignerWalletFromState(ctx: PoolOpContext, st: PoolState) {
+  const id = st.covenantSigner;
+  if (!id) {
+    throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
+  }
 
-function pickCovenantSignerWallet(ctx: PoolOpContext, shardScriptPubKey: Uint8Array) {
+  const wantActor = (id.actorId ?? '').toLowerCase();
+  const wantH160 = (id.pubkeyHash160Hex ?? '').toLowerCase();
+
   const a = ctx.actors.actorABaseWallet;
   const b = ctx.actors.actorBBaseWallet;
 
-  const hasA = scriptContainsHash160(shardScriptPubKey, a.hash160);
-  const hasB = scriptContainsHash160(shardScriptPubKey, b.hash160);
+  let chosen =
+    wantActor === 'actor_a' || wantActor === 'alice' || wantActor === 'a'
+      ? a
+      : wantActor === 'actor_b' || wantActor === 'bob' || wantActor === 'b'
+        ? b
+        : undefined;
 
-  if (shouldDebug()) {
-    console.log(`[withdraw:debug] covenant signer search: contains(A.h160)=${hasA} contains(B.h160)=${hasB}`);
-    console.log(`[withdraw:debug] A.h160=${bytesToHex(a.hash160)} B.h160=${bytesToHex(b.hash160)}`);
+  if (!chosen) {
+    const aH = bytesToHex(a.hash160).toLowerCase();
+    const bH = bytesToHex(b.hash160).toLowerCase();
+    if (wantH160 === aH) chosen = a;
+    if (wantH160 === bH) chosen = b;
   }
 
-  if (hasA && !hasB) return { wallet: a, ownerTag: 'A' as const };
-  if (hasB && !hasA) return { wallet: b, ownerTag: 'B' as const };
-
-  if (shouldDebug()) {
-    console.log(`[withdraw:debug] WARNING: ambiguous covenant signer (both/neither h160 found). Defaulting to actor B.`);
+  if (!chosen) {
+    throw new Error(
+      `Unknown covenantSigner in state: actorId=${id.actorId} pubkeyHash160Hex=${id.pubkeyHash160Hex}`
+    );
   }
-  return { wallet: b, ownerTag: 'B' as const };
+
+  const actual = bytesToHex(chosen.hash160).toLowerCase();
+  if (wantH160 && wantH160 !== actual) {
+    throw new Error(
+      `covenantSigner mismatch: state.pubkeyHash160Hex=${id.pubkeyHash160Hex} actualWalletHash160=${actual}`
+    );
+  }
+
+  return { actorId: id.actorId, wallet: chosen };
 }
 
 export async function runWithdraw(
@@ -68,13 +83,18 @@ export async function runWithdraw(
     throw new Error('State missing redeemScriptHex/categoryHex. Run init first or repair state.');
   }
 
+  // B452: fail early if missing signer identity (withdraw requires covenant spend)
+  if (!st.covenantSigner) {
+    throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
+  }
+
   const shard = st.shards[shardIndex];
   if (!shard) throw new Error(`Unknown shard index ${shardIndex}`);
 
   const shardPrev = await ctx.chainIO.getPrevOutput(shard.txid, shard.vout);
 
-  // ✅ Covenant signer must match the h160 embedded in the shard locking script.
-  const covenantSigner = pickCovenantSignerWallet(ctx, shardPrev.scriptPubKey);
+  // ✅ Covenant signer is resolved from state (no script scanning).
+  const covenantSigner = resolveCovenantSignerWalletFromState(ctx, st);
   const covenantSignerWallet = covenantSigner.wallet;
 
   const payment = BigInt(amountSats);
@@ -138,7 +158,8 @@ export async function runWithdraw(
       `\n[withdraw:debug] shard=${shardIndex} payment=${payment.toString()} fee=${String(ctx.config.DEFAULT_FEE)}`
     );
     console.log(`[withdraw:debug] categoryMode=${forcedMode ?? '<default>'}`);
-    console.log(`[withdraw:debug] covenantSigner=${covenantSigner.ownerTag}`);
+    console.log(`[withdraw:debug] covenantSigner.actorId=${covenantSigner.actorId}`);
+    console.log(`[withdraw:debug] covenantSigner.h160=${bytesToHex(covenantSignerWallet.hash160)}`);
   }
 
   const built = PoolShards.withdrawFromShard({
@@ -147,7 +168,6 @@ export async function runWithdraw(
     shardPrevout,
     feePrevout: feePrevouts.shards,
     covenantWallet: {
-      // ✅ FIX: sign with the wallet whose h160 is embedded in the shard covenant script
       signPrivBytes: covenantSignerWallet.privBytes,
       pubkeyHash160Hex: bytesToHex(covenantSignerWallet.hash160),
     },

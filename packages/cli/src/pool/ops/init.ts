@@ -34,13 +34,35 @@ function cleanHex20Maybe(x: unknown): string | null {
 // This is used by init to fetch the redeem script bytecode.
 async function getPoolHashFoldBytecode(poolVersion: any): Promise<Uint8Array> {
   const m: any = await import('@bch-stealth/pool-hash-fold');
-  if (typeof m.getPoolHashFoldBytecode === 'function') return await m.getPoolHashFoldBytecode(poolVersion);
-  if (typeof m.getPoolHashFoldScript === 'function') return await m.getPoolHashFoldScript(poolVersion);
-  if (typeof m.getRedeemScript === 'function') return await m.getRedeemScript(poolVersion);
-  if (typeof m.loadPoolHashFoldBytecode === 'function') return await m.loadPoolHashFoldBytecode(poolVersion);
 
-  throw new Error(
-    `[init] Unable to load pool-hash-fold bytecode. Available: ${Object.keys(m).sort().join(', ')}`
+  const toBytes = (x: any): Uint8Array | null => {
+    if (x instanceof Uint8Array) return x;
+    if (typeof x === 'string') {
+      const h = x.startsWith('0x') ? x.slice(2) : x;
+      if (/^[0-9a-f]+$/i.test(h) && h.length % 2 === 0) return hexToBytes(h);
+    }
+    return null;
+  };
+
+  const tryCall = async (fnName: string): Promise<Uint8Array | null> => {
+    const fn = m?.[fnName];
+    if (typeof fn !== 'function') return null;
+    const r = await fn(poolVersion);
+    return toBytes(r);
+  };
+
+  // Preferred → legacy → common alternates
+  return (
+    (await tryCall('getPoolHashFoldBytecode')) ??
+    (await tryCall('getRedeemScriptBytecode')) ??
+    (await tryCall('getPoolHashFoldScript')) ??
+    (await tryCall('getRedeemScript')) ??
+    (await tryCall('loadPoolHashFoldBytecode')) ??
+    (() => {
+      throw new Error(
+        `[init] Unable to load pool-hash-fold bytecode. Available: ${Object.keys(m ?? {}).sort().join(', ')}`
+      );
+    })()
   );
 }
 
@@ -53,6 +75,14 @@ export async function runInit(
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
   const st = ensurePoolStateDefaults(st0);
 
+  // make covenant signer explicit in state (demo default: actor_b).
+  const defaultSigner = {
+    actorId: 'actor_b',
+    pubkeyHash160Hex: bytesToHex(ctx.actors.actorBBaseWallet.hash160),
+  };
+  if (fresh) st.covenantSigner = defaultSigner;
+  else st.covenantSigner = st.covenantSigner ?? defaultSigner;
+
   const alreadyInitialized =
     Array.isArray(st.shards) &&
     st.shards.length > 0 &&
@@ -62,6 +92,8 @@ export async function runInit(
     st.redeemScriptHex.length > 0;
 
   if (!fresh && alreadyInitialized) {
+    // still persist covenantSigner if it was missing and we defaulted it above
+    await saveState({ store: ctx.store, state: st, networkDefault: ctx.network });
     return { state: st };
   }
 
@@ -142,6 +174,7 @@ export async function runInit(
   const next: PoolState = ensurePoolStateDefaults({
     ...st,
     schemaVersion: 1,
+    covenantSigner: st.covenantSigner, // keep explicit signer
     network: built.nextPoolState.network,
     poolIdHex: built.nextPoolState.poolIdHex,
     poolVersion: built.nextPoolState.poolVersion,

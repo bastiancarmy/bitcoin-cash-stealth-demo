@@ -1,9 +1,5 @@
 // packages/pool-state/src/helpers.ts
-import type { PoolState, DepositRecord, StealthUtxoRecord, ShardPointer } from './state.js';
-
-function isRecord(x: unknown): x is Record<string, unknown> {
-  return !!x && typeof x === 'object';
-}
+import type { PoolState, DepositRecord, StealthUtxoRecord, ShardPointer, CovenantSignerIdentity } from './state.js';
 
 function normalizeShardPointer(s: any, fallbackIndex: number): ShardPointer {
   const index = typeof s?.index === 'number' ? s.index : fallbackIndex;
@@ -68,6 +64,14 @@ function normalizeStealthUtxo(r: any): StealthUtxoRecord {
   } as StealthUtxoRecord;
 }
 
+function normalizeCovenantSigner(x: any): CovenantSignerIdentity | undefined {
+  if (!x || typeof x !== 'object') return undefined;
+  const actorId = typeof x.actorId === 'string' ? x.actorId : '';
+  const pubkeyHash160Hex = typeof x.pubkeyHash160Hex === 'string' ? x.pubkeyHash160Hex : '';
+  if (!actorId || !pubkeyHash160Hex) return undefined;
+  return { actorId, pubkeyHash160Hex };
+}
+
 /**
  * Ensure a PoolState is in canonical v1 shape.
  * - Idempotent: safe to call multiple times.
@@ -78,6 +82,13 @@ export function ensurePoolStateDefaults(state?: PoolState | any | null, networkD
 
   // canonical schemaVersion
   if (st.schemaVersion !== 1) st.schemaVersion = 1;
+
+  // covenantSigner (additive)
+  // - keep if present
+  // - if malformed, drop to undefined
+  if ('covenantSigner' in st) {
+    st.covenantSigner = normalizeCovenantSigner(st.covenantSigner);
+  }
 
   // network defaulting
   const net = networkDefault ?? st.network;

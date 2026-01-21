@@ -21,31 +21,49 @@ function shouldDebug(): boolean {
   );
 }
 
-function scriptContainsHash160(scriptPubKey: Uint8Array, h160: Uint8Array): boolean {
-  const spkHex = bytesToHex(scriptPubKey).toLowerCase();
-  const needle = bytesToHex(h160).toLowerCase();
-  return spkHex.includes(needle);
-}
+function resolveCovenantSignerWalletFromState(ctx: PoolOpContext, st: PoolState) {
+  const id = (st as any).covenantSigner;
+  if (!id) {
+    throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
+  }
 
-function pickCovenantSignerWallet(ctx: PoolOpContext, shardScriptPubKey: Uint8Array) {
+  const wantActor = String(id.actorId ?? '').toLowerCase();
+  const wantH160 = String(id.pubkeyHash160Hex ?? '').toLowerCase();
+
   const a = ctx.actors.actorABaseWallet;
   const b = ctx.actors.actorBBaseWallet;
 
-  const hasA = scriptContainsHash160(shardScriptPubKey, a.hash160);
-  const hasB = scriptContainsHash160(shardScriptPubKey, b.hash160);
+  // Prefer actorId mapping
+  let chosen =
+    wantActor === 'actor_a' || wantActor === 'alice' || wantActor === 'a'
+      ? a
+      : wantActor === 'actor_b' || wantActor === 'bob' || wantActor === 'b'
+        ? b
+        : undefined;
 
-  if (shouldDebug()) {
-    console.log(`[import:debug] covenant signer search: contains(A.h160)=${hasA} contains(B.h160)=${hasB}`);
-    console.log(`[import:debug] A.h160=${bytesToHex(a.hash160)} B.h160=${bytesToHex(b.hash160)}`);
+  // Otherwise match by hash160
+  if (!chosen) {
+    const aH = bytesToHex(a.hash160).toLowerCase();
+    const bH = bytesToHex(b.hash160).toLowerCase();
+    if (wantH160 === aH) chosen = a;
+    if (wantH160 === bH) chosen = b;
   }
 
-  if (hasA && !hasB) return { wallet: a, ownerTag: 'A' as const };
-  if (hasB && !hasA) return { wallet: b, ownerTag: 'B' as const };
-
-  if (shouldDebug()) {
-    console.log(`[import:debug] WARNING: ambiguous covenant signer (both/neither h160 found). Defaulting to actor B.`);
+  if (!chosen) {
+    throw new Error(
+      `Unknown covenantSigner in state: actorId=${id.actorId} pubkeyHash160Hex=${id.pubkeyHash160Hex}`
+    );
   }
-  return { wallet: b, ownerTag: 'B' as const };
+
+  // Validate stored hash160 matches chosen wallet
+  const actual = bytesToHex(chosen.hash160).toLowerCase();
+  if (wantH160 && wantH160 !== actual) {
+    throw new Error(
+      `covenantSigner mismatch: state.pubkeyHash160Hex=${id.pubkeyHash160Hex} actualWalletHash160=${actual}`
+    );
+  }
+
+  return { actorId: String(id.actorId), wallet: chosen };
 }
 
 function parseP2pkhHash160(scriptPubKey: Uint8Array | string): Uint8Array | null {
@@ -128,11 +146,6 @@ function loudBaseImportWarning(args: { dep: DepositRecord; expectedH160Hex: stri
   );
 }
 
-/**
- * Minimal debug helper:
- * - prints prefix of scriptPubKey hex
- * - searches for known substrings (categoryHex, commitmentHex) in the scriptPubKey hex
- */
 function debugScriptSearch(args: {
   label: string;
   scriptPubKey: Uint8Array;
@@ -167,12 +180,19 @@ async function importDepositToShardOnce(args: {
   depositOutpoint: DepositRecord;
   categoryMode?: string | null;
 
-  // base-import key material (already parsed to bytes)
   baseDepositPrivBytes?: Uint8Array | null;
   allowBaseFlag: boolean;
 }): Promise<{ txid: string; built: any; depositKind: 'rpa' | 'base_p2pkh'; expectedH160Hex: string }> {
   const { ctx, poolState, shardIndex, depositOutpoint, categoryMode, baseDepositPrivBytes, allowBaseFlag } = args;
   const st = ensurePoolStateDefaults(poolState);
+
+  if (!st.categoryHex || !st.redeemScriptHex) {
+    throw new Error('State missing categoryHex/redeemScriptHex. Run init first or repair state.');
+  }
+
+  // B452: covenant signer comes from state (no shard script scanning)
+  const covenantSigner = resolveCovenantSignerWalletFromState(ctx, st);
+  const covenantSignerWallet = covenantSigner.wallet;
 
   const shard = st.shards[shardIndex];
   if (!shard) throw new Error(`invalid shardIndex ${shardIndex}`);
@@ -180,12 +200,9 @@ async function importDepositToShardOnce(args: {
   const shardPrev = await ctx.chainIO.getPrevOutput(shard.txid, shard.vout);
   const depositPrev = await ctx.chainIO.getPrevOutput(depositOutpoint.txid, depositOutpoint.vout);
 
-  // ✅ Covenant signer must match the h160 embedded in the shard locking script.
-  const covenantSigner = pickCovenantSignerWallet(ctx, shardPrev.scriptPubKey);
-  const covenantSignerWallet = covenantSigner.wallet;
-
   if (shouldDebug()) {
-    console.log(`[import:debug] covenantSigner=${covenantSigner.ownerTag}`);
+    console.log(`[import:debug] covenantSigner.actorId=${covenantSigner.actorId}`);
+    console.log(`[import:debug] covenantSigner.h160=${bytesToHex(covenantSignerWallet.hash160)}`);
   }
 
   debugScriptSearch({
@@ -204,23 +221,15 @@ async function importDepositToShardOnce(args: {
   if (!expectedH160) throw new Error('deposit prevout is not P2PKH');
   const expectedH160Hex = bytesToHex(expectedH160);
 
-  // ------------------------------------------------------------
-  // Branch A: RPA (existing behavior)
-  // Branch B: BASE P2PKH (new; guarded)
-  // ------------------------------------------------------------
   let depositKind: 'rpa' | 'base_p2pkh' = 'rpa';
-
   let depositSignPrivBytes: Uint8Array;
   let depositH160Hex: string;
 
   const rpaCtx = depositOutpoint.rpaContext;
 
   if (rpaCtx?.senderPub33Hex && rpaCtx?.prevoutHashHex) {
-    // ---- RPA path ----
-    // ✅ Fix discrepancy: keep senderPub33 scoped and consistently named.
     const senderPaycodePub33 = hexToBytes(rpaCtx.senderPub33Hex);
 
-    // Receiver is the stealth recipient (Actor B) in this demo.
     const receiverWallet = ctx.actors.actorBBaseWallet;
 
     const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
@@ -242,7 +251,6 @@ async function importDepositToShardOnce(args: {
     depositSignPrivBytes = oneTimePriv;
     depositKind = 'rpa';
   } else {
-    // ---- BASE P2PKH path ----
     depositKind = 'base_p2pkh';
 
     requireBaseImportUnlocks({ allowBaseFlag });
@@ -276,10 +284,6 @@ async function importDepositToShardOnce(args: {
     depositSignPrivBytes = baseDepositPrivBytes;
   }
 
-  if (!st.categoryHex || !st.redeemScriptHex) {
-    throw new Error('State missing categoryHex/redeemScriptHex. Run init first or repair state.');
-  }
-
   const pool = toPoolShardsState(st, ctx.network);
 
   const shardPrevout: PoolShards.PrevoutLike = {
@@ -296,13 +300,11 @@ async function importDepositToShardOnce(args: {
     scriptPubKey: depositPrev.scriptPubKey,
   };
 
-  // ✅ FIX: covenantWallet must use signer matching shard script h160
   const covenantWallet: PoolShards.WalletLike = {
     signPrivBytes: covenantSignerWallet.privBytes,
     pubkeyHash160Hex: bytesToHex(covenantSignerWallet.hash160),
   };
 
-  // Deposit wallet is constructed directly from derived (RPA) or provided (base) key.
   const depositWallet: PoolShards.WalletLike = {
     signPrivBytes: depositSignPrivBytes,
     pubkeyHash160Hex: depositH160Hex,
@@ -345,7 +347,7 @@ async function importDepositToShardOnce(args: {
       feeSats: built?.diagnostics?.feeSats,
       newShardValueSats: built?.diagnostics?.newShardValueSats,
       depositKind,
-      covenantSigner: covenantSigner.ownerTag,
+      covenantSignerActorId: covenantSigner.actorId,
     });
   }
 
@@ -387,6 +389,11 @@ export async function runImport(
   st.deposits ??= [];
   st.withdrawals ??= [];
   st.stealthUtxos ??= [];
+
+  // B452: fail early if missing signer identity (import requires covenant spend)
+  if (!(st as any).covenantSigner) {
+    throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
+  }
 
   const dep =
     ((st as any).lastDeposit && !(st as any).lastDeposit.importTxid ? (st as any).lastDeposit : null) ??
