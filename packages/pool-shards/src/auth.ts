@@ -38,6 +38,21 @@ export type AuthProvider = {
   authorizeCovenantInput(args: AuthorizeCovenantInputArgs): void;
 };
 
+function inferAmountCommitmentFromTx(tx: any): bigint {
+    const out0 = tx?.outputs?.[0];
+    const v =
+      out0?.value ??
+      out0?.satoshis ??
+      out0?.valueSats ??
+      out0?.amount;
+    if (v == null) return 0n;
+    try {
+      return BigInt(v);
+    } catch {
+      return 0n;
+    }
+  }
+
 export function makeDefaultAuthProvider(txb: TxBuilderLike): AuthProvider {
   return {
     authorizeP2pkhInput(args: AuthorizeP2pkhInputArgs) {
@@ -59,7 +74,8 @@ export function makeDefaultAuthProvider(txb: TxBuilderLike): AuthProvider {
       } = args;
 
       const ht = hashtype ?? 0x41;
-      const amt = amountCommitment ?? 0n;
+      const inferred = inferAmountCommitmentFromTx(tx);
+      const amt = amountCommitment == null || amountCommitment === 0n ? inferred : amountCommitment;
 
       txb.signCovenantInput(
         tx,

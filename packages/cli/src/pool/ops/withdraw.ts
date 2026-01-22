@@ -66,15 +66,62 @@ function resolveCovenantSignerWalletFromState(ctx: PoolOpContext, st: PoolState)
   return { actorId: id.actorId, wallet: chosen };
 }
 
+/**
+ * Pick a shard that can satisfy a single-shard withdraw:
+ *   shardValue >= payment + dust
+ *
+ * Strategy: best-fit (smallest shard that works), to avoid always draining the biggest shard.
+ */
+function pickShardIndexForSingleShardWithdraw(st: PoolState, payment: bigint, dust: bigint): number | null {
+  const need = payment + dust;
+
+  let bestIndex: number | null = null;
+  let bestValue: bigint | null = null;
+
+  for (let i = 0; i < (st.shards?.length ?? 0); i++) {
+    const s: any = st.shards[i];
+    if (!s) continue;
+
+    let v: bigint;
+    try {
+      v = BigInt(s.valueSats ?? s.value ?? '0');
+    } catch {
+      continue;
+    }
+
+    if (v < need) continue;
+
+    if (bestValue === null || v < bestValue) {
+      bestValue = v;
+      bestIndex = i;
+    }
+  }
+
+  return bestIndex;
+}
+
+function maxShardValue(st: PoolState): bigint {
+  let m = 0n;
+  for (const s of st.shards ?? []) {
+    if (!s) continue;
+    try {
+      const v = BigInt((s as any).valueSats ?? (s as any).value ?? '0');
+      if (v > m) m = v;
+    } catch {}
+  }
+  return m;
+}
+
 export async function runWithdraw(
   ctx: PoolOpContext,
   opts: {
-    shardIndex: number;
+    shardIndex?: number;              // ✅ now optional
     amountSats: number;
     fresh?: boolean;
+    requireShard?: boolean;           // ✅ if true, fail if shardIndex not provided
   }
 ): Promise<{ txid: string }> {
-  const { shardIndex, amountSats } = opts;
+  const { amountSats } = opts;
 
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
   const st = ensurePoolStateDefaults(st0);
@@ -83,9 +130,33 @@ export async function runWithdraw(
     throw new Error('State missing redeemScriptHex/categoryHex. Run init first or repair state.');
   }
 
-  // B452: fail early if missing signer identity (withdraw requires covenant spend)
   if (!st.covenantSigner) {
     throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
+  }
+
+  const payment = BigInt(amountSats);
+  if (payment < BigInt(ctx.config.DUST)) throw new Error('withdraw amount below dust');
+
+  // --- shard selection (single-shard) --------------------------------------
+  let shardIndex =
+    typeof opts.shardIndex === 'number' && Number.isFinite(opts.shardIndex) ? opts.shardIndex : undefined;
+
+  if (shardIndex == null) {
+    if (opts.requireShard) {
+      throw new Error('Missing --shard and requireShard=true. Provide --shard explicitly.');
+    }
+
+    const picked = pickShardIndexForSingleShardWithdraw(st, payment, BigInt(ctx.config.DUST));
+    if (picked == null) {
+      const max = maxShardValue(st);
+      throw new Error(
+        `No shard can satisfy single-shard withdraw. Need >= ${(
+          payment + BigInt(ctx.config.DUST)
+        ).toString()} sats in one shard, but max shard is ${max.toString()} sats. ` +
+          `Deposit more, reduce amount, or (future) use multi-shard withdraw.`
+      );
+    }
+    shardIndex = picked;
   }
 
   const shard = st.shards[shardIndex];
@@ -93,12 +164,8 @@ export async function runWithdraw(
 
   const shardPrev = await ctx.chainIO.getPrevOutput(shard.txid, shard.vout);
 
-  // ✅ Covenant signer is resolved from state (no script scanning).
   const covenantSigner = resolveCovenantSignerWalletFromState(ctx, st);
   const covenantSignerWallet = covenantSigner.wallet;
-
-  const payment = BigInt(amountSats);
-  if (payment < BigInt(ctx.config.DUST)) throw new Error('withdraw amount below dust');
 
   const senderTag = 'B';
   const senderWallet = ctx.actors.actorBBaseWallet;

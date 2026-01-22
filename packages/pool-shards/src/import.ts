@@ -1,7 +1,7 @@
 // packages/pool-shards/src/import.ts
 import type { BuilderDeps } from './di.js';
 
-import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
+import { bytesToHex, hexToBytes } from '@bch-stealth/utils';
 import * as txbDefault from '@bch-stealth/tx-builder';
 
 import {
@@ -35,7 +35,7 @@ export function importDepositToShard(args: any) {
   //   - { covenantWallet, depositWallet } OR
   //   - { ownerWallet } (legacy)
   // New multi-signer shape:
-  //   - { signers?: { covenantPrivBytes, depositPrivBytes } }
+  //   - { signers?: { depositPrivBytes } }
   const a: any = args ?? {};
 
   const legacyWallet =
@@ -49,21 +49,13 @@ export function importDepositToShard(args: any) {
   if (!a.depositWallet && a.covenantWallet) a.depositWallet = a.covenantWallet;
 
   // ---- Multi-signer overlay (B3g) ----------------------------------------
-  if (a.signers?.covenantPrivBytes) {
-    if (!a.covenantWallet) a.covenantWallet = {};
-    a.covenantWallet.signPrivBytes = a.signers.covenantPrivBytes;
-  }
+  // Phase 2: covenant input is NOT signed; only P2PKH deposit input is signed.
   if (a.signers?.depositPrivBytes) {
     if (!a.depositWallet) a.depositWallet = {};
     a.depositWallet.signPrivBytes = a.signers.depositPrivBytes;
   }
 
   // Helpful early errors
-  if (!a.covenantWallet?.signPrivBytes) {
-    throw new Error(
-      'importDepositToShard: missing covenantWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
-    );
-  }
   if (!a.depositWallet?.signPrivBytes) {
     throw new Error(
       'importDepositToShard: missing depositWallet.signPrivBytes (or legacy ownerWallet.signPrivBytes)'
@@ -76,11 +68,9 @@ export function importDepositToShard(args: any) {
     shardIndex,
     shardPrevout,
     depositPrevout,
-    covenantWallet,
     depositWallet,
     feeSats,
     categoryMode,
-    amountCommitment,
     deps,
     witnessPrevout,
     witnessPrivBytes,
@@ -115,7 +105,8 @@ export function importDepositToShard(args: any) {
   const noteHash32 = outpointHash32(depositPrevout.txid, depositPrevout.vout);
   const proofBlob32 = makeProofBlobV11(noteHash32);
 
-  // v1.1 covenant expects noteHash32 + proofBlob32; no limbs for Phase 2 import
+  // v1.1 covenant expects: limbs... noteHash32 proofBlob32
+  // Phase 2: no limbs
   const limbs: Uint8Array[] = [];
 
   const effectiveCategoryMode = categoryMode ?? DEFAULT_CATEGORY_MODE;
@@ -130,18 +121,16 @@ export function importDepositToShard(args: any) {
     capByte: DEFAULT_CAP_BYTE,
   });
 
-  const shardUnlockPrefix = buildPoolHashFoldUnlockingBytecode({
+  const shardUnlock = buildPoolHashFoldUnlockingBytecode({
     version: DEFAULT_POOL_HASH_FOLD_VERSION,
     limbs,
     noteHash32,
     proofBlob32,
   });
 
-  // shard output locking script via templates
-  // (p2shSpk retained for covenant prevout fallback behavior)
-  const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
-  
   const tokenOut = makeShardTokenOut({ category32, commitment32: stateOut32 });
+
+  // ✅ shard output is bare covenant (token prefix + redeemScript bytes)
   const shardOutSpk = locking.shardLock({ token: tokenOut, redeemScript });
 
   const tx: any = {
@@ -156,21 +145,8 @@ export function importDepositToShard(args: any) {
 
   const { witnessVin, witnessPrevoutCtx } = appendWitnessInput(tx, witnessPrevout);
 
-  // covenant unlocking via provider (provider applies extraPrefix)
-  auth.authorizeCovenantInput({
-    tx,
-    vin: 0,
-    covenantPrivBytes: covenantWallet.signPrivBytes,
-    redeemScript,
-    prevout: {
-      valueSats: shardPrevout.valueSats,
-      scriptPubKey: (shardPrevout.scriptPubKey ?? p2shSpk) as Uint8Array,
-    },
-    amountCommitment: amountCommitment ?? 0n,
-    extraPrefix: shardUnlockPrefix,
-    witnessVin,
-    witnessPrevout: witnessPrevoutCtx,
-  });
+  // ✅ Phase 2 / v1.1 ABI: covenant input is push-only and NOT signed
+  tx.inputs[0].scriptSig = shardUnlock;
 
   // deposit spend via provider
   auth.authorizeP2pkhInput({
@@ -200,7 +176,7 @@ export function importDepositToShard(args: any) {
     });
   }
 
-  const rawAny = txb.buildRawTx(tx, { format: 'bytes' });
+  const rawAny = (txb ?? txbDefault).buildRawTx(tx, { format: 'bytes' });
   const rawTx = normalizeRawTxBytes(rawAny);
   const sizeBytes = rawTx.length;
 

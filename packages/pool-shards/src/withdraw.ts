@@ -1,7 +1,7 @@
 // packages/pool-shards/src/withdraw.ts
 import type { BuilderDeps } from './di.js';
 
-import { bytesToHex, concat, hexToBytes, hash160, sha256, uint32le } from '@bch-stealth/utils';
+import { bytesToHex, concat, hexToBytes, sha256, uint32le } from '@bch-stealth/utils';
 
 import { DEFAULT_CAP_BYTE, DEFAULT_CATEGORY_MODE, DEFAULT_POOL_HASH_FOLD_VERSION, DUST_SATS } from './policy.js';
 import { computePoolStateOut, buildPoolHashFoldUnlockingBytecode } from '@bch-stealth/pool-hash-fold';
@@ -31,8 +31,6 @@ export function withdrawFromShard(args: any) {
   if (!a.changeP2pkhHash160Hex && legacyWallet?.pubkeyHash160Hex) {
     a.changeP2pkhHash160Hex = legacyWallet.pubkeyHash160Hex;
   }
-
-  // Some older shapes used pubkeyHashHex (still 20B hex)
   if (!a.changeP2pkhHash160Hex && legacyWallet?.pubkeyHashHex) {
     a.changeP2pkhHash160Hex = legacyWallet.pubkeyHashHex;
   }
@@ -46,21 +44,13 @@ export function withdrawFromShard(args: any) {
   }
 
   // ---- Multi-signer overlay (B3g) ----------------------------------------
-  if (a.signers?.covenantPrivBytes) {
-    if (!a.covenantWallet) a.covenantWallet = {};
-    a.covenantWallet.signPrivBytes = a.signers.covenantPrivBytes;
-  }
+  // Phase 2: covenant input is NOT signed; only fee P2PKH input is signed.
   if (a.signers?.feePrivBytes) {
     if (!a.feeWallet) a.feeWallet = {};
     a.feeWallet.signPrivBytes = a.signers.feePrivBytes;
   }
 
   // Helpful early errors
-  if (!a.covenantWallet?.signPrivBytes) {
-    throw new Error(
-      'withdrawFromShard: missing covenantWallet.signPrivBytes (or legacy senderWallet.signPrivBytes)'
-    );
-  }
   if (!a.feeWallet?.signPrivBytes) {
     throw new Error(
       'withdrawFromShard: missing feeWallet.signPrivBytes (or legacy senderWallet.signPrivBytes)'
@@ -78,13 +68,11 @@ export function withdrawFromShard(args: any) {
     shardIndex,
     shardPrevout,
     feePrevout,
-    covenantWallet,
     feeWallet,
     receiverP2pkhHash160Hex,
     amountSats,
     feeSats,
     changeP2pkhHash160Hex,
-    amountCommitment,
     categoryMode,
     deps,
     witnessPrevout,
@@ -122,11 +110,13 @@ export function withdrawFromShard(args: any) {
   const changeValue = feeValue - fee;
   if (changeValue < DUST_SATS) throw new Error('withdrawFromShard: fee prevout too small after fee');
 
-  // deterministic “nullifier-ish” update (no electrum required)
+  // deterministic “nullifier-ish” update (Phase 2 placeholder)
   const nullifier32 = sha256(
-    concat(stateIn32, receiverHash160, sha256(uint32le(Number(payment & 0xffffffffn)))));
+    concat(stateIn32, receiverHash160, sha256(uint32le(Number(payment & 0xffffffffn))))
+  );
   const proofBlob32 = sha256(concat(nullifier32, Uint8Array.of(0x02)));
-  // v1.1 covenant expects noteHash32 + proofBlob32; no limbs for Phase 2 withdraw
+
+  // v1.1 covenant expects: limbs... noteHash32 proofBlob32
   const limbs: Uint8Array[] = [];
 
   const effectiveCategoryMode = categoryMode ?? DEFAULT_CATEGORY_MODE;
@@ -141,18 +131,16 @@ export function withdrawFromShard(args: any) {
     capByte: DEFAULT_CAP_BYTE,
   });
 
-  const shardUnlockPrefix = buildPoolHashFoldUnlockingBytecode({
+  const shardUnlock = buildPoolHashFoldUnlockingBytecode({
     version: DEFAULT_POOL_HASH_FOLD_VERSION,
     limbs,
     noteHash32: nullifier32,
     proofBlob32,
   });
 
-  // shard output locking script via templates
-  // (p2shSpk retained for covenant prevout fallback behavior)
-  const p2shSpk = txb.getP2SHScript(hash160(redeemScript));
-
   const tokenOut = makeShardTokenOut({ category32, commitment32: stateOut32 });
+
+  // ✅ shard output is bare covenant (token prefix + redeemScript bytes)
   const shardOutSpk = locking.shardLock({ token: tokenOut, redeemScript });
 
   const paySpk = locking.p2pkh(receiverHash160);
@@ -177,20 +165,8 @@ export function withdrawFromShard(args: any) {
 
   const { witnessVin, witnessPrevoutCtx } = appendWitnessInput(tx, witnessPrevout);
 
-  auth.authorizeCovenantInput({
-    tx,
-    vin: 0,
-    covenantPrivBytes: covenantWallet.signPrivBytes,
-    redeemScript,
-    prevout: {
-      valueSats: shardPrevout.valueSats,
-      scriptPubKey: (shardPrevout.scriptPubKey ?? p2shSpk) as Uint8Array,
-    },
-    amountCommitment: amountCommitment ?? 0n,
-    extraPrefix: shardUnlockPrefix,
-    witnessVin,
-    witnessPrevout: witnessPrevoutCtx,
-  });
+  // ✅ Phase 2 / v1.1 ABI: covenant input is push-only and NOT signed
+  tx.inputs[0].scriptSig = shardUnlock;
 
   auth.authorizeP2pkhInput({
     tx,

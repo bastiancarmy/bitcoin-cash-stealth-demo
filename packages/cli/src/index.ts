@@ -502,26 +502,36 @@ pool
 
 pool
   .command('withdraw')
-  .option('--shard <i>', 'shard index', '0')
+  .option('--shard <i>', 'shard index (default: auto)')
+  .option('--require-shard', 'fail if --shard not provided (no auto selection)', false)
   .option('--amount <sats>', 'withdraw amount in sats', '50000')
   .option('--fresh', 'force a new withdrawal even if already recorded', false)
   .action(async (opts) => {
     assertChipnet();
 
-    const shardIndex = Number(opts.shard);
     const amountSats = Number(opts.amount);
-
-    if (!Number.isFinite(shardIndex) || shardIndex < 0) throw new Error(`invalid --shard: ${String(opts.shard)}`);
     if (!Number.isFinite(amountSats) || amountSats < Number(DUST)) {
       throw new Error(`amount must be >= dust (${DUST})`);
     }
 
+    // only parse shardIndex if user actually provided it
+    const shardIndex = opts.shard == null ? undefined : Number(opts.shard);
+    if (shardIndex != null && (!Number.isFinite(shardIndex) || shardIndex < 0)) {
+      throw new Error(`invalid --shard: ${String(opts.shard)}`);
+    }
+
     const ctx = await makePoolCtx();
-    const res = await runWithdraw(ctx, { shardIndex, amountSats, fresh: !!opts.fresh });
+    const res = await runWithdraw(ctx, {
+      shardIndex,
+      amountSats,
+      fresh: !!opts.fresh,
+      requireShard: !!opts.requireShard,
+    });
 
     console.log(`✅ withdraw txid: ${res.txid}`);
     console.log(`   state saved: ${(program.opts().stateFile as string) ?? STORE_FILE}`);
   });
+
 
 pool
   .command('import')

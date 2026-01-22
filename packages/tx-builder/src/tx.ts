@@ -1,4 +1,4 @@
-// src/tx.js
+// packages/tx-builder/src/tx.ts
 // -----------------------------------------------------------------------------
 // BCH-compatible transaction helpers (CashTokens aware)
 // - Uses custom BCH Schnorr sign/verify from utils.js (not noble schnorr)
@@ -88,6 +88,38 @@ export function splitTokenPrefix(rawScript) {
   // Fallback: treat all as locking if we couldn't parse
   return { prefix: null, locking: rawScript };
 }
+
+// ----------------------------------------------------------------------------
+//  debug-only self-check for CashTokens prefix splitting
+// ----------------------------------------------------------------------------
+
+function selfCheckTokenPrefixSplit(): void {
+  if (!debugSighashEnabled()) return;
+
+  // Construct a minimal, valid-looking token prefix:
+  // 0xef + 32-byte category + 1-byte bitfield (NFT present, capability=0)
+  const fakeCategory = new Uint8Array(32).fill(0x11);
+  const fakeBitfield = Uint8Array.of(0x20); // hasNft flag
+  const p2shBody = getP2SHScript(new Uint8Array(20).fill(0x22)); // a9 14 <20> 87
+  const raw = concat(Uint8Array.of(0xef), fakeCategory, fakeBitfield, p2shBody);
+
+  const { prefix, locking } = splitTokenPrefix(raw);
+
+  const prefixLen = prefix ? prefix.length : 0;
+  const lockingHex = bytesToHex(locking).toLowerCase();
+
+  // Assertions per ticket
+  assertOrThrow(prefix != null && prefixLen > 0, `[] splitTokenPrefix self-check failed: prefix empty`);
+  assertOrThrow(
+    locking.length >= 23 && locking[0] === 0xa9 && locking[1] === 0x14 && locking[22] === 0x87,
+    `[] splitTokenPrefix self-check failed: locking not P2SH-like (got ${lockingHex.slice(0, 80)}…)`
+  );
+
+  console.log(`[sighash] splitTokenPrefix self-check OK: prefixLen=${prefixLen} locking[0..6]=${lockingHex.slice(0, 12)}`);
+}
+
+// Run self-check once at module load (debug-only)
+selfCheckTokenPrefixSplit();
 
 /* ========================================================================== */
 /* Script builders                                                            */
@@ -319,6 +351,32 @@ function countOutputsFromBlob(blob) {
   return count;
 }
 
+// ----------------------------------------------------------------------------
+// debug/assert helpers
+// ----------------------------------------------------------------------------
+
+function debugSighashEnabled(): boolean {
+  const v = String(process.env.BCH_STEALTH_DEBUG_SIGHASH ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'y' || v === 'on';
+}
+
+function enforceTokenPrefixEnabled(): boolean {
+  const v = String(process.env.BCH_STEALTH_ENFORCE_TOKEN_PREFIX ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'y' || v === 'on';
+}
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a === b) return true;
+  if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array)) return false;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function assertOrThrow(cond: boolean, msg: string): void {
+  if (!cond) throw new Error(msg);
+}
+
 /* ========================================================================== */
 /* Outputs aggregator (for hashOutputs)                                       */
 /* ========================================================================== */
@@ -502,8 +560,26 @@ export function signP2SHInput(tx, inputIndex, privBytes, redeemScript, value, ra
   if (!(rawPrevScript instanceof Uint8Array)) throw new Error('rawPrevScript must be Uint8Array');
 
   const pubCompressed = secp256k1.getPublicKey(privBytes, true);
-  const { prefix: prevTokenPrefix } = splitTokenPrefix(rawPrevScript);
+
+  // IMPORTANT: token prefix comes from the RAW prevout scriptPubKey
+  const { prefix: prevTokenPrefix, locking } = splitTokenPrefix(rawPrevScript);
+
+  // IMPORTANT: scriptCode MUST be the redeemScript (never token-prefixed)
   const scriptCode = redeemScript;
+
+  if (debugSighashEnabled()) {
+    console.log(`[sighash] signP2SHInput input=${inputIndex}`);
+    console.log(`[sighash]   prevTokenPrefixLen=${prevTokenPrefix ? prevTokenPrefix.length : 0}`);
+    console.log(`[sighash]   rawPrevScript[0]=0x${rawPrevScript[0]?.toString(16)}`);
+    console.log(`[sighash]   locking[0..12]=${bytesToHex(locking).slice(0, 24)}`);
+    console.log(`[sighash]   scriptCodeLen=${scriptCode.length} redeemLen=${redeemScript.length}`);
+  }
+
+  // Assertions (debug-only unless it’s clearly wrong)
+  if (debugSighashEnabled()) {
+    assertOrThrow(bytesEqual(scriptCode, redeemScript), `[B453] scriptCode must equal redeemScript (byte-for-byte)`);
+    assertOrThrow(scriptCode[0] !== 0xef, `[B453] scriptCode must NOT start with 0xef (token prefix must be separate)`);
+  }
 
   const preimage = getPreimage(tx, inputIndex, scriptCode, value, 0x41, prevTokenPrefix);
   const sighash = sha256(sha256(preimage));
@@ -548,7 +624,6 @@ export function signCovenantInput(
   amount,           // bigint | number
   hashtype = 0x41   // SIGHASH_ALL | FORKID
 ) {
-  // --- Defensive type checks (keep them!) ---
   if (!(privBytes instanceof Uint8Array) || privBytes.length !== 32) {
     throw new Error('privBytes must be 32-byte Uint8Array');
   }
@@ -562,16 +637,48 @@ export function signCovenantInput(
     throw new Error('amount must be number or bigint');
   }
 
-  // --- Keys & scriptCode ---
   const pub33 = secp256k1.getPublicKey(privBytes, true);
-  const { prefix: prevTokenPrefix } = splitTokenPrefix(rawPrevScript);
+
+  // MUST split token prefix from RAW prevout scriptPubKey
+  const { prefix: prevTokenPrefix, locking } = splitTokenPrefix(rawPrevScript);
+
+  // MUST sign with scriptCode = redeemScript bytes (NOT token-prefixed)
   const scriptCode = redeemScript;
 
-  // --- Build preimage per BCH + CashTokens ---
+  const prefixLen = prevTokenPrefix ? prevTokenPrefix.length : 0;
+
+  if (debugSighashEnabled()) {
+    console.log(`[sighash] signCovenantInput input=${inputIndex}`);
+    console.log(`[sighash]   prevTokenPrefixLen=${prefixLen}`);
+    console.log(`[sighash]   rawPrevScript[0]=0x${rawPrevScript[0]?.toString(16)}`);
+    console.log(`[sighash]   locking[0..12]=${bytesToHex(locking).slice(0, 24)}`);
+    console.log(`[sighash]   scriptCodeLen=${scriptCode.length} redeemLen=${redeemScript.length}`);
+  }
+
+  // Debug assertions per ticket
+  if (debugSighashEnabled()) {
+    assertOrThrow(bytesEqual(scriptCode, redeemScript), `[B453] scriptCode must equal redeemScript (byte-for-byte)`);
+    assertOrThrow(scriptCode[0] !== 0xef, `[B453] scriptCode must NOT start with 0xef (token prefix must be separate)`);
+
+    // If the raw script is token-prefixed, split MUST find a prefix
+    if (rawPrevScript.length > 0 && rawPrevScript[0] === 0xef) {
+      assertOrThrow(prefixLen > 0, `[B453] rawPrevScript starts with 0xef but splitTokenPrefix returned empty prefix`);
+    }
+
+    // Covenant shard prevouts are expected to be CashTokens UTXOs
+    if (prefixLen === 0) {
+      console.warn(`[sighash] WARNING: covenant prevTokenPrefixLen=0 (shard likely missing token prefix?)`);
+    }
+  }
+
+  // Optional enforcement (off by default to avoid behavior changes)
+  if (enforceTokenPrefixEnabled() && prefixLen === 0) {
+    throw new Error(`[B453] Missing prevTokenPrefix for covenant input. Refusing to sign (BCH_STEALTH_ENFORCE_TOKEN_PREFIX=1).`);
+  }
+
   const preimage = getPreimage(tx, inputIndex, scriptCode, value, hashtype, prevTokenPrefix);
   const sighash = sha256(sha256(preimage));
 
-  // --- Sign & verify (keeps your nice debug paths) ---
   const sig64 = bchSchnorrSign(sighash, privBytes, pub33);
   const sig65 = concat(sig64, Uint8Array.of(hashtype));
 
@@ -579,25 +686,21 @@ export function signCovenantInput(
     console.error('COVENANT verify failed');
     console.error('preimage (hex):', bytesToHex(preimage));
     console.error('sighash  (hex):', bytesToHex(sighash));
-    console.error('tokenPrefix len:', prevTokenPrefix ? prevTokenPrefix.length : 0);
+    console.error('tokenPrefix len:', prefixLen);
     throw new Error('Schnorr verification failed');
   }
 
-  // --- Assemble unlocking script (NO envelope) ---
   const pushBytes = (b) => concat(pushDataPrefix(b.length), b);
-  const amountBytes = minimalScriptNumber(
-    typeof amount === 'bigint' ? amount : BigInt(amount)
-  );
+  const amountBytes = minimalScriptNumber(typeof amount === 'bigint' ? amount : BigInt(amount));
 
   const unlocking = concat(
-    pushBytes(amountBytes),          // <amountCommitment>   (minimal-int)
-    pushBytes(pub33),                // <pubkey33>
-    pushBytes(sig65),                // <sig65>
-    pushBytes(redeemScript)          // <redeemScript> (P2SH requires last push)
+    pushBytes(amountBytes),
+    pushBytes(pub33),
+    pushBytes(sig65),
+    pushBytes(redeemScript)
   );
 
   tx.inputs[inputIndex].scriptSig = unlocking;
-
   return tx;
 }
 

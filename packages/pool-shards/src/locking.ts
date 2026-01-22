@@ -1,5 +1,4 @@
 // packages/pool-shards/src/locking.ts
-import { hash160 } from '@bch-stealth/utils';
 import type { TxBuilderLike } from './di.js';
 
 function ensureBytesLen(u8: Uint8Array, n: number, label: string) {
@@ -13,6 +12,15 @@ export type ShardLockParams = {
 
 export interface LockingTemplates {
   p2pkh(hash16020: Uint8Array): Uint8Array;
+
+  /**
+   * Shard locking script.
+   *
+   * Phase 2 (chipnet demo): **bare covenant**
+   * scriptPubKey = addTokenToScript(token, redeemScriptBytes)
+   *
+   * NOTE: This is intentionally NOT P2SH-wrapped.
+   */
   shardLock(params: ShardLockParams): Uint8Array;
 }
 
@@ -26,11 +34,12 @@ export function makeDefaultLockingTemplates(opts: { txb: TxBuilderLike }): Locki
     },
 
     shardLock({ token, redeemScript }) {
-      ensureBytesLen(redeemScript, redeemScript.length, 'locking.shardLock(redeemScript)'); // (optional/no-op)
-      const redeemHash20 = hash160(redeemScript);
-      ensureBytesLen(redeemHash20, 20, 'locking.shardLock(redeemHash20)');
-      const p2shLock = txb.getP2SHScript(redeemHash20);
-      return txb.addTokenToScript(token as any, p2shLock);
+      if (!(redeemScript instanceof Uint8Array) || redeemScript.length === 0) {
+        throw new Error('locking.shardLock(redeemScript): redeemScript must be non-empty Uint8Array');
+      }
+
+      // ✅ Bare covenant (no P2SH wrapper)
+      return txb.addTokenToScript(token as any, redeemScript);
     },
   };
 }
