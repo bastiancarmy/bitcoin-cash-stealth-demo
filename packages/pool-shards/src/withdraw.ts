@@ -17,6 +17,29 @@ import {
   appendWitnessInput,
 } from './shard_common.js';
 
+import { validatePoolHashFoldV11UnlockScriptSig } from './script_pushes.js';
+
+function maybeValidateCovenantScriptSig(label: string, scriptSig: Uint8Array) {
+  const debugPushParse = process.env.BCH_STEALTH_DEBUG_COVENANT_PUSHPARSE === '1';
+  if (!debugPushParse) return;
+
+  const allowBad = process.env.BCH_STEALTH_ALLOW_BAD_COVENANT_PUSHPARSE === '1';
+
+  try {
+    validatePoolHashFoldV11UnlockScriptSig(scriptSig, {
+      debugPrint: true,
+      label,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (allowBad) {
+      console.warn(msg);
+      return;
+    }
+    throw e;
+  }
+}
+
 export function withdrawFromShard(args: any) {
   // --- Back-compat / caller normalization ---------------------------------
   const a: any = args ?? {};
@@ -167,6 +190,9 @@ export function withdrawFromShard(args: any) {
 
   // ✅ Phase 2 / v1.1 ABI: covenant input is push-only and NOT signed
   tx.inputs[0].scriptSig = shardUnlock;
+
+  // NEW: local parse/validation of covenant pushes (debug gated)
+  maybeValidateCovenantScriptSig('withdrawFromShard vin=0', tx.inputs[0].scriptSig);
 
   auth.authorizeP2pkhInput({
     tx,

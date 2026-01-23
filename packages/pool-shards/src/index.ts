@@ -11,6 +11,9 @@ export * from './locking.js';
 // Policy primitives (stable, reusable)
 export * from './policy.js';
 
+// Debug utilities (push parser + validator)
+export * from './script_pushes.js';
+
 // Core builders (public API)
 export { initShardsTx } from './init.js';
 export { importDepositToShard } from './import.js';
