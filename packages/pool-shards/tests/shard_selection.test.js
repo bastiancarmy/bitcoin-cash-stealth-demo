@@ -16,6 +16,8 @@ test('stability: outpointHash32 + selectShardIndex match fixture', () => {
     expectedShardIndex,
   } = vector.shardSelection;
 
+  assert.ok(shardCount > 0, 'shardCount must be > 0');
+
   const h = outpointHash32(txidHex, vout);
   assert.equal(bytesToHex(h), expectedOutpointHash32Hex);
 
@@ -24,5 +26,9 @@ test('stability: outpointHash32 + selectShardIndex match fixture', () => {
     depositVout: vout,
     shardCount,
   });
+
+  assert.ok(Number.isInteger(idx), 'shard index must be integer');
+  assert.ok(idx >= 0 && idx < shardCount, 'shard index must be in range');
+
   assert.equal(idx, expectedShardIndex);
 });

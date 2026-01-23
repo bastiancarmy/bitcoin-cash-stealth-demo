@@ -2,200 +2,122 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { hexToBytes, bytesToHex } from '@bch-stealth/utils';
-import { importDepositToShard, withdrawFromShard } from '@bch-stealth/pool-shards';
+import { hexToBytes } from '@bch-stealth/utils';
+import { importDepositToShard, withdrawFromShard, outpointHash32 } from '@bch-stealth/pool-shards';
+import { buildPoolHashFoldUnlockingBytecode, makeProofBlobV11 } from '@bch-stealth/pool-hash-fold';
 
-// A tiny “spy” tx-builder that records which privkey bytes were used per input.
-function makeSpyTxb() {
-  const calls = {
-    signCovenantInput: [],
-    signInput: [],
+function u8(n, b = 1) {
+  return new Uint8Array(n).fill(b);
+}
+
+test('import: deposit input (vin=1) uses depositWallet key; covenant input is unsigned unlocking blob', () => {
+  const calls = [];
+
+  const auth = {
+    authorizeP2pkhInput({ vin, privBytes }) {
+      calls.push({ vin, privBytes });
+    },
   };
 
   const txb = {
-    buildRawTx(_tx, _opts) {
-      return Uint8Array.from([0x00]);
-    },
-
-    signInput(tx, inputIndex, privBytes, scriptPubKey, value) {
-      calls.signInput.push({ inputIndex, privBytes, scriptPubKey, value });
-      if (!tx.inputs[inputIndex].scriptSig) tx.inputs[inputIndex].scriptSig = '';
-      return tx;
-    },
-
-    signCovenantInput(tx, inputIndex, privBytes, redeemScript, value, rawPrevScript, amount, hashtype) {
-      calls.signCovenantInput.push({
-        inputIndex,
-        privBytes,
-        redeemScript,
-        value,
-        rawPrevScript,
-        amount,
-        hashtype,
-      });
-      // must exist for prefix-prepend logic
-      tx.inputs[inputIndex].scriptSig = '00';
-      return tx;
-    },
-
-    addTokenToScript(_token, lockingScript) {
-      return lockingScript;
-    },
-
-    getP2PKHScript(hash160) {
-      return Uint8Array.from([0x76, 0xa9, 0x14, ...hash160, 0x88, 0xac]);
-    },
-
-    getP2SHScript(scriptHash20) {
-      return Uint8Array.from([0xa9, 0x14, ...scriptHash20, 0x87]);
-    },
+    buildRawTx() { return u8(10, 0xaa); },
+    getP2PKHScript(hash160) { return Uint8Array.from([0x76, 0xa9, 0x14, ...hash160, 0x88, 0xac]); },
+    addTokenToScript(_t, locking) { return locking; },
   };
 
-  return { txb, calls };
-}
-
-function assertBytesEqual(actualU8, expectedU8, label) {
-  assert.ok(actualU8 instanceof Uint8Array, `${label}: actual must be Uint8Array`);
-  assert.ok(expectedU8 instanceof Uint8Array, `${label}: expected must be Uint8Array`);
-  assert.equal(bytesToHex(actualU8), bytesToHex(expectedU8), `${label}: bytes mismatch`);
-}
-
-test('multi-signer: importDepositToShard uses covenantWallet for input0 and depositWallet for input1', () => {
-  const { txb, calls } = makeSpyTxb();
-
-  const covenantPriv = Uint8Array.from([0xc1, ...new Array(31).fill(0x01)]);
-  const depositPriv = Uint8Array.from([0xd1, ...new Array(31).fill(0x02)]);
+  const deps = { txb, auth };
 
   const pool = {
     categoryHex: '00'.repeat(32),
-    redeemScriptHex: '51', // OP_1 placeholder
-    shards: [
-      {
-        index: 0,
-        txid: '<prev>',
-        vout: 0,
-        valueSats: '2000',
-        commitmentHex: '11'.repeat(32),
-      },
-    ],
+    redeemScriptHex: '51',
+    shards: [{ index: 0, txid: 'aa'.repeat(32), vout: 0, valueSats: '2000', commitmentHex: '11'.repeat(32) }],
   };
 
   const p2pkhSpk = hexToBytes('76a914' + '11'.repeat(20) + '88ac');
 
-  const shardPrevout = {
-    txid: 'aa'.repeat(32),
-    vout: 0,
-    valueSats: 2000n,
-    scriptPubKey: p2pkhSpk,
-  };
+  const shardPrevout = { txid: 'aa'.repeat(32), vout: 0, valueSats: 2000n, scriptPubKey: u8(10) };
+  const depositPrevout = { txid: 'bb'.repeat(32), vout: 3, valueSats: 50_000n, scriptPubKey: p2pkhSpk };
 
-  const depositPrevout = {
-    txid: 'bb'.repeat(32),
-    vout: 0,
-    valueSats: 50_000n,
-    scriptPubKey: p2pkhSpk,
-  };
+  const depositPriv = u8(32, 0xd1);
+  const depositWallet = { signPrivBytes: depositPriv };
 
-  // Explicit multi-signer (wallet-based, matches current builders)
-  const covenantWallet = {
-    signPrivBytes: covenantPriv,
-    pubkeyHash160Hex: '11'.repeat(20),
-  };
-
-  const depositWallet = {
-    signPrivBytes: depositPriv,
-    pubkeyHash160Hex: '22'.repeat(20),
-  };
-
-  importDepositToShard({
+  const res = importDepositToShard({
     pool,
     shardIndex: 0,
     shardPrevout,
     depositPrevout,
-    covenantWallet,
     depositWallet,
     feeSats: 2000n,
-    amountCommitment: 0n,
-    deps: { txb },
+    deps,
   });
 
-  assert.equal(calls.signCovenantInput.length, 1, 'expected one covenant signature');
-  assert.equal(calls.signInput.length, 1, 'expected one p2pkh signature');
+  // P2PKH signed with deposit wallet
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].vin, 1);
+  assert.deepEqual(Buffer.from(calls[0].privBytes), Buffer.from(depositPriv));
 
-  assert.equal(calls.signCovenantInput[0].inputIndex, 0);
-  assertBytesEqual(calls.signCovenantInput[0].privBytes, covenantPriv, 'covenant input privkey');
+  // Covenant scriptSig equals expected unlock
+  const noteHash32 = outpointHash32(depositPrevout.txid, depositPrevout.vout);
+  const proofBlob32 = makeProofBlobV11(noteHash32);
+  const expectedUnlock = buildPoolHashFoldUnlockingBytecode({
+    version: 'V1_1',
+    limbs: [],
+    noteHash32,
+    proofBlob32,
+  });
 
-  assert.equal(calls.signInput[0].inputIndex, 1);
-  assertBytesEqual(calls.signInput[0].privBytes, depositPriv, 'deposit input privkey');
+  assert.ok(res.tx.inputs[0].scriptSig instanceof Uint8Array);
+  assert.deepEqual(Buffer.from(res.tx.inputs[0].scriptSig), Buffer.from(expectedUnlock));
 });
 
-test('multi-signer: withdrawFromShard uses covenantWallet for input0 and feeWallet for input1', () => {
-  const { txb, calls } = makeSpyTxb();
+test('withdraw: fee input (vin=1) uses feeWallet key; covenant input is unsigned unlocking blob', () => {
+  const calls = [];
 
-  const covenantPriv = Uint8Array.from([0xc2, ...new Array(31).fill(0x04)]);
-  const feePriv = Uint8Array.from([0xf2, ...new Array(31).fill(0x05)]);
+  const auth = {
+    authorizeP2pkhInput({ vin, privBytes }) {
+      calls.push({ vin, privBytes });
+    },
+  };
+
+  const txb = {
+    buildRawTx() { return u8(10, 0xaa); },
+    getP2PKHScript(hash160) { return Uint8Array.from([0x76, 0xa9, 0x14, ...hash160, 0x88, 0xac]); },
+    addTokenToScript(_t, locking) { return locking; },
+  };
+
+  const deps = { txb, auth };
 
   const pool = {
     categoryHex: '00'.repeat(32),
-    redeemScriptHex: '51', // OP_1 placeholder
-    shards: [
-      {
-        index: 0,
-        txid: '<prev>',
-        vout: 0,
-        valueSats: '100000',
-        commitmentHex: '22'.repeat(32),
-      },
-    ],
+    redeemScriptHex: '51',
+    shards: [{ index: 0, txid: 'aa'.repeat(32), vout: 0, valueSats: '100000', commitmentHex: '11'.repeat(32) }],
   };
 
   const p2pkhSpk = hexToBytes('76a914' + '11'.repeat(20) + '88ac');
 
-  const shardPrevout = {
-    txid: 'cc'.repeat(32),
-    vout: 0,
-    valueSats: 100_000n,
-    scriptPubKey: p2pkhSpk,
-  };
+  const shardPrevout = { txid: 'aa'.repeat(32), vout: 0, valueSats: 100_000n, scriptPubKey: u8(10) };
+  const feePrevout = { txid: 'cc'.repeat(32), vout: 0, valueSats: 10_000n, scriptPubKey: p2pkhSpk };
 
-  const feePrevout = {
-    txid: 'dd'.repeat(32),
-    vout: 0,
-    valueSats: 10_000n,
-    scriptPubKey: p2pkhSpk,
-  };
+  const feePriv = u8(32, 0xf2);
+  const feeWallet = { signPrivBytes: feePriv, pubkeyHash160Hex: '11'.repeat(20) };
 
-  const covenantWallet = {
-    signPrivBytes: covenantPriv,
-    pubkeyHash160Hex: '11'.repeat(20),
-  };
-
-  const feeWallet = {
-    signPrivBytes: feePriv,
-    pubkeyHash160Hex: '11'.repeat(20),
-  };
-
-  withdrawFromShard({
+  const res = withdrawFromShard({
     pool,
     shardIndex: 0,
     shardPrevout,
     feePrevout,
-    covenantWallet,
     feeWallet,
     receiverP2pkhHash160Hex: '22'.repeat(20),
     changeP2pkhHash160Hex: '11'.repeat(20),
     amountSats: 1000n,
     feeSats: 2000n,
-    amountCommitment: 0n,
-    deps: { txb },
+    deps,
   });
 
-  assert.equal(calls.signCovenantInput.length, 1, 'expected one covenant signature');
-  assert.equal(calls.signInput.length, 1, 'expected one fee signature');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].vin, 1);
+  assert.deepEqual(Buffer.from(calls[0].privBytes), Buffer.from(feePriv));
 
-  assert.equal(calls.signCovenantInput[0].inputIndex, 0);
-  assertBytesEqual(calls.signCovenantInput[0].privBytes, covenantPriv, 'covenant input privkey');
-
-  assert.equal(calls.signInput[0].inputIndex, 1);
-  assertBytesEqual(calls.signInput[0].privBytes, feePriv, 'fee input privkey');
+  assert.ok(res.tx.inputs[0].scriptSig instanceof Uint8Array);
+  assert.ok(res.tx.inputs[0].scriptSig.length > 0, 'expected push-only unlock for covenant input');
 });

@@ -33,8 +33,11 @@ function readVarInt(u8, offset) {
   return { value: hi * 2 ** 32 + (lo >>> 0), size: 9 };
 }
 
-// Minimal token prefix parse: commitment is immediately after varInt(len) when bitfield has 0x40 set.
+// Minimal token prefix parse: expects 0xef || category32 || bitfield || varint(32) || commitment32 ...
 function parseTokenCommitmentFromScriptPubKey(scriptPubKey) {
+  assert.ok(scriptPubKey instanceof Uint8Array);
+  assert.ok(scriptPubKey.length > 1 + 32 + 1 + 1 + 32, 'scriptPubKey too short for token prefix + commitment');
+
   assert.equal(scriptPubKey[0], 0xef, 'missing CashTokens prefix marker 0xef');
   let off = 1;
 
@@ -67,7 +70,10 @@ test('parity: importDepositToShard output[0] token commitment equals computed st
   const depositVout = vector.depositOutpoint.vout;
 
   const noteHash32 = outpointHash32(depositTxidHex, depositVout);
-  const limbs = [noteHash32];
+
+  // IMPORTANT: current Phase 2 import logic uses limbs = [] (no folding yet),
+  // and passes noteHash32 separately.
+  const limbs = [];
 
   const expectedStateOut32 = computePoolStateOut({
     version: POOL_HASH_FOLD_VERSION.V1_1,
@@ -80,7 +86,7 @@ test('parity: importDepositToShard output[0] token commitment equals computed st
   });
 
   // Deterministic redeemScript; doesn't need to be "real" for parity check
-  const redeemScriptHex = '51'; // OP_1 (tiny deterministic placeholder)
+  const redeemScriptHex = '51'; // OP_1
 
   const pool = {
     categoryHex: vector.category32Hex,
@@ -90,14 +96,14 @@ test('parity: importDepositToShard output[0] token commitment equals computed st
     ],
   };
 
-  // Deterministic scriptPubKeys (they don't need to correspond to the signing key for this parity test)
+  // Deterministic scriptPubKeys (not required to match signing key for parity test)
   const p2pkhSpk = hexToBytes('76a914' + '11'.repeat(20) + '88ac');
 
   const shardPrevout = {
     txid: '00'.repeat(32),
     vout: 0,
     valueSats: 2000n,
-    scriptPubKey: p2pkhSpk, // importDepositToShard will fall back to p2shSpk if missing; providing something stable is fine
+    scriptPubKey: p2pkhSpk,
   };
 
   const depositPrevout = {
@@ -107,7 +113,7 @@ test('parity: importDepositToShard output[0] token commitment equals computed st
     scriptPubKey: p2pkhSpk,
   };
 
-  const ownerWallet = {
+  const depositWallet = {
     // non-zero deterministic private key
     signPrivBytes: Uint8Array.from([1, ...new Array(31).fill(0)]),
   };
@@ -117,23 +123,17 @@ test('parity: importDepositToShard output[0] token commitment equals computed st
     shardIndex: 0,
     shardPrevout,
     depositPrevout,
-    ownerWallet,
+    depositWallet,
     feeSats: 2000n,
     categoryMode: vector.categoryMode ?? DEFAULT_CATEGORY_MODE,
     amountCommitment: 0n,
   });
 
-  assert.ok(res && res.tx && res.tx.outputs && res.tx.outputs.length >= 1);
+  assert.ok(res?.tx?.outputs?.length >= 1);
 
-  const out0 = res.tx.outputs[0];
-  const spk0 = out0.scriptPubKey;
-  assert.ok(spk0 instanceof Uint8Array, 'output[0].scriptPubKey must be Uint8Array');
-
+  const spk0 = res.tx.outputs[0].scriptPubKey;
   const parsed = parseTokenCommitmentFromScriptPubKey(spk0);
 
-  assert.equal(parsed.commitment.length, 32, 'expected 32-byte commitment');
   assert.equal(bytesToHex(parsed.commitment), bytesToHex(expectedStateOut32));
-
-  // nextPoolState should also reflect commitmentHex update
   assert.equal(res.nextPoolState.shards[0].commitmentHex, bytesToHex(expectedStateOut32));
 });

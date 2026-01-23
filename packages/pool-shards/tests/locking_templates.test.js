@@ -1,3 +1,4 @@
+// packages/pool-shards/tests/locking_templates.test.js
 import { strict as assert } from 'node:assert';
 import test from 'node:test';
 
@@ -9,56 +10,77 @@ function u8(n) {
   return new Uint8Array(n).fill(7);
 }
 
-test('builders use LockingTemplates (no inline output script assembly)', () => {
-  const calls = [];
+function endsWithBytes(buf, suffix) {
+  assert.ok(buf instanceof Uint8Array);
+  assert.ok(suffix instanceof Uint8Array);
+  assert.ok(buf.length >= suffix.length);
+  const start = buf.length - suffix.length;
+  for (let i = 0; i < suffix.length; i++) {
+    if (buf[start + i] !== suffix[i]) return false;
+  }
+  return true;
+}
 
+test('builders use LockingTemplates; shardLock returns prefix||redeemScript (byte-for-byte suffix)', () => {
+  const calls = [];
+  const shardLockReturns = [];
+
+  // tx-builder stub: forbid inline output assembly
+  const txb = {
+    buildRawTx() {
+      return u8(200);
+    },
+
+    // initShardsTx still signs funding input directly
+    signInput() {},
+
+    // covenant signing intentionally disabled
+    signCovenantInput() {
+      throw new Error('signCovenantInput should not be called');
+    },
+
+    // These must never be called directly by builders anymore:
+    addTokenToScript() {
+      throw new Error('txb.addTokenToScript should not be called directly (must use deps.locking.shardLock)');
+    },
+    getP2PKHScript() {
+      throw new Error('txb.getP2PKHScript should not be called directly (must use deps.locking.p2pkh)');
+    },
+
+    // Legacy fallback should not be necessary in bare covenant tests
+    getP2SHScript() {
+      throw new Error('txb.getP2SHScript should not be called in this test');
+    },
+  };
+
+  // Locking templates are the *only* place output scripts get produced.
   const locking = {
     p2pkh(h160) {
       calls.push(['p2pkh', Buffer.from(h160).toString('hex')]);
       return u8(25);
     },
+
     shardLock({ token, redeemScript }) {
       calls.push(['shardLock', token, Buffer.from(redeemScript).toString('hex')]);
-      return u8(35);
+
+      // IMPORTANT:
+      // We are testing “builders call shardLock”, not re-implementing token encoding.
+      // Return a deterministic “prefix||redeemScript” byte array.
+      const prefix = u8(10); // arbitrary non-empty prefix for this test
+      const out = new Uint8Array(prefix.length + redeemScript.length);
+      out.set(prefix, 0);
+      out.set(redeemScript, prefix.length);
+
+      shardLockReturns.push({ redeemScript, scriptPubKey: out });
+      return out;
     },
   };
 
-  // tx-builder stub:
-  // - allow getP2SHScript/hash160 fallback paths (builders still use this for prevout fallback)
-  // - forbid inline output creation paths (those must go through locking templates)
-  const txb = {
-    buildRawTx() {
-      // builders call this to compute sizeBytes; any bytes is fine for this test
-      return u8(200);
-    },
-
-    // initShardsTx still signs funding input directly (not via auth provider), so allow no-op
-    signInput() {},
-
-    // import/withdraw use auth provider, so this shouldn't be called here; keep it a guard
-    signCovenantInput() {
-      throw new Error('signCovenantInput should not be called directly (use deps.auth)');
-    },
-
-    // inline output assembly should not be called in builders anymore
-    addTokenToScript() {
-      throw new Error('inline addTokenToScript not allowed (must use deps.locking.shardLock)');
-    },
-    getP2PKHScript() {
-      throw new Error('inline getP2PKHScript not allowed (must use deps.locking.p2pkh)');
-    },
-
-    // allowed: only used for covenant prevout fallback in import/withdraw
-    getP2SHScript(scriptHash20) {
-      assert.equal(scriptHash20?.length, 20);
-      return u8(23);
-    },
-  };
-
-  // auth stub: builders will call these, but we don't need them to do anything
   const auth = {
     authorizeP2pkhInput() {},
-    authorizeCovenantInput() {},
+    authorizeCovenantInput() {
+      throw new Error('authorizeCovenantInput should not be called (covenant signing disabled)');
+    },
   };
 
   const deps = { txb, auth, locking };
@@ -70,7 +92,7 @@ test('builders use LockingTemplates (no inline output script assembly)', () => {
     shardValueSats: '1000',
     defaultFeeSats: '500',
     network: 'chipnet',
-    redeemScriptHex: '51', // OP_1 (valid minimal script bytes)
+    redeemScriptHex: '51', // OP_1
   };
 
   const funding = {
@@ -85,7 +107,8 @@ test('builders use LockingTemplates (no inline output script assembly)', () => {
     signPrivBytes: u8(32),
   };
 
-  initShardsTx({ cfg, shardCount: 2, funding, ownerWallet, deps });
+  const initRes = initShardsTx({ cfg, shardCount: 2, funding, ownerWallet, deps });
+  assert.ok(initRes?.tx?.outputs?.length >= 1);
 
   // ---------- importDepositToShard fixture ----------
   const pool = {
@@ -96,86 +119,51 @@ test('builders use LockingTemplates (no inline output script assembly)', () => {
     categoryHex: '00'.repeat(32),
     redeemScriptHex: cfg.redeemScriptHex,
     shards: [
-      {
-        index: 0,
-        txid: 'aa'.repeat(32),
-        vout: 0,
-        valueSats: '2000',
-        commitmentHex: '00'.repeat(32),
-      },
+      { index: 0, txid: 'aa'.repeat(32), vout: 0, valueSats: '2000', commitmentHex: '00'.repeat(32) },
     ],
   };
 
-  const shardPrevout = {
-    txid: 'aa'.repeat(32),
-    vout: 0,
-    valueSats: 2000n,
-    // leave scriptPubKey undefined so the fallback path is exercised (uses txb.getP2SHScript)
-    scriptPubKey: undefined,
-  };
-
-  const depositPrevout = {
-    txid: 'bb'.repeat(32),
-    vout: 1,
-    valueSats: 1500n,
-    scriptPubKey: u8(25),
-  };
+  const shardPrevout = { txid: 'aa'.repeat(32), vout: 0, valueSats: 2000n, scriptPubKey: u8(10) };
+  const depositPrevout = { txid: 'bb'.repeat(32), vout: 1, valueSats: 1500n, scriptPubKey: u8(25) };
 
   importDepositToShard({
     pool,
     shardIndex: 0,
     shardPrevout,
     depositPrevout,
-    covenantWallet: { signPrivBytes: u8(32) },
     depositWallet: { signPrivBytes: u8(32) },
-    feeSats: 0,
+    feeSats: 0n,
     deps,
   });
 
   // ---------- withdrawFromShard fixture ----------
-  // Choose values safely above any reasonable dust threshold.
-  // Requirements:
-  // - payment >= DUST_SATS
-  // - newShardValue = shardValueIn - payment >= DUST_SATS
-  // - changeValue = feeValue - fee >= DUST_SATS
-  const feePrevout = {
-    txid: 'cc'.repeat(32),
-    vout: 2,
-    valueSats: 10_000n,
-    scriptPubKey: u8(25),
-  };
-
-  // Make shard big enough to leave remainder above dust after payment
-  const shardPrevout2 = {
-    txid: shardPrevout.txid,
-    vout: shardPrevout.vout,
-    valueSats: 50_000n,
-    scriptPubKey: undefined, // exercise fallback p2shSpk path
-  };
+  const feePrevout = { txid: 'cc'.repeat(32), vout: 2, valueSats: 10_000n, scriptPubKey: u8(25) };
+  const shardPrevout2 = { txid: shardPrevout.txid, vout: shardPrevout.vout, valueSats: 50_000n, scriptPubKey: u8(10) };
 
   withdrawFromShard({
     pool,
     shardIndex: 0,
     shardPrevout: shardPrevout2,
     feePrevout,
-    covenantWallet: { signPrivBytes: u8(32), pubkeyHash160Hex: '44'.repeat(20) },
     feeWallet: { signPrivBytes: u8(32), pubkeyHash160Hex: '55'.repeat(20) },
     receiverP2pkhHash160Hex: '66'.repeat(20),
-
-    // comfortably above dust; remainder also above dust
-    amountSats: 20_000,
-
-    // fee + change both above dust with feePrevout=10k and fee=1k => change=9k
-    feeSats: 1_000,
-
+    amountSats: 20_000n,
+    feeSats: 1_000n,
     changeP2pkhHash160Hex: '77'.repeat(20),
     deps,
   });
 
-  // Ensure locking was used
-  assert.ok(calls.length > 0);
+  // --- Assertions: this is the *actual* goal of the test ---
+  assert.ok(calls.some((c) => c[0] === 'p2pkh'), 'expected locking.p2pkh to be used');
+  assert.ok(calls.some((c) => c[0] === 'shardLock'), 'expected locking.shardLock to be used');
+  assert.ok(shardLockReturns.length > 0, 'expected shardLock to have been called at least once');
 
-  // Ensure we exercised both calls at least once
-  assert.ok(calls.some((c) => c[0] === 'p2pkh'));
-  assert.ok(calls.some((c) => c[0] === 'shardLock'));
+  // shardLock contract: returned scriptPubKey must end with redeemScript bytes, and contain a non-empty prefix
+  for (const r of shardLockReturns) {
+    assert.ok(r.scriptPubKey.length > r.redeemScript.length, 'expected a non-empty prefix before redeemScript');
+    assert.ok(
+      endsWithBytes(r.scriptPubKey, r.redeemScript),
+      'expected shardLock return value to end with redeemScript bytes (byte-for-byte)',
+    );
+  }
 });
