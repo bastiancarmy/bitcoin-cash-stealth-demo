@@ -3,19 +3,18 @@ import type { StealthUtxoRecord, PoolState } from '@bch-stealth/pool-state';
 import { ensurePoolStateDefaults, upsertStealthUtxo, markStealthSpent } from '@bch-stealth/pool-state';
 
 import * as PoolShards from '@bch-stealth/pool-shards';
-import { bytesToHex } from '@bch-stealth/utils';
+import { bytesToHex, decodeCashAddress } from '@bch-stealth/utils';
 
 import type { PoolOpContext } from '../context.js';
 import { loadStateOrEmpty, saveState, selectFundingUtxo } from '../state.js';
 import { toPoolShardsState, patchShardFromNextPoolState } from '../adapters.js';
 import { deriveStealthP2pkhLock } from '../stealth.js';
+import { extractPubKeyFromPaycode } from '../../paycodes.js';
+import { NETWORK } from '../../config.js';
 
 function shouldDebug(): boolean {
-  return (
-    process.env.BCH_STEALTH_DEBUG_WITHDRAW === '1' ||
-    process.env.BCH_STEALTH_DEBUG_WITHDRAW === 'true' ||
-    process.env.BCH_STEALTH_DEBUG_WITHDRAW === 'yes'
-  );
+  const v = String(process.env.BCH_STEALTH_DEBUG_WITHDRAW ?? '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
 }
 
 function normalizeMode(mode: unknown): string | null {
@@ -24,53 +23,47 @@ function normalizeMode(mode: unknown): string | null {
   return s.length ? s : null;
 }
 
-function resolveCovenantSignerWalletFromState(ctx: PoolOpContext, st: PoolState) {
-  const id = st.covenantSigner;
-  if (!id) {
-    throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
+function expectedPrefixFromNetwork(): 'bitcoincash' | 'bchtest' {
+  const n = String(NETWORK ?? '').toLowerCase();
+  return n === 'mainnet' ? 'bitcoincash' : 'bchtest';
+}
+
+/**
+ * Decode a cashaddr and return the hash160 for P2PKH.
+ * Accepts both prefixed (bchtest:...) and unprefixed (...).
+ */
+export function decodeCashAddrToHash160(addr: string): Uint8Array {
+  const s = String(addr ?? '').trim();
+  if (!s) throw new Error('empty cashaddr');
+
+  const expectedPrefix = expectedPrefixFromNetwork();
+  const normalized = s.includes(':') ? s : `${expectedPrefix}:${s}`;
+
+  const decoded = decodeCashAddress(normalized);
+
+  if (decoded.prefix !== expectedPrefix) {
+    throw new Error(`cashaddr prefix mismatch: got "${decoded.prefix}", expected "${expectedPrefix}"`);
+  }
+  if (decoded.type !== 'P2PKH') {
+    throw new Error(`withdraw destination must be P2PKH cashaddr (got ${decoded.type})`);
   }
 
-  const wantActor = (id.actorId ?? '').toLowerCase();
-  const wantH160 = (id.pubkeyHash160Hex ?? '').toLowerCase();
+  return decoded.hash;
+}
 
-  const a = ctx.actors.actorABaseWallet;
-  const b = ctx.actors.actorBBaseWallet;
+function parseDestToPub33OrH160(dest: string): { paycodePub33?: Uint8Array; p2pkhH160?: Uint8Array } {
+  const s = String(dest ?? '').trim();
+  if (!s) throw new Error('withdraw dest is required');
 
-  let chosen =
-    wantActor === 'actor_a' || wantActor === 'alice' || wantActor === 'a'
-      ? a
-      : wantActor === 'actor_b' || wantActor === 'bob' || wantActor === 'b'
-        ? b
-        : undefined;
-
-  if (!chosen) {
-    const aH = bytesToHex(a.hash160).toLowerCase();
-    const bH = bytesToHex(b.hash160).toLowerCase();
-    if (wantH160 === aH) chosen = a;
-    if (wantH160 === bH) chosen = b;
-  }
-
-  if (!chosen) {
-    throw new Error(
-      `Unknown covenantSigner in state: actorId=${id.actorId} pubkeyHash160Hex=${id.pubkeyHash160Hex}`
-    );
-  }
-
-  const actual = bytesToHex(chosen.hash160).toLowerCase();
-  if (wantH160 && wantH160 !== actual) {
-    throw new Error(
-      `covenantSigner mismatch: state.pubkeyHash160Hex=${id.pubkeyHash160Hex} actualWalletHash160=${actual}`
-    );
-  }
-
-  return { actorId: id.actorId, wallet: chosen };
+  if (s.startsWith('PM')) return { paycodePub33: extractPubKeyFromPaycode(s) };
+  return { p2pkhH160: decodeCashAddrToHash160(s) };
 }
 
 /**
  * Pick a shard that can satisfy a single-shard withdraw:
  *   shardValue >= payment + dust
  *
- * Strategy: best-fit (smallest shard that works), to avoid always draining the biggest shard.
+ * Strategy: best-fit (smallest shard that works).
  */
 function pickShardIndexForSingleShardWithdraw(st: PoolState, payment: bigint, dust: bigint): number | null {
   const need = payment + dust;
@@ -112,48 +105,54 @@ function maxShardValue(st: PoolState): bigint {
   return m;
 }
 
+function assertCovenantSignerIsMe(ctx: PoolOpContext, st: PoolState) {
+  if (!st.covenantSigner?.pubkeyHash160Hex) return; // allow legacy states; init should set it
+  const want = String(st.covenantSigner.pubkeyHash160Hex).toLowerCase();
+  const have = bytesToHex(ctx.me.wallet.hash160).toLowerCase();
+  if (want && want !== have) {
+    throw new Error(`covenantSigner mismatch: state=${want} me=${have}`);
+  }
+}
+
 export async function runWithdraw(
   ctx: PoolOpContext,
   opts: {
-    shardIndex?: number;              // ✅ now optional
+    dest: string;
+    shardIndex?: number;
     amountSats: number;
     fresh?: boolean;
-    requireShard?: boolean;           // ✅ if true, fail if shardIndex not provided
+    requireShard?: boolean;
   }
 ): Promise<{ txid: string }> {
-  const { amountSats } = opts;
+  const { amountSats, dest } = opts;
 
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
   const st = ensurePoolStateDefaults(st0);
 
   if (!st.categoryHex || !st.redeemScriptHex) {
-    throw new Error('State missing redeemScriptHex/categoryHex. Run init first or repair state.');
+    throw new Error('State missing redeemScriptHex/categoryHex. Run pool init first or repair state.');
   }
-
   if (!st.covenantSigner) {
-    throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
+    throw new Error('Missing covenantSigner in state. Re-run pool init or repair state.');
   }
+  assertCovenantSignerIsMe(ctx, st);
 
   const payment = BigInt(amountSats);
   if (payment < BigInt(ctx.config.DUST)) throw new Error('withdraw amount below dust');
 
-  // --- shard selection (single-shard) --------------------------------------
+  // shard selection
   let shardIndex =
     typeof opts.shardIndex === 'number' && Number.isFinite(opts.shardIndex) ? opts.shardIndex : undefined;
 
   if (shardIndex == null) {
-    if (opts.requireShard) {
-      throw new Error('Missing --shard and requireShard=true. Provide --shard explicitly.');
-    }
+    if (opts.requireShard) throw new Error('Missing --shard and requireShard=true. Provide --shard explicitly.');
 
     const picked = pickShardIndexForSingleShardWithdraw(st, payment, BigInt(ctx.config.DUST));
     if (picked == null) {
       const max = maxShardValue(st);
       throw new Error(
-        `No shard can satisfy single-shard withdraw. Need >= ${(
-          payment + BigInt(ctx.config.DUST)
-        ).toString()} sats in one shard, but max shard is ${max.toString()} sats. ` +
-          `Deposit more, reduce amount, or (future) use multi-shard withdraw.`
+        `No shard can satisfy single-shard withdraw. Need >= ${(payment + BigInt(ctx.config.DUST)).toString()} sats in one shard, ` +
+          `but max shard is ${max.toString()} sats.`
       );
     }
     shardIndex = picked;
@@ -164,16 +163,14 @@ export async function runWithdraw(
 
   const shardPrev = await ctx.chainIO.getPrevOutput(shard.txid, shard.vout);
 
-  const covenantSigner = resolveCovenantSignerWalletFromState(ctx, st);
-  const covenantSignerWallet = covenantSigner.wallet;
-
-  const senderTag = 'B';
-  const senderWallet = ctx.actors.actorBBaseWallet;
+  // single-user: covenant signer + fee wallet are "me"
+  const covenantSignerWallet = ctx.me.wallet;
+  const senderWallet = ctx.me.wallet;
 
   const feeUtxo = await selectFundingUtxo({
     state: st,
     wallet: senderWallet,
-    ownerTag: senderTag,
+    ownerTag: 'me',
     minSats: BigInt(ctx.config.DUST) + 2_000n,
     chainIO: ctx.chainIO,
     getUtxos: ctx.getUtxos,
@@ -193,17 +190,32 @@ export async function runWithdraw(
 
   const changeValueSats = String(BigInt(feePrevouts.chain.value) - BigInt(ctx.config.DEFAULT_FEE));
 
-  const { intent: payIntent, rpaContext: payContext } = deriveStealthP2pkhLock({
-    senderWallet,
-    receiverPaycodePub33: ctx.actors.actorAPaycodePub33,
-    prevoutTxidHex: feeUtxo.txid,
-    prevoutN: feeUtxo.vout,
-    index: 0,
-  });
+  const { paycodePub33, p2pkhH160 } = parseDestToPub33OrH160(dest);
 
+  // receiver hash160
+  let receiverH160: Uint8Array;
+  let payContext: any = null;
+
+  if (paycodePub33) {
+    const { intent: payIntent, rpaContext } = deriveStealthP2pkhLock({
+      senderWallet,
+      receiverPaycodePub33: paycodePub33,
+      prevoutTxidHex: feeUtxo.txid,
+      prevoutN: feeUtxo.vout,
+      index: 0,
+    });
+    receiverH160 = payIntent.childHash160;
+    payContext = rpaContext;
+  } else if (p2pkhH160) {
+    receiverH160 = p2pkhH160;
+  } else {
+    throw new Error('unable to parse dest (expected paycode or cashaddr)');
+  }
+
+  // change back to me (stealth)
   const { intent: changeIntent, rpaContext: changeContext } = deriveStealthP2pkhLock({
     senderWallet,
-    receiverPaycodePub33: ctx.actors.actorBPaycodePub33,
+    receiverPaycodePub33: ctx.me.paycodePub33,
     prevoutTxidHex: feeUtxo.txid,
     prevoutN: feeUtxo.vout,
     index: 1,
@@ -221,12 +233,10 @@ export async function runWithdraw(
   const forcedMode = normalizeMode(process.env.BCH_STEALTH_CATEGORY_MODE);
 
   if (shouldDebug()) {
-    console.log(
-      `\n[withdraw:debug] shard=${shardIndex} payment=${payment.toString()} fee=${String(ctx.config.DEFAULT_FEE)}`
-    );
+    console.log(`\n[withdraw:debug] shard=${shardIndex} payment=${payment.toString()} fee=${String(ctx.config.DEFAULT_FEE)}`);
     console.log(`[withdraw:debug] categoryMode=${forcedMode ?? '<default>'}`);
-    console.log(`[withdraw:debug] covenantSigner.actorId=${covenantSigner.actorId}`);
-    console.log(`[withdraw:debug] covenantSigner.h160=${bytesToHex(covenantSignerWallet.hash160)}`);
+    console.log(`[withdraw:debug] me.h160=${bytesToHex(ctx.me.wallet.hash160)}`);
+    console.log(`[withdraw:debug] dest=${dest}`);
   }
 
   const built = PoolShards.withdrawFromShard({
@@ -242,7 +252,7 @@ export async function runWithdraw(
       signPrivBytes: feeUtxo.signPrivBytes,
       pubkeyHash160Hex: bytesToHex(senderWallet.hash160),
     },
-    receiverP2pkhHash160Hex: bytesToHex(payIntent.childHash160),
+    receiverP2pkhHash160Hex: bytesToHex(receiverH160),
     amountSats: payment,
     feeSats: BigInt(ctx.config.DEFAULT_FEE),
     changeP2pkhHash160Hex: bytesToHex(changeIntent.childHash160),
@@ -253,7 +263,7 @@ export async function runWithdraw(
   const txid = await ctx.chainIO.broadcastRawTx(rawHex);
 
   const changeRec: StealthUtxoRecord = {
-    owner: senderTag,
+    owner: 'me',
     purpose: 'withdraw_change',
     txid,
     vout: 2,
@@ -267,22 +277,17 @@ export async function runWithdraw(
 
   if (feeUtxo.source === 'stealth') markStealthSpent(st, feeUtxo.txid, feeUtxo.vout, txid);
 
-  patchShardFromNextPoolState({
-    poolState: st,
-    shardIndex,
-    txid,
-    nextPool: built.nextPoolState,
-  });
+  patchShardFromNextPoolState({ poolState: st, shardIndex, txid, nextPool: built.nextPoolState });
 
   st.withdrawals ??= [];
   st.withdrawals.push({
     txid,
     shardIndex,
     amountSats,
-    receiverRpaHash160Hex: bytesToHex(payIntent.childHash160),
+    receiverRpaHash160Hex: bytesToHex(receiverH160),
     createdAt: new Date().toISOString(),
-    rpaContext: payContext,
-    receiverPaycodePub33Hex: bytesToHex(ctx.actors.actorAPaycodePub33),
+    rpaContext: payContext ?? undefined,
+    receiverPaycodePub33Hex: paycodePub33 ? bytesToHex(paycodePub33) : undefined,
   } as any);
 
   await saveState({ store: ctx.store, state: st, networkDefault: ctx.network });

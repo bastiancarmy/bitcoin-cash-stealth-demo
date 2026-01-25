@@ -1,0 +1,24 @@
+[
+  {
+    "name": "chipnet_import_base_p2pkh_edbe0960_vout0_to_shard1",
+    "version": "v1_1",
+
+    "category32Hex": "688ce7200313082dc04e3d4040edcee7e80ccb26c79b3db492dbb4e7184dd232",
+    "categoryTxidHex": "32d24d18e7b4db92b43d9bc726cb0ce8e7ceed40403d4ec02d08130320e78c68",
+
+    "stateIn32Hex": "94e3ee2a74770feadc896bc6d3a8418ff06adc0fd988e9d9ceae1f2972300775",
+    "noteHash32Hex": "491f37e3b54729c24453321908e0ef7bbffccf2eaedbc006439b74e261626d10",
+    "expectedStateOut32Hex": "1f40cd6ac05364bb38e0145e30d55e2d78ccc3d7bedfecb5e7cac194fd44eed3",
+
+    "categoryMode": "direct",
+    "capByteHex": "01",
+
+    "initTxid": "aa0b3cb856dac34b0286de6aada1700135455994011055c2c5c7277889e548d7",
+    "stateInOutpoint": { "txid": "aa0b3cb856dac34b0286de6aada1700135455994011055c2c5c7277889e548d7", "vout": 2 },
+
+    "depositOutpoint": { "txid": "edbe09600ed62cf03425936c12ded050edc1053d4b831f75a60b76631da5fdda", "vout": 0 },
+    "importTxid": "e20c7466eeee2197672eb463dc32629a98655dfb91090936e0660be7c10c8361",
+    "importVout": 0,
+    "shardIndex": 1
+  }
+]

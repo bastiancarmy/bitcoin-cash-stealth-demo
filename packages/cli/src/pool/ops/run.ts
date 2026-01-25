@@ -25,8 +25,8 @@ export async function runHappyPath(
   const imp = await runImport(ctx, { shardIndex: null, fresh: false });
   const shardIndex = imp?.shardIndex ?? 0;
 
-  console.log(`\n[4/4] withdraw ${withdrawSats} sats (Actor B shard -> Actor A stealth P2PKH)...`);
-  await runWithdraw(ctx, { shardIndex, amountSats: withdrawSats, fresh: false });
+  console.log(`\n[4/4] withdraw ${withdrawSats} sats (shard -> me)...`);
+  await runWithdraw(ctx, { dest: ctx.me.paycode, shardIndex, amountSats: withdrawSats, fresh: false });
 
   void fresh; // keep lint/unused clean until init supports it
 }

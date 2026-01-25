@@ -10,13 +10,6 @@ export type WalletLike = {
   spendPrivBytes?: Uint8Array;
 };
 
-export type PoolOpActors = {
-  actorABaseWallet: WalletLike;
-  actorBBaseWallet: WalletLike;
-  actorAPaycodePub33: Uint8Array;
-  actorBPaycodePub33: Uint8Array;
-};
-
 export type PoolOpConfig = {
   DUST: number;
   DEFAULT_FEE: bigint | number | string;
@@ -45,5 +38,11 @@ export type PoolOpContext = {
     DEFAULT_FEE: bigint;
     SHARD_VALUE: bigint;
   };
-  actors: PoolOpActors;
+
+  // single-user ("me") context
+  me: {
+    wallet: WalletLike;
+    paycode: string;
+    paycodePub33: Uint8Array;
+  };
 };

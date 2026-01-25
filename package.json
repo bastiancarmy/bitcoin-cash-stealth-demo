@@ -8,7 +8,9 @@
   "scripts": {
     "build": "yarn workspaces foreach -A -pt run build",
     "clean": "yarn workspaces foreach -A -pt run clean",
-    "typecheck": "yarn workspaces foreach -A -pt run typecheck"
+    "typecheck": "yarn workspaces foreach -A -pt run typecheck",
+    "bch-stealth": "yarn workspace @bch-stealth/cli exec bch-stealth"
+
   },
   "packageManager": "yarn@4.12.0"
 }

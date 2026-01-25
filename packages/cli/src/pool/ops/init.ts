@@ -75,10 +75,10 @@ export async function runInit(
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
   const st = ensurePoolStateDefaults(st0);
 
-  // make covenant signer explicit in state (demo default: actor_b).
+  // covenant signer is always "me" in single-user mode
   const defaultSigner = {
-    actorId: 'actor_b',
-    pubkeyHash160Hex: bytesToHex(ctx.actors.actorBBaseWallet.hash160),
+    actorId: 'me',
+    pubkeyHash160Hex: bytesToHex(ctx.me.wallet.hash160),
   };
   if (fresh) st.covenantSigner = defaultSigner;
   else st.covenantSigner = st.covenantSigner ?? defaultSigner;
@@ -92,7 +92,6 @@ export async function runInit(
     st.redeemScriptHex.length > 0;
 
   if (!fresh && alreadyInitialized) {
-    // still persist covenantSigner if it was missing and we defaulted it above
     await saveState({ store: ctx.store, state: st, networkDefault: ctx.network });
     return { state: st };
   }
@@ -104,16 +103,28 @@ export async function runInit(
   const SHARD_VALUE = BigInt(ctx.config.SHARD_VALUE);
   const shardsTotal = SHARD_VALUE * BigInt(shardCount);
 
+  // single-user: signer is always me
+  const signer = { wallet: ctx.me.wallet, ownerTag: 'me' as const };
+
   const funding = await selectFundingUtxo({
     state: st,
-    wallet: ctx.actors.actorBBaseWallet,
-    ownerTag: 'B',
+    wallet: signer.wallet,
+    ownerTag: signer.ownerTag,
     minSats: shardsTotal + DUST + 20_000n,
     chainIO: ctx.chainIO,
     getUtxos: ctx.getUtxos,
     network: ctx.network,
     dustSats: DUST,
   });
+  
+  if (funding.vout !== 0) {
+    throw new Error(
+      `[init] CashTokens category genesis requires spending a UTXO at vout=0, but selected ${funding.txid}:${funding.vout}.\n` +
+      `Fix: send a fresh self-transfer that creates an unspent vout=0 to your base address, then re-run:\n` +
+      `  bchctl pool init --shards ${shardCount} --fresh\n`
+    );
+  }
+
   // ---- poolIdHex (MUST be 20 bytes / 40 hex) --------------------------------
   const statePoolIdHex = cleanHexLenMaybe((st as any)?.poolIdHex, 20);
 
@@ -149,7 +160,7 @@ export async function runInit(
 
   const owner: PoolShards.WalletLike = {
     signPrivBytes: funding.signPrivBytes,
-    pubkeyHash160Hex: bytesToHex(ctx.actors.actorBBaseWallet.hash160),
+    pubkeyHash160Hex: bytesToHex(signer.wallet.hash160),
   };
 
   const built = PoolShards.initShardsTx({

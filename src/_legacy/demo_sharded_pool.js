@@ -776,7 +776,7 @@ async function sweepDepositDebug({ depositOutpoint, receiverWallet }) {
 
   const senderPub33 = hexToBytes(ctx.senderPub33Hex);
 
-  // ✅ chosen (known-good): txid "as-is" + no evenY normalization
+  // chosen (known-good): txid "as-is" + no evenY normalization
   const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
     receiverWallet.scanPrivBytes ?? receiverWallet.privBytes,
     receiverWallet.spendPrivBytes ?? receiverWallet.privBytes,
@@ -1152,7 +1152,7 @@ async function loadDemoActors() {
     throw new Error(`getWallets() returned unexpected shape. Keys: ${Object.keys(wallets ?? {}).join(', ')}`);
   }
 
-  // ✅ paycodes.js expects (alice, bob) wallet args
+  // paycodes.js expects (alice, bob) wallet args
   const { alicePaycode, bobPaycode } = setupPaycodesAndDerivation(actorABaseWallet, actorBBaseWallet);
 
   const actorAPaycodePub33 = extractPubKeyFromPaycode(alicePaycode);

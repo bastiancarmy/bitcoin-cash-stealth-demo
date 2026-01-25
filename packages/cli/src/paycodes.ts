@@ -1,9 +1,10 @@
+// packages/cli/src/paycodes.ts
 import { base58checkDecode, base58checkEncode } from "./base58.js";
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { randomBytes } from "node:crypto";
-import type { Wallet } from "./wallets.js";
+import type { LoadedWallet } from "./wallets.js";
 import { ensureEvenYPriv, getXOnlyPub } from "./utils.js";
-import { bytesToHex, hexToBytes } from '@bch-stealth/utils'
+import { bytesToHex, sha256 } from "@bch-stealth/utils";
 
 export type PaycodeSetup = {
   alicePaycode: string;
@@ -31,7 +32,10 @@ export function generatePaycode(privBytes: Uint8Array): string {
   privBytes = ensureEvenYPriv(privBytes);
   const pubKey = secp256k1.getPublicKey(privBytes, true);
 
-  const chainCode = randomBytes(32);
+  // deterministic chaincode (demo): sha256("bch-stealth-paycode-v0" || pubkey33)
+  const tag = new TextEncoder().encode('bch-stealth-paycode-v0');
+  const chainCode = sha256(new Uint8Array([...tag, ...pubKey]));
+
   const flags = 0x00;
   const version = 0x01;
   const pad = new Uint8Array(13);
@@ -39,7 +43,7 @@ export function generatePaycode(privBytes: Uint8Array): string {
   return base58checkEncode(0x47, payload);
 }
 
-export function setupPaycodesAndDerivation(alice: Wallet, bob: Wallet): PaycodeSetup {
+export function setupPaycodesAndDerivation(alice: LoadedWallet, bob: LoadedWallet): PaycodeSetup {
   console.log("Generating paycodes from static wallet keys...");
   console.log("  Alice base pubkey:", bytesToHex(alice.pubBytes));
   console.log("  Bob   base pubkey:", bytesToHex(bob.pubBytes));

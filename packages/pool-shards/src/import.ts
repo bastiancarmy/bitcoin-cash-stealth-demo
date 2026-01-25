@@ -153,7 +153,7 @@ export function importDepositToShard(args: any) {
 
   const tokenOut = makeShardTokenOut({ category32, commitment32: stateOut32 });
 
-  // ✅ shard output is bare covenant (token prefix + redeemScript bytes)
+  // shard output is bare covenant (token prefix + redeemScript bytes)
   const shardOutSpk = locking.shardLock({ token: tokenOut, redeemScript });
 
   const tx: any = {
@@ -168,7 +168,7 @@ export function importDepositToShard(args: any) {
 
   const { witnessVin, witnessPrevoutCtx } = appendWitnessInput(tx, witnessPrevout);
 
-  // ✅ Phase 2 / v1.1 ABI: covenant input is push-only and NOT signed
+  // Phase 2 / v1.1 ABI: covenant input is push-only and NOT signed
   tx.inputs[0].scriptSig = shardUnlock;
 
   // NEW: local parse/validation of covenant pushes (debug gated)

@@ -185,24 +185,19 @@ export async function selectFundingUtxo(args: {
 
   const dbg = process.env.BCH_STEALTH_DEBUG_FUNDING === '1';
 
-  // Try the expected signature first: (address, network, includeUnconfirmed)
+  // Try the expected signature first
   let utxos: any[] = [];
   try {
-    const utxos = await getUtxos(wallet.address, true, network);
+    utxos = await getUtxos(wallet.address, true, network);
   } catch (e) {
-    if (dbg) {
-      console.log(`[funding] getUtxos(address, network, true) threw: ${errToString(e)}`);
-    }
+    if (dbg) console.log(`[funding] getUtxos(address, true, network) threw: ${errToString(e)}`);
   }
 
-  // If empty, try the common alternate signature: (address, includeUnconfirmed, network)
   if (!Array.isArray(utxos) || utxos.length === 0) {
     try {
       utxos = await (getUtxos as any)(wallet.address, true, network);
     } catch (e) {
-      if (dbg) {
-        console.log(`[funding] getUtxos(address, true, network) threw: ${errToString(e)}`);
-      }
+      if (dbg) console.log(`[funding] getUtxos(address, true, network) threw: ${errToString(e)}`);
     }
   }
 

@@ -43,3 +43,4 @@ packages/cli/wallets.local.json
 # TypeScript incremental build cache
 tsconfig.tsbuildinfo
 *.tsbuildinfo
+/tmp/

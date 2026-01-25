@@ -21,54 +21,8 @@ function shouldDebug(): boolean {
   );
 }
 
-function resolveCovenantSignerWalletFromState(ctx: PoolOpContext, st: PoolState) {
-  const id = (st as any).covenantSigner;
-  if (!id) {
-    throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
-  }
-
-  const wantActor = String(id.actorId ?? '').toLowerCase();
-  const wantH160 = String(id.pubkeyHash160Hex ?? '').toLowerCase();
-
-  const a = ctx.actors.actorABaseWallet;
-  const b = ctx.actors.actorBBaseWallet;
-
-  // Prefer actorId mapping
-  let chosen =
-    wantActor === 'actor_a' || wantActor === 'alice' || wantActor === 'a'
-      ? a
-      : wantActor === 'actor_b' || wantActor === 'bob' || wantActor === 'b'
-        ? b
-        : undefined;
-
-  // Otherwise match by hash160
-  if (!chosen) {
-    const aH = bytesToHex(a.hash160).toLowerCase();
-    const bH = bytesToHex(b.hash160).toLowerCase();
-    if (wantH160 === aH) chosen = a;
-    if (wantH160 === bH) chosen = b;
-  }
-
-  if (!chosen) {
-    throw new Error(
-      `Unknown covenantSigner in state: actorId=${id.actorId} pubkeyHash160Hex=${id.pubkeyHash160Hex}`
-    );
-  }
-
-  // Validate stored hash160 matches chosen wallet
-  const actual = bytesToHex(chosen.hash160).toLowerCase();
-  if (wantH160 && wantH160 !== actual) {
-    throw new Error(
-      `covenantSigner mismatch: state.pubkeyHash160Hex=${id.pubkeyHash160Hex} actualWalletHash160=${actual}`
-    );
-  }
-
-  return { actorId: String(id.actorId), wallet: chosen };
-}
-
 function parseP2pkhHash160(scriptPubKey: Uint8Array | string): Uint8Array | null {
   const spk = scriptPubKey instanceof Uint8Array ? scriptPubKey : hexToBytes(scriptPubKey);
-  // OP_DUP OP_HASH160 PUSH20 <20B> OP_EQUALVERIFY OP_CHECKSIG
   if (
     spk.length === 25 &&
     spk[0] === 0x76 &&
@@ -88,7 +42,6 @@ function pubkeyHashFromPriv(privBytes: Uint8Array): { pub: Uint8Array; h160: Uin
   return { pub, h160 };
 }
 
-/** Derive a stable 32-byte hash for an outpoint (demo placeholder). */
 function outpointHash32(txidHex: string, vout: number): Uint8Array {
   const txid = hexToBytes(txidHex);
   const n = uint32le(vout >>> 0);
@@ -146,33 +99,6 @@ function loudBaseImportWarning(args: { dep: DepositRecord; expectedH160Hex: stri
   );
 }
 
-function debugScriptSearch(args: {
-  label: string;
-  scriptPubKey: Uint8Array;
-  categoryHex?: string | null;
-  commitmentHex?: string | null;
-  extraNeedleHex?: string | null;
-}) {
-  if (!shouldDebug()) return;
-
-  const spkHex = bytesToHex(args.scriptPubKey).toLowerCase();
-  const cat = (args.categoryHex ?? '').toLowerCase();
-  const com = (args.commitmentHex ?? '').toLowerCase();
-  const extra = (args.extraNeedleHex ?? '').toLowerCase();
-
-  const loc = (needle: string) => {
-    if (!needle) return -1;
-    return spkHex.indexOf(needle);
-  };
-
-  console.log(`\n[import:debug] ${args.label}`);
-  console.log(`[import:debug]   spkHex[0..160): ${spkHex.slice(0, 160)}${spkHex.length > 160 ? '…' : ''}`);
-
-  if (cat) console.log(`[import:debug]   contains categoryHex? idx=${loc(cat)}`);
-  if (com) console.log(`[import:debug]   contains commitmentHex? idx=${loc(com)}`);
-  if (extra) console.log(`[import:debug]   contains extraNeedleHex? idx=${loc(extra)}`);
-}
-
 async function importDepositToShardOnce(args: {
   ctx: PoolOpContext;
   poolState: PoolState;
@@ -183,39 +109,21 @@ async function importDepositToShardOnce(args: {
   baseDepositPrivBytes?: Uint8Array | null;
   allowBaseFlag: boolean;
 }): Promise<{ txid: string; built: any; depositKind: 'rpa' | 'base_p2pkh'; expectedH160Hex: string }> {
-  const { ctx, poolState, shardIndex, depositOutpoint, categoryMode, baseDepositPrivBytes, allowBaseFlag } = args;
+  const { ctx, poolState, shardIndex, depositOutpoint, categoryMode, allowBaseFlag } = args;
   const st = ensurePoolStateDefaults(poolState);
 
   if (!st.categoryHex || !st.redeemScriptHex) {
     throw new Error('State missing categoryHex/redeemScriptHex. Run init first or repair state.');
   }
 
-  // B452: covenant signer comes from state (no shard script scanning)
-  const covenantSigner = resolveCovenantSignerWalletFromState(ctx, st);
-  const covenantSignerWallet = covenantSigner.wallet;
+  // single-user: covenant signer is me
+  const covenantSignerWallet = ctx.me.wallet;
 
   const shard = st.shards[shardIndex];
   if (!shard) throw new Error(`invalid shardIndex ${shardIndex}`);
 
   const shardPrev = await ctx.chainIO.getPrevOutput(shard.txid, shard.vout);
   const depositPrev = await ctx.chainIO.getPrevOutput(depositOutpoint.txid, depositOutpoint.vout);
-
-  if (shouldDebug()) {
-    console.log(`[import:debug] covenantSigner.actorId=${covenantSigner.actorId}`);
-    console.log(`[import:debug] covenantSigner.h160=${bytesToHex(covenantSignerWallet.hash160)}`);
-  }
-
-  debugScriptSearch({
-    label: `shard prevout ${shard.txid}:${shard.vout}`,
-    scriptPubKey: shardPrev.scriptPubKey,
-    categoryHex: st.categoryHex ?? null,
-    commitmentHex: shard.commitmentHex ?? null,
-  });
-
-  debugScriptSearch({
-    label: `deposit prevout ${depositOutpoint.txid}:${depositOutpoint.vout}`,
-    scriptPubKey: depositPrev.scriptPubKey,
-  });
 
   const expectedH160 = parseP2pkhHash160(depositPrev.scriptPubKey);
   if (!expectedH160) throw new Error('deposit prevout is not P2PKH');
@@ -225,12 +133,12 @@ async function importDepositToShardOnce(args: {
   let depositSignPrivBytes: Uint8Array;
   let depositH160Hex: string;
 
-  const rpaCtx = depositOutpoint.rpaContext;
+  const rpaCtx = (depositOutpoint as any).rpaContext;
 
   if (rpaCtx?.senderPub33Hex && rpaCtx?.prevoutHashHex) {
+    // RPA path: receiver is me (scan/spend keys derive one-time priv)
     const senderPaycodePub33 = hexToBytes(rpaCtx.senderPub33Hex);
-
-    const receiverWallet = ctx.actors.actorBBaseWallet;
+    const receiverWallet = ctx.me.wallet;
 
     const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
       receiverWallet.scanPrivBytes ?? receiverWallet.privBytes,
@@ -251,16 +159,28 @@ async function importDepositToShardOnce(args: {
     depositSignPrivBytes = oneTimePriv;
     depositKind = 'rpa';
   } else {
+    // BASE P2PKH path: spend with explicit key (or auto if matches my base address)
     depositKind = 'base_p2pkh';
-
     requireBaseImportUnlocks({ allowBaseFlag });
+
+    let baseDepositPrivBytes = args.baseDepositPrivBytes ?? null;
+
+    // If the deposit output is to MY base P2PKH, auto-use MY base key.
+    const meH160Hex = bytesToHex(ctx.me.wallet.hash160).toLowerCase();
+    if (!baseDepositPrivBytes && expectedH160Hex.toLowerCase() === meH160Hex) {
+      baseDepositPrivBytes = ctx.me.wallet.privBytes;
+      if (shouldDebug()) {
+        console.log(`[import:debug] base import: using my base key (hash160 matched deposit output)`);
+      }
+    }
 
     if (!baseDepositPrivBytes) {
       throw new Error(
         `Base import requires a spend key.\n` +
           `Provide one of:\n` +
           `  --deposit-wif <WIF>\n` +
-          `  --deposit-privhex <32-byte-hex>\n`
+          `  --deposit-privhex <32-byte-hex>\n` +
+          `Or deposit directly to your base P2PKH to allow auto-key selection.\n`
       );
     }
 
@@ -300,56 +220,22 @@ async function importDepositToShardOnce(args: {
     scriptPubKey: depositPrev.scriptPubKey,
   };
 
-  const covenantWallet: PoolShards.WalletLike = {
-    signPrivBytes: covenantSignerWallet.privBytes,
-    pubkeyHash160Hex: bytesToHex(covenantSignerWallet.hash160),
-  };
-
-  const depositWallet: PoolShards.WalletLike = {
-    signPrivBytes: depositSignPrivBytes,
-    pubkeyHash160Hex: depositH160Hex,
-  };
-
   const built = PoolShards.importDepositToShard({
     pool,
     shardIndex,
     shardPrevout,
     depositPrevout,
-    covenantWallet,
-    depositWallet,
+    covenantWallet: {
+      signPrivBytes: covenantSignerWallet.privBytes,
+      pubkeyHash160Hex: bytesToHex(covenantSignerWallet.hash160),
+    },
+    depositWallet: {
+      signPrivBytes: depositSignPrivBytes,
+      pubkeyHash160Hex: depositH160Hex,
+    },
     feeSats: BigInt(ctx.config.DEFAULT_FEE),
     categoryMode: categoryMode ?? undefined,
   } as any);
-
-  const out0 = built?.tx?.outputs?.[0];
-  const out0Spk: Uint8Array | undefined = out0?.scriptPubKey;
-  const stateOutHex: string | null =
-    typeof built?.diagnostics?.stateOut32Hex === 'string' ? built.diagnostics.stateOut32Hex : null;
-
-  if (out0Spk instanceof Uint8Array) {
-    debugScriptSearch({
-      label: `built output[0] (shard) mode=${categoryMode ?? '<default>'}`,
-      scriptPubKey: out0Spk,
-      categoryHex: st.categoryHex ?? null,
-      commitmentHex: stateOutHex,
-      extraNeedleHex: shard.commitmentHex ?? null,
-    });
-  }
-
-  if (shouldDebug()) {
-    console.log(`[import:debug] built diagnostics:`, {
-      shardIndex,
-      categoryMode: categoryMode ?? '<default>',
-      category32Hex: built?.diagnostics?.category32Hex,
-      stateIn32Hex: built?.diagnostics?.stateIn32Hex,
-      stateOut32Hex: built?.diagnostics?.stateOut32Hex,
-      noteHash32Hex: built?.diagnostics?.noteHash32Hex,
-      feeSats: built?.diagnostics?.feeSats,
-      newShardValueSats: built?.diagnostics?.newShardValueSats,
-      depositKind,
-      covenantSignerActorId: covenantSigner.actorId,
-    });
-  }
 
   const rawHex = bytesToHex(built.rawTx);
   const txid = await ctx.chainIO.broadcastRawTx(rawHex);
@@ -373,6 +259,10 @@ export async function runImport(
     allowBase?: boolean;
     depositWif?: string | null;
     depositPrivHex?: string | null;
+
+    // override outpoint
+    depositTxid?: string | null;
+    depositVout?: number;
   }
 ): Promise<{ txid: string; shardIndex: number } | null> {
   const {
@@ -382,6 +272,9 @@ export async function runImport(
     allowBase = false,
     depositWif = null,
     depositPrivHex = null,
+
+    depositTxid = null,
+    depositVout = 0,
   } = opts;
 
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
@@ -390,30 +283,47 @@ export async function runImport(
   st.withdrawals ??= [];
   st.stealthUtxos ??= [];
 
-  // B452: fail early if missing signer identity (import requires covenant spend)
-  if (!(st as any).covenantSigner) {
-    throw new Error('Missing covenantSigner in state. Re-run init or repair state.');
-  }
+  let dep: DepositRecord | null = null;
 
-  const dep =
-    ((st as any).lastDeposit && !(st as any).lastDeposit.importTxid ? (st as any).lastDeposit : null) ??
-    getLatestUnimportedDeposit(st, null);
+  if (depositTxid) {
+    const txid = String(depositTxid).trim().toLowerCase();
+    const vout = Number(depositVout ?? 0);
+    if (!/^[0-9a-f]{64}$/i.test(txid)) throw new Error(`invalid --deposit-txid: ${depositTxid}`);
+    if (!Number.isFinite(vout) || vout < 0) throw new Error(`invalid --deposit-vout: ${depositVout}`);
+
+    const prev = await ctx.chainIO.getPrevOutput(txid, vout);
+    const h160 = parseP2pkhHash160(prev.scriptPubKey);
+    if (!h160) throw new Error(`override deposit outpoint is not P2PKH: ${txid}:${vout}`);
+
+    dep = {
+      txid,
+      vout,
+      valueSats: String(prev.value),
+      value: String(prev.value),
+      receiverRpaHash160Hex: bytesToHex(h160),
+      createdAt: new Date().toISOString(),
+    } as any;
+  } else {
+    dep =
+      ((st as any).lastDeposit && !(st as any).lastDeposit.importTxid ? (st as any).lastDeposit : null) ??
+      getLatestUnimportedDeposit(st, null);
+  }
 
   if (!dep) return null;
 
-  if (!fresh && dep.importTxid) {
-    return { txid: dep.importTxid, shardIndex: dep.importedIntoShard! };
+  if (!fresh && (dep as any).importTxid) {
+    return { txid: (dep as any).importTxid, shardIndex: (dep as any).importedIntoShard! };
   }
 
   let stillUnspent = await ctx.chainIO.isP2pkhOutpointUnspent({
     txid: dep.txid,
     vout: dep.vout,
-    hash160Hex: dep.receiverRpaHash160Hex,
+    hash160Hex: (dep as any).receiverRpaHash160Hex,
   });
 
   if (!stillUnspent) {
     stillUnspent = await ctx.chainIO.waitForP2pkhOutpointUnspent(
-      { txid: dep.txid, vout: dep.vout, hash160Hex: dep.receiverRpaHash160Hex },
+      { txid: dep.txid, vout: dep.vout, hash160Hex: (dep as any).receiverRpaHash160Hex },
       { attempts: 12, delayMs: 750 }
     );
   }
@@ -435,9 +345,7 @@ export async function runImport(
           `[import:debug] deposit-wif version=${wifVersionHint(decoded.version)} compressed=${decoded.compressed}`
         );
       }
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   const forcedMode = normalizeMode(process.env.BCH_STEALTH_CATEGORY_MODE);
@@ -465,25 +373,17 @@ export async function runImport(
         shardIndex,
         depositOutpoint: dep,
         categoryMode: mode,
-
         baseDepositPrivBytes: basePrivBytes,
         allowBaseFlag: allowBase,
       });
 
-      const warnings: string[] = [];
-      if (res.depositKind === 'base_p2pkh') {
-        warnings.push('BASE_P2PKH_IMPORT_NOT_STEALTH');
-        warnings.push('User asserted provenance/mixing externally (e.g. CashFusion).');
-      }
-
+      // Persist deposit record in MY store so reruns are deterministic.
       upsertDeposit(st, {
         ...dep,
         importedIntoShard: shardIndex,
         importTxid: res.txid,
-
         depositKind: res.depositKind,
         baseP2pkhHash160Hex: res.depositKind === 'base_p2pkh' ? res.expectedH160Hex : undefined,
-        warnings: warnings.length ? warnings : (dep as any).warnings,
       } as any);
 
       await saveState({ store: ctx.store, state: st, networkDefault: ctx.network });

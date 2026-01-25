@@ -38,7 +38,7 @@ export function makeDefaultLockingTemplates(opts: { txb: TxBuilderLike }): Locki
         throw new Error('locking.shardLock(redeemScript): redeemScript must be non-empty Uint8Array');
       }
 
-      // ✅ Bare covenant (no P2SH wrapper)
+      // Bare covenant (no P2SH wrapper)
       return txb.addTokenToScript(token as any, redeemScript);
     },
   };

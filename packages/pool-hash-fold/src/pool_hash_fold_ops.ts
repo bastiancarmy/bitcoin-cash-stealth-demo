@@ -38,22 +38,17 @@ export type PoolHashFoldCategoryMode =
   | 'forward'
   | 'normal';
 
-export type ComputePoolStateOutParams =
-  | {
-      version?: typeof POOL_HASH_FOLD_VERSION.V0 | typeof POOL_HASH_FOLD_VERSION.V1;
-      limbs?: PoolHashFoldLimb[];
-      // legacy versions don’t use these
-    }
-  | {
-      version?: typeof POOL_HASH_FOLD_VERSION.V1_1;
-      limbs?: PoolHashFoldLimb[];
-      categoryMode?: PoolHashFoldCategoryMode;
-      capByte?: number;
-      stateIn32: Uint8Array;
-      category32: Uint8Array;
-      noteHash32: Uint8Array;
-      oldCommit32?: Uint8Array; // if you carry it for callers, keep optional
-    };
+// 1) Make capByte optional since you already default it below.
+//    (If you prefer it required, see note at the bottom.)
+export type ComputePoolStateOutParams = {
+  version?: PoolHashFoldVersion;
+  stateIn32: Uint8Array;
+  category32: Uint8Array;
+  noteHash32: Uint8Array;
+  limbs: Uint8Array[];
+  categoryMode: 'reverse' | 'direct';
+  capByte?: number; // was: capByte: number
+};
 
 export type BuildPoolHashFoldUnlockingBytecodeParams =
   | {
@@ -208,8 +203,8 @@ export function computePoolStateOut(params: ComputePoolStateOutParams): Uint8Arr
     return acc;
   }
 
-  // v1.1: prehash chain then LIFO fold limbs
-  const p = params as Extract<ComputePoolStateOutParams, { version?: typeof POOL_HASH_FOLD_VERSION.V1_1 }>;
+  // v1.1: do NOT use Extract<> here (it becomes never)
+  const p = params as ComputePoolStateOutParams;
 
   assertLen(p.stateIn32, 32, 'stateIn32');
   assertLen(p.category32, 32, 'category32');
@@ -220,10 +215,7 @@ export function computePoolStateOut(params: ComputePoolStateOutParams): Uint8Arr
     throw new Error('capByte must be 0..255');
   }
 
-  // v1.1 category normalization:
-  // - default: "reverse"
-  // - accepts aliases like "raw" => direct (no reverse)
-  const mode = normalizeCategoryMode((p as any).categoryMode);
+  const mode = normalizeCategoryMode(p.categoryMode);
 
   const catNorm = mode === 'reverse' ? reverseBytes(p.category32) : p.category32;
 
