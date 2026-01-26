@@ -33,7 +33,7 @@ import * as Electrum from '@bch-stealth/electrum';
 import { bytesToHex } from '@bch-stealth/utils';
 
 import { NETWORK, DUST } from './config.js';
-import { getWallet, resolveDefaultWalletPath, type LoadedWallet } from './wallets.js';
+import { getWallet, resolveDefaultWalletPath, type LoadedWallet, getWalletFromConfig } from './wallets.js';
 import { generatePaycode } from './paycodes.js';
 
 import { makeChainIO } from './pool/io.js';
@@ -44,6 +44,7 @@ import type { PoolOpContext } from './pool/context.js';
 import { runInit } from './pool/ops/init.js';
 import { runImport } from './pool/ops/import.js';
 import { runWithdraw } from './pool/ops/withdraw.js';
+import { resolveProfilePaths } from './paths.js';
 
 // -------------------------------------------------------------------------------------
 // pool-hash-fold namespace
@@ -79,12 +80,11 @@ const program = new Command();
 program
   .name('bchctl')
   .description('bchctl control plane (single-user)')
+  .option('--profile <name>', 'profile name (default: "default")', 'default')
   .option('--pool-version <ver>', 'pool hash-fold version: v1 or v1_1', 'v1_1')
-  .option(
-    '--wallet <path>',
-    'wallet.json path (default: ./wallet.json or BCH_STEALTH_WALLET)'
-  )
-  .option('--state-file <path>', 'state file path (default: ./state.json)')
+  .option('--wallet <path>', 'wallet.json path (default: profile wallet.json or BCH_STEALTH_WALLET)')
+  .option('--state-file <path>', 'state file path (default: profile state.json)')
+  .option('--log-file <path>', 'events log path (default: profile events.ndjson)');
 
 function resolvePoolVersionFlag(): any {
   return program.opts().poolVersion === 'v1' ? POOL_HASH_FOLD_VERSION.V1 : POOL_HASH_FOLD_VERSION.V1_1;
@@ -103,8 +103,22 @@ function ensureParentDir(filename: string) {
   fs.mkdirSync(path.dirname(filename), { recursive: true });
 }
 
+function getActivePaths() {
+  const opts = program?.opts?.() ?? {};
+
+  return resolveProfilePaths({
+    cwd: process.cwd(),
+    profile: String(opts.profile ?? 'default'),
+    walletOverride: typeof opts.wallet === 'string' && opts.wallet.trim() ? String(opts.wallet).trim() : null,
+    stateOverride: typeof opts.stateFile === 'string' && opts.stateFile.trim() ? String(opts.stateFile).trim() : null,
+    logOverride: typeof opts.logFile === 'string' && opts.logFile.trim() ? String(opts.logFile).trim() : null,
+    envWalletPath: process.env.BCH_STEALTH_WALLET ? String(process.env.BCH_STEALTH_WALLET) : null,
+  });
+}
+
 function makeStore(): FileBackedPoolStateStore {
-  const filename = path.resolve(resolveStateFileFlag());
+  const { stateFile } = getActivePaths();
+  const filename = path.resolve(stateFile);
 
   migrateLegacyPoolStateDirSync({
     repoRoot: process.cwd(),
@@ -136,20 +150,23 @@ function errToString(e: unknown): string {
 }
 
 async function loadMeWallet(): Promise<LoadedWallet> {
-  const raw = String(program?.opts?.()?.wallet ?? '').trim();
+  const { walletFile, configFile, profile } = getActivePaths();
 
-  // Lazily resolve default wallet path only when a command actually needs the wallet.
-  const walletPath = raw || resolveDefaultWalletPath();
-
+  // If --wallet was provided (or env override already baked into walletFile),
+  // getWallet(walletFile) will load it. If it fails, we still want to mention config.
   try {
-    return await getWallet({ walletFile: walletPath || undefined });
-  } catch (e) {
-    // Keep the existing helpful message pattern
+    return await getWallet({ walletFile });
+  } catch (e1) {
+    // Try embedded keys from config.json for this profile (if any)
+    const w = getWalletFromConfig({ configFile, profile });
+    if (w) return w;
+
     throw new Error(
-      `[wallets] wallet.json not found in ${process.cwd()}\n` +
+      `[wallets] wallet not found in ${process.cwd()}\n` +
         `Create one with: bchctl wallet init\n` +
-        `Tried path: ${walletPath}\n` +
-        `Inner: ${errToString(e)}`
+        `Tried wallet path: ${walletFile}\n` +
+        `Tried config: ${configFile} (profile=${profile})\n` +
+        `Inner: ${errToString(e1)}`
     );
   }
 }
@@ -241,7 +258,7 @@ pool
     const ctx = await makePoolCtx();
     const res = await runInit(ctx, { shards, fresh: !!opts.fresh });
 
-    const stateFile = resolveStateFileFlag();
+    const { stateFile } = getActivePaths();
 
     console.log(`init txid: ${res.txid ?? res.state?.txid ?? '<unknown>'}`);
     console.log(`shards: ${shards}`);
@@ -300,7 +317,7 @@ pool
       return;
     }
 
-    const stateFile = resolveStateFileFlag();
+    const { stateFile } = getActivePaths();
 
     console.log(`import txid: ${res.txid}`);
     console.log(`shard: ${res.shardIndex}`);
@@ -338,7 +355,7 @@ pool
       requireShard: !!opts.requireShard,
     });
 
-    const stateFile = resolveStateFileFlag();
+    const { stateFile } = getActivePaths();
 
     console.log(`withdraw txid: ${res.txid}`);
     console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
