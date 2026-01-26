@@ -1,5 +1,6 @@
 {
   "name": "@bch-stealth/cli",
+  "description": "bchctl: CLI for BCH vault/stealth/pool operations (bch-stealth is a compatibility alias).",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -12,7 +13,8 @@
     }
   },
   "bin": {
-    "bch-stealth": "./dist/index.js"
+    "bchctl": "./dist/index.js",
+    "bch-stealth": "./dist/bch-stealth.js"
   },
   "files": [
     "dist"
@@ -20,7 +22,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "yarn build && node --test ./dist/tests"
   },
   "dependencies": {
     "@bch-stealth/electrum": "workspace:^",

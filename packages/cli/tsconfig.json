@@ -6,5 +6,5 @@
     "types": ["node"],
     "noImplicitAny": false
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "src/bch-stealth.ts"]
 }

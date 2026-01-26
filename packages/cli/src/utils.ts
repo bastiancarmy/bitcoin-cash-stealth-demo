@@ -5,6 +5,7 @@ import { bytesToNumberBE, numberToBytesBE } from '@noble/curves/utils.js';
 import { hmac } from '@noble/hashes/hmac.js';
 import { utf8ToBytes } from '@noble/hashes/utils.js';
 import { pow } from '@noble/curves/abstract/modular.js';
+import { hash160 } from '@bch-stealth/utils';
 
 export { sha256, ripemd160 };
 
@@ -367,4 +368,10 @@ function normalizeOwnersInState(st: any): void {
     const canon = canonicalizeOwnerId((r as any).owner);
     if (canon) (r as any).owner = canon;
   }
+}
+
+export function pubkeyHashFromPriv(privBytes: Uint8Array): { pub: Uint8Array; h160: Uint8Array } {
+  const pub = secp256k1.getPublicKey(privBytes, true);
+  const h160 = hash160(pub);
+  return { pub, h160 };
 }

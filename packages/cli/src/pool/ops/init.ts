@@ -107,6 +107,8 @@ export async function runInit(
   const signer = { wallet: ctx.me.wallet, ownerTag: 'me' as const };
 
   const funding = await selectFundingUtxo({
+    mode: 'pool-op',
+    // default prefer is ['base','stealth']
     state: st,
     wallet: signer.wallet,
     ownerTag: signer.ownerTag,

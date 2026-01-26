@@ -51,6 +51,8 @@ export async function runDeposit(
 
   // 1) Select a funding UTXO owned by me
   const senderUtxo = await selectFundingUtxo({
+    mode: 'wallet-send',
+    // default prefer is ['base','stealth'] (wallet-first)
     state: st,
     wallet: senderWallet,
     ownerTag: senderTag,

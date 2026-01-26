@@ -12,6 +12,7 @@ import { loadStateOrEmpty, saveState } from '../state.js';
 import { toPoolShardsState, patchShardFromNextPoolState } from '../adapters.js';
 
 import { parsePrivKeyInput, decodeWifToPrivBytes, wifVersionHint } from '../wif.js';
+import { pubkeyHashFromPriv } from '../../utils.js';
 
 function shouldDebug(): boolean {
   return (
@@ -34,12 +35,6 @@ function parseP2pkhHash160(scriptPubKey: Uint8Array | string): Uint8Array | null
     return spk.slice(3, 23);
   }
   return null;
-}
-
-function pubkeyHashFromPriv(privBytes: Uint8Array): { pub: Uint8Array; h160: Uint8Array } {
-  const pub = secp256k1.getPublicKey(privBytes, true);
-  const h160 = hash160(pub);
-  return { pub, h160 };
 }
 
 function outpointHash32(txidHex: string, vout: number): Uint8Array {
@@ -74,7 +69,7 @@ function requireBaseImportUnlocks(args: { allowBaseFlag: boolean }) {
     throw new Error(
       `Refusing to import a NON-RPA (base P2PKH) deposit without --allow-base.\n` +
         `This deposit is not stealth. If you intended to import fused coins, re-run with:\n` +
-        `  bch-stealth pool import --allow-base --deposit-wif <WIF>\n` +
+        `  bchctl  pool import --allow-base --deposit-wif <WIF>\n` +
         `And also set:\n` +
         `  BCH_STEALTH_ALLOW_BASE_IMPORT=1`
     );

@@ -31,7 +31,7 @@ export type PoolOpContext = {
   network: string;
   store: FileBackedPoolStateStore;
   chainIO: ChainIO;
-  getUtxos: any;
+  getUtxos: (address: string, network: string, includeUnconfirmed: boolean) => Promise<any[]>;
   poolVersion: any;
   config: {
     DUST: bigint | number;

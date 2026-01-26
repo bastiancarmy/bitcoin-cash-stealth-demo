@@ -168,6 +168,8 @@ export async function runWithdraw(
   const senderWallet = ctx.me.wallet;
 
   const feeUtxo = await selectFundingUtxo({
+    mode: 'pool-op',
+    // fee funding should be wallet-first
     state: st,
     wallet: senderWallet,
     ownerTag: 'me',

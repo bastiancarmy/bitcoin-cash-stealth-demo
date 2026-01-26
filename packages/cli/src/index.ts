@@ -66,6 +66,11 @@ function defaultStateFileFromCwd(): string {
   return path.resolve(process.cwd(), 'state.json');
 }
 
+function resolveStateFileFlag(): string {
+  const raw = String(program?.opts?.()?.stateFile ?? '').trim();
+  return raw || defaultStateFileFromCwd();
+}
+
 // -------------------------------------------------------------------------------------
 // CLI
 // -------------------------------------------------------------------------------------
@@ -73,14 +78,13 @@ const program = new Command();
 
 program
   .name('bchctl')
-  .description('bch-stealth control plane (single-user)')
+  .description('bchctl control plane (single-user)')
   .option('--pool-version <ver>', 'pool hash-fold version: v1 or v1_1', 'v1_1')
   .option(
     '--wallet <path>',
-    'wallet.json path (default: ./wallet.json or BCH_STEALTH_WALLET)',
-    resolveDefaultWalletPath()
+    'wallet.json path (default: ./wallet.json or BCH_STEALTH_WALLET)'
   )
-  .option('--state-file <path>', 'state file path (default: ./state.json)', defaultStateFileFromCwd());
+  .option('--state-file <path>', 'state file path (default: ./state.json)')
 
 function resolvePoolVersionFlag(): any {
   return program.opts().poolVersion === 'v1' ? POOL_HASH_FOLD_VERSION.V1 : POOL_HASH_FOLD_VERSION.V1_1;
@@ -100,8 +104,7 @@ function ensureParentDir(filename: string) {
 }
 
 function makeStore(): FileBackedPoolStateStore {
-  const opted = (program?.opts?.()?.stateFile as string | undefined) ?? null;
-  const filename = path.resolve(opted ?? defaultStateFileFromCwd());
+  const filename = path.resolve(resolveStateFileFlag());
 
   migrateLegacyPoolStateDirSync({
     repoRoot: process.cwd(),
@@ -123,9 +126,32 @@ async function writeState(store: FileBackedPoolStateStore, state: PoolState): Pr
 // -------------------------------------------------------------------------------------
 // Wallet helpers (single-user)
 // -------------------------------------------------------------------------------------
+function errToString(e: unknown): string {
+  if (e instanceof Error) return e.stack || e.message;
+  try {
+    return String(e);
+  } catch {
+    return '[unknown error]';
+  }
+}
+
 async function loadMeWallet(): Promise<LoadedWallet> {
-  const walletPath = String(program?.opts?.()?.wallet ?? '').trim();
-  return await getWallet({ walletFile: walletPath || undefined });
+  const raw = String(program?.opts?.()?.wallet ?? '').trim();
+
+  // Lazily resolve default wallet path only when a command actually needs the wallet.
+  const walletPath = raw || resolveDefaultWalletPath();
+
+  try {
+    return await getWallet({ walletFile: walletPath || undefined });
+  } catch (e) {
+    // Keep the existing helpful message pattern
+    throw new Error(
+      `[wallets] wallet.json not found in ${process.cwd()}\n` +
+        `Create one with: bchctl wallet init\n` +
+        `Tried path: ${walletPath}\n` +
+        `Inner: ${errToString(e)}`
+    );
+  }
 }
 
 function printFundingHelpForMe(me: LoadedWallet) {
@@ -215,10 +241,12 @@ pool
     const ctx = await makePoolCtx();
     const res = await runInit(ctx, { shards, fresh: !!opts.fresh });
 
-    console.log(`✅ init txid: ${res.txid ?? res.state?.txid ?? '<unknown>'}`);
-    console.log(`   shards: ${shards}`);
-    console.log(`   fresh: ${!!opts.fresh}`);
-    console.log(`   state saved: ${String(program.opts().stateFile ?? defaultStateFileFromCwd())} (${POOL_STATE_STORE_KEY})`);
+    const stateFile = resolveStateFileFlag();
+
+    console.log(`init txid: ${res.txid ?? res.state?.txid ?? '<unknown>'}`);
+    console.log(`shards: ${shards}`);
+    console.log(`fresh: ${!!opts.fresh}`);
+    console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
   });
 
 // pool import
@@ -272,9 +300,11 @@ pool
       return;
     }
 
-    console.log(`✅ import txid: ${res.txid}`);
-    console.log(`   shard: ${res.shardIndex}`);
-    console.log(`   state saved: ${String(program.opts().stateFile ?? defaultStateFileFromCwd())} (${POOL_STATE_STORE_KEY})`);
+    const stateFile = resolveStateFileFlag();
+
+    console.log(`import txid: ${res.txid}`);
+    console.log(`shard: ${res.shardIndex}`);
+    console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
   });
 
 // pool withdraw (FIXED: pass dest + sats to runWithdraw)
@@ -308,8 +338,10 @@ pool
       requireShard: !!opts.requireShard,
     });
 
-    console.log(`✅ withdraw txid: ${res.txid}`);
-    console.log(`   state saved: ${String(program.opts().stateFile ?? defaultStateFileFromCwd())} (${POOL_STATE_STORE_KEY})`);
+    const stateFile = resolveStateFileFlag();
+
+    console.log(`withdraw txid: ${res.txid}`);
+    console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
   });
 
 // -------------------------------------------------------------------------------------
