@@ -5,9 +5,10 @@ export type ProfilePaths = {
   profile: string;
   profileDir: string;
 
-  // New: shared config for all profiles
+  // canonical DB
   configFile: string;
 
+  // optional file locations (overrides still supported)
   walletFile: string;
   stateFile: string;
   logFile: string;
@@ -17,7 +18,6 @@ export function sanitizeProfileName(name: string): string {
   const n = String(name ?? '').trim();
   if (!n) return 'default';
 
-  // Keep it simple: file-system friendly, predictable.
   if (!/^[a-zA-Z0-9_-]+$/.test(n)) {
     throw new Error(`invalid --profile "${n}" (allowed: [a-zA-Z0-9_-])`);
   }
@@ -32,7 +32,6 @@ export function resolveProfilePaths(args: {
   stateOverride?: string | null;
   logOverride?: string | null;
 
-  // Optional: allow env-based wallet override while keeping profile defaults
   envWalletPath?: string | null;
 }): ProfilePaths {
   const {
@@ -46,11 +45,13 @@ export function resolveProfilePaths(args: {
 
   const prof = sanitizeProfileName(profile);
 
-  const appDir = path.resolve(cwd, '.bch-stealth');
-  const baseDir = path.resolve(appDir, 'profiles', prof);
+  // Canonical store is shared across profiles (kubeconfig-style)
+  const configFile = path.resolve(cwd, '.bch-stealth', 'config.json');
 
-  const configFile = path.resolve(appDir, 'config.json');
+  // Profile dir is still used for state/log defaults
+  const baseDir = path.resolve(cwd, '.bch-stealth', 'profiles', prof);
 
+  // walletFile stays for override/migration (NOT the canonical store)
   const walletFile =
     (walletOverride && path.resolve(cwd, walletOverride)) ||
     (envWalletPath && path.resolve(cwd, envWalletPath)) ||

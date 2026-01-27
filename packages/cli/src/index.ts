@@ -20,6 +20,8 @@ import path from 'node:path';
 
 import { Command } from 'commander';
 
+import { registerProfileCommands } from './profile/commands.js';
+
 import {
   FileBackedPoolStateStore,
   type PoolState,
@@ -30,10 +32,17 @@ import {
 import * as PoolHashFold from '@bch-stealth/pool-hash-fold';
 import * as Electrum from '@bch-stealth/electrum';
 
-import { bytesToHex } from '@bch-stealth/utils';
+import { bytesToHex, sha256, ensureEvenYPriv } from '@bch-stealth/utils';
 
 import { NETWORK, DUST } from './config.js';
-import { getWallet, resolveDefaultWalletPath, type LoadedWallet, getWalletFromConfig } from './wallets.js';
+import { readConfig, writeConfig, ensureConfigDefaults, upsertProfile } from './config_store.js';
+import {
+  getWalletFromConfig,
+  getWallet,
+  generateMnemonicV1,
+  walletJsonFromMnemonic,
+  type LoadedWallet,
+} from './wallets.js';
 import { generatePaycode } from './paycodes.js';
 
 import { makeChainIO } from './pool/io.js';
@@ -41,10 +50,12 @@ import { loadStateOrEmpty, saveState } from './pool/state.js';
 
 import type { PoolOpContext } from './pool/context.js';
 
+import { registerPoolCommands } from './commands/pool.js';
 import { runInit } from './pool/ops/init.js';
 import { runImport } from './pool/ops/import.js';
 import { runWithdraw } from './pool/ops/withdraw.js';
 import { resolveProfilePaths } from './paths.js';
+import { registerWalletCommands } from './commands/wallet.js';
 
 // -------------------------------------------------------------------------------------
 // pool-hash-fold namespace
@@ -152,23 +163,35 @@ function errToString(e: unknown): string {
 async function loadMeWallet(): Promise<LoadedWallet> {
   const { walletFile, configFile, profile } = getActivePaths();
 
-  // If --wallet was provided (or env override already baked into walletFile),
-  // getWallet(walletFile) will load it. If it fails, we still want to mention config.
-  try {
-    return await getWallet({ walletFile });
-  } catch (e1) {
-    // Try embedded keys from config.json for this profile (if any)
-    const w = getWalletFromConfig({ configFile, profile });
-    if (w) return w;
+  // 1) Prefer config.json (canonical kubeconfig-style store)
+  const fromCfg = getWalletFromConfig({ configFile, profile });
+  if (fromCfg) return fromCfg;
 
-    throw new Error(
-      `[wallets] wallet not found in ${process.cwd()}\n` +
-        `Create one with: bchctl wallet init\n` +
-        `Tried wallet path: ${walletFile}\n` +
-        `Tried config: ${configFile} (profile=${profile})\n` +
-        `Inner: ${errToString(e1)}`
-    );
+  // 2) Fallback to wallet file ONLY if explicitly overridden
+  const walletOptRaw = String(program?.opts?.()?.wallet ?? '').trim();
+  const envWallet = String(process.env.BCH_STEALTH_WALLET ?? '').trim();
+  const hasWalletOverride = !!walletOptRaw || !!envWallet;
+
+  if (hasWalletOverride) {
+    try {
+      return await getWallet({ walletFile });
+    } catch (e) {
+      throw new Error(
+        `[wallets] wallet not found in ${process.cwd()}\n` +
+          `Create one with: bchctl wallet init\n` +
+          `Tried wallet path: ${walletFile}\n` +
+          `Tried config: ${configFile} (profile=${profile})\n` +
+          `Inner: ${errToString(e)}`
+      );
+    }
   }
+
+  // 3) No config wallet and no file override -> clean instruction
+  throw new Error(
+    `[wallets] no wallet configured for profile "${profile}"\n` +
+      `Run: bchctl --profile ${profile} wallet init\n` +
+      `Config: ${configFile}`
+  );
 }
 
 function printFundingHelpForMe(me: LoadedWallet) {
@@ -216,17 +239,10 @@ async function makePoolCtx(): Promise<PoolOpContext> {
   } as any;
 }
 
-// -------------------------------------------------------------------------------------
-// Wallet namespace (stubs where implementation is not yet migrated)
-// -------------------------------------------------------------------------------------
-const wallet = program.command('wallet').description('Wallet commands (single-user)');
 
-wallet
-  .command('init')
-  .description('Create wallet.json (+ optional state.json). (TODO)')
-  .action(async () => {
-    throw new Error('wallet init not implemented yet in this refactor. (Next ticket: bchctl-wallet-init)');
-  });
+registerProfileCommands(program, { getActivePaths });
+
+registerWalletCommands(program, { getActivePaths });
 
 program
   .command('addr')
@@ -242,124 +258,11 @@ program
 // -------------------------------------------------------------------------------------
 // Pool namespace
 // -------------------------------------------------------------------------------------
-const pool = program.command('pool').description('Pool (optional vault/policy layer)');
-
-// pool init
-pool
-  .command('init')
-  .option('--shards <n>', 'number of shards', '8')
-  .option('--fresh', 'force a new init (creates new shards)', false)
-  .action(async (opts) => {
-    assertChipnet();
-
-    const shards = Number(opts.shards);
-    if (!Number.isFinite(shards) || shards < 2) throw new Error('shards must be >= 2');
-
-    const ctx = await makePoolCtx();
-    const res = await runInit(ctx, { shards, fresh: !!opts.fresh });
-
-    const { stateFile } = getActivePaths();
-
-    console.log(`init txid: ${res.txid ?? res.state?.txid ?? '<unknown>'}`);
-    console.log(`shards: ${shards}`);
-    console.log(`fresh: ${!!opts.fresh}`);
-    console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
-  });
-
-// pool import
-pool
-  .command('import')
-  .description('Import a deposit UTXO into the pool.')
-  .argument('<outpoint>', 'deposit outpoint as txid:vout')
-  .option('--shard <i>', 'shard index (default: derived)', '')
-  .option('--fresh', 'force a new import even if already marked imported', false)
-  .option(
-    '--allow-base',
-    'ALLOW importing a non-RPA base P2PKH deposit (requires BCH_STEALTH_ALLOW_BASE_IMPORT=1).',
-    false
-  )
-  .option('--deposit-wif <wif>', 'WIF for base P2PKH deposit key (optional).', '')
-  .option('--deposit-privhex <hex>', 'Hex private key for base P2PKH deposit key (optional).', '')
-  .action(async (outpoint, opts) => {
-    assertChipnet();
-
-    const [txidRaw, voutRaw] = String(outpoint).split(':');
-    const depositTxid = String(txidRaw ?? '').trim();
-    const depositVout = Number(String(voutRaw ?? '0').trim());
-
-    if (!/^[0-9a-fA-F]{64}$/.test(depositTxid)) {
-      throw new Error(`invalid outpoint txid (expected 64-hex): ${outpoint}`);
-    }
-    if (!Number.isFinite(depositVout) || depositVout < 0) {
-      throw new Error(`invalid outpoint vout: ${outpoint}`);
-    }
-
-    const shardIndexOpt: number | null = opts.shard === '' ? null : Number(opts.shard);
-    if (opts.shard !== '' && !Number.isFinite(shardIndexOpt)) throw new Error(`invalid --shard: ${String(opts.shard)}`);
-
-    const ctx = await makePoolCtx();
-
-    const res = await runImport(ctx, {
-      shardIndex: shardIndexOpt,
-      fresh: !!opts.fresh,
-      allowBase: !!opts.allowBase,
-      depositWif: typeof opts.depositWif === 'string' && opts.depositWif.trim() ? String(opts.depositWif).trim() : null,
-      depositPrivHex:
-        typeof opts.depositPrivhex === 'string' && opts.depositPrivhex.trim()
-          ? String(opts.depositPrivhex).trim()
-          : null,
-      depositTxid,
-      depositVout,
-    });
-
-    if (!res) {
-      console.log('ℹ no import performed (no matching deposit found / already imported).');
-      return;
-    }
-
-    const { stateFile } = getActivePaths();
-
-    console.log(`import txid: ${res.txid}`);
-    console.log(`shard: ${res.shardIndex}`);
-    console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
-  });
-
-// pool withdraw (FIXED: pass dest + sats to runWithdraw)
-pool
-  .command('withdraw')
-  .description('Withdraw from pool to a destination (paycode or cashaddr).')
-  .argument('<dest>', 'destination: paycode (PM...) or cashaddr')
-  .argument('<sats>', 'amount in sats')
-  .option('--shard <i>', 'shard index (default: auto)')
-  .option('--require-shard', 'fail if --shard not provided (no auto selection)', false)
-  .option('--fresh', 'force a new withdrawal even if already recorded', false)
-  .action(async (dest, sats, opts) => {
-    assertChipnet();
-
-    const amountSats = Number(sats);
-    if (!Number.isFinite(amountSats) || amountSats < Number(DUST)) {
-      throw new Error(`amount must be >= dust (${DUST})`);
-    }
-
-    const shardIndex = opts.shard == null ? undefined : Number(opts.shard);
-    if (shardIndex != null && (!Number.isFinite(shardIndex) || shardIndex < 0)) {
-      throw new Error(`invalid --shard: ${String(opts.shard)}`);
-    }
-
-    const ctx = await makePoolCtx();
-    const res = await runWithdraw(ctx, {
-      dest: String(dest),
-      shardIndex,
-      amountSats,
-      fresh: !!opts.fresh,
-      requireShard: !!opts.requireShard,
-    });
-
-    const { stateFile } = getActivePaths();
-
-    console.log(`withdraw txid: ${res.txid}`);
-    console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
-  });
+registerPoolCommands(program, {
+  assertChipnet,
+  makePoolCtx,
+  getActivePaths,
+});
 
 // -------------------------------------------------------------------------------------
 // Entrypoint
