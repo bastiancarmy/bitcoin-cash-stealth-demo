@@ -56,6 +56,7 @@ import { runImport } from './pool/ops/import.js';
 import { runWithdraw } from './pool/ops/withdraw.js';
 import { resolveProfilePaths } from './paths.js';
 import { registerWalletCommands } from './commands/wallet.js';
+import { registerAddrCommand } from './commands/addr.js';
 
 // -------------------------------------------------------------------------------------
 // pool-hash-fold namespace
@@ -244,16 +245,7 @@ registerProfileCommands(program, { getActivePaths });
 
 registerWalletCommands(program, { getActivePaths });
 
-program
-  .command('addr')
-  .description('Print my base address and paycode.')
-  .action(async () => {
-    const me = await loadMeWallet();
-    const paycode = generatePaycode(me.privBytes);
-    console.log(`base (P2PKH): ${me.address}`);
-    console.log(`paycode:      ${paycode}`);
-    console.log(`pubkey33:     ${bytesToHex(me.pubBytes)}`);
-  });
+registerAddrCommand(program, { getActivePaths, loadMeWallet });
 
 // -------------------------------------------------------------------------------------
 // Pool namespace
