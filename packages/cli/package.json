@@ -13,12 +13,10 @@
     }
   },
   "bin": {
-    "bchctl": "./dist/index.js",
-    "bch-stealth": "./dist/bch-stealth.js"
+    "bch-stealth": "./dist/bch-stealth.js",
+    "bchctl": "./dist/index.js"
   },
-  "files": [
-    "dist"
-  ],
+  "files": ["dist"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
@@ -26,12 +24,14 @@
     "test": "yarn build && node --test ./dist/tests"
   },
   "dependencies": {
-    "@bch-stealth/electrum": "workspace:^",
-    "@bch-stealth/pool-hash-fold": "workspace:^",
-    "@bch-stealth/pool-shards": "workspace:^",
-    "@bch-stealth/rpa": "workspace:^",
-    "@bch-stealth/tx-builder": "workspace:^",
     "@bch-stealth/utils": "workspace:^",
+    "@bch-stealth/electrum": "workspace:^",
+    "@bch-stealth/rpa": "workspace:^",
+    "@bch-stealth/rpa-scan": "workspace:^",
+    "@bch-stealth/pool-state": "workspace:^",
+    "@bch-stealth/pool-shards": "workspace:^",
+    "@bch-stealth/pool-hash-fold": "workspace:^",
+    "@bch-stealth/tx-builder": "workspace:^",
     "@noble/curves": "^2.0.0",
     "commander": "^12.0.0"
   },

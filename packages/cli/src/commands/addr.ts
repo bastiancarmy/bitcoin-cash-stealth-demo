@@ -64,7 +64,8 @@ export function registerAddrCommand(
 
       // Wallet must exist (config-first; file override supported via your loadMeWallet)
       const me = await deps.loadMeWallet();
-      const paycode = generatePaycode(me.privBytes);
+      const paycodeKey = (me as any).scanPrivBytes ?? me.privBytes;
+      const paycode = generatePaycode(paycodeKey);
 
       // Network must be known (prefer config; fallback to wallet file)
       const network =

@@ -1,12 +1,15 @@
 // packages/cli/src/pool/stealth.ts
 //
 // Stealth derivation helpers for the CLI pool demo.
-// Mechanical extraction from packages/cli/src/index.ts (no behavior changes).
 
 import type { RpaContext, StealthUtxoRecord } from '@bch-stealth/pool-state';
 import type { WalletLike } from './context.js';
 
-import { RPA_MODE_STEALTH_P2PKH, deriveRpaLockIntent } from '@bch-stealth/rpa';
+import {
+  RPA_MODE_STEALTH_P2PKH,
+  deriveRpaLockIntent,
+  deriveSpendPub33FromScanPub33,
+} from '@bch-stealth/rpa'; // ok now that @bch-stealth/rpa re-exports rpa-derive
 import { bytesToHex } from '@bch-stealth/utils';
 
 /**
@@ -17,22 +20,27 @@ import { bytesToHex } from '@bch-stealth/utils';
  */
 export function deriveStealthP2pkhLock(args: {
   senderWallet: WalletLike;
-  receiverPaycodePub33: Uint8Array;
+  receiverPaycodePub33: Uint8Array; // interpreted as scan pubkey Q
   prevoutTxidHex: string;
   prevoutN: number;
   index: number;
 }): { intent: any; rpaContext: RpaContext } {
   const { senderWallet, receiverPaycodePub33, prevoutTxidHex, prevoutN, index } = args;
 
+  const receiverScanPub33 = receiverPaycodePub33;
+  const receiverSpendPub33 = deriveSpendPub33FromScanPub33(receiverScanPub33);
+
   const intent = deriveRpaLockIntent({
     mode: RPA_MODE_STEALTH_P2PKH,
     senderPrivBytes: senderWallet.privBytes,
-    receiverPub33: receiverPaycodePub33,
+    receiverScanPub33,
+    receiverSpendPub33,
     prevoutTxidHex,
     prevoutN,
     index,
   });
 
+  // IMPORTANT: use the pool-state RpaContext shape (not the rpa-derive one)
   const rpaContext: RpaContext = {
     senderPub33Hex: bytesToHex(senderWallet.pubBytes),
     prevoutHashHex: prevoutTxidHex,
@@ -47,14 +55,11 @@ export function deriveStealthP2pkhLock(args: {
  * Derive the two stealth outputs used by the demo:
  * - index 0: payment to receiver
  * - index 1: change back to sender
- *
- * Returns child hash160 + RPA context for each output.
- * Script construction remains at the call site (keeps this module policy-light).
  */
 export function deriveStealthOutputsForPaymentAndChange(args: {
   senderWallet: WalletLike;
-  senderPaycodePub33: Uint8Array;
-  receiverPaycodePub33: Uint8Array;
+  senderPaycodePub33: Uint8Array; // scan pubkey Q for sender
+  receiverPaycodePub33: Uint8Array; // scan pubkey Q for receiver
   prevoutTxidHex: string;
   prevoutN: number;
 }): {
@@ -65,7 +70,7 @@ export function deriveStealthOutputsForPaymentAndChange(args: {
 
   const { intent: payIntent, rpaContext: payContext } = deriveStealthP2pkhLock({
     senderWallet,
-    receiverPaycodePub33: receiverPaycodePub33,
+    receiverPaycodePub33,
     prevoutTxidHex,
     prevoutN,
     index: 0,
@@ -85,10 +90,6 @@ export function deriveStealthOutputsForPaymentAndChange(args: {
   };
 }
 
-/**
- * Create a StealthUtxoRecord with the demo's current record shape.
- * Includes both `valueSats` and legacy `value` (string) for compatibility.
- */
 export function makeStealthUtxoRecord(args: {
   owner: string;
   purpose: string;

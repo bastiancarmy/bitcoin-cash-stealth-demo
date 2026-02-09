@@ -1,5 +1,6 @@
 // packages/cli/src/commands/pool.ts
 import type { Command } from 'commander';
+import fs from 'node:fs';
 
 import { POOL_STATE_STORE_KEY } from '@bch-stealth/pool-state';
 import { DUST } from '../config.js';
@@ -15,6 +16,27 @@ function getOrCreateSubcommand(program: Command, name: string, description: stri
   const existing = (program.commands ?? []).find((c) => c.name() === name);
   if (existing) return existing;
   return program.command(name).description(description);
+}
+
+function readJsonOrNull(p: string): any | null {
+  try {
+    if (!p) return null;
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function parseOutpointOrThrow(outpoint: string): { txid: string; vout: number } {
+  const [txidRaw, voutRaw] = String(outpoint).split(':');
+  const txid = String(txidRaw ?? '').trim();
+  const vout = Number(String(voutRaw ?? '0').trim());
+
+  if (!/^[0-9a-fA-F]{64}$/.test(txid)) throw new Error(`invalid outpoint txid (expected 64-hex): ${outpoint}`);
+  if (!Number.isFinite(vout) || vout < 0) throw new Error(`invalid outpoint vout: ${outpoint}`);
+
+  return { txid: txid.toLowerCase(), vout };
 }
 
 export function registerPoolCommands(
@@ -53,7 +75,10 @@ export function registerPoolCommands(
   pool
     .command('import')
     .description('Import a deposit UTXO into the pool.')
-    .argument('<outpoint>', 'deposit outpoint as txid:vout')
+    .argument('[outpoint]', 'deposit outpoint as txid:vout (optional if using --txid or --latest)')
+    .option('--txid <txid>', 'deposit txid (optional; pairs with --vout or defaults vout=0)', '')
+    .option('--vout <n>', 'deposit vout (default 0 if used with --txid)', '0')
+    .option('--latest', 'use the most recently-saved stealthUtxo from state file', false)
     .option('--shard <i>', 'shard index (default: derived)', '')
     .option('--fresh', 'force a new import even if already marked imported', false)
     .option(
@@ -63,18 +88,49 @@ export function registerPoolCommands(
     )
     .option('--deposit-wif <wif>', 'WIF for base P2PKH deposit key (optional).', '')
     .option('--deposit-privhex <hex>', 'Hex private key for base P2PKH deposit key (optional).', '')
-    .action(async (outpoint, opts) => {
+    .action(async (outpointArg, opts) => {
       deps.assertChipnet();
 
-      const [txidRaw, voutRaw] = String(outpoint).split(':');
-      const depositTxid = String(txidRaw ?? '').trim();
-      const depositVout = Number(String(voutRaw ?? '0').trim());
+      const { stateFile } = deps.getActivePaths();
 
-      if (!/^[0-9a-fA-F]{64}$/.test(depositTxid)) {
-        throw new Error(`invalid outpoint txid (expected 64-hex): ${outpoint}`);
-      }
-      if (!Number.isFinite(depositVout) || depositVout < 0) {
-        throw new Error(`invalid outpoint vout: ${outpoint}`);
+      let depositTxid = '';
+      let depositVout = 0;
+
+      // Priority:
+      // 1) explicit outpoint arg
+      // 2) --txid/--vout
+      // 3) --latest (from state)
+      if (outpointArg) {
+        const p = parseOutpointOrThrow(String(outpointArg));
+        depositTxid = p.txid;
+        depositVout = p.vout;
+      } else if (opts.txid && String(opts.txid).trim()) {
+        const txid = String(opts.txid).trim();
+        if (!/^[0-9a-fA-F]{64}$/.test(txid)) throw new Error(`invalid --txid (expected 64-hex): ${txid}`);
+        const vout = Number(String(opts.vout ?? '0').trim());
+        if (!Number.isFinite(vout) || vout < 0) throw new Error(`invalid --vout: ${String(opts.vout)}`);
+        depositTxid = txid.toLowerCase();
+        depositVout = vout;
+      } else if (opts.latest) {
+        const st = readJsonOrNull(stateFile) ?? {};
+        const utxos = Array.isArray(st.stealthUtxos) ? st.stealthUtxos : [];
+        if (utxos.length === 0) {
+          throw new Error(`pool import --latest: no stealthUtxos found in state file: ${stateFile}`);
+        }
+        const last = utxos[utxos.length - 1];
+        const txid = String(last.txid ?? last.txidHex ?? '').trim();
+        const vout = Number(last.vout ?? last.n ?? 0);
+        if (!/^[0-9a-fA-F]{64}$/.test(txid)) {
+          throw new Error(`pool import --latest: malformed txid in last stealthUtxo record`);
+        }
+        if (!Number.isFinite(vout) || vout < 0) {
+          throw new Error(`pool import --latest: malformed vout in last stealthUtxo record`);
+        }
+        depositTxid = txid.toLowerCase();
+        depositVout = vout;
+        console.log(`ℹ using latest stealthUtxo: ${depositTxid}:${depositVout}`);
+      } else {
+        throw new Error('pool import: provide <outpoint> or --txid (optionally --vout) or --latest');
       }
 
       const shardIndexOpt: number | null = opts.shard === '' ? null : Number(opts.shard);
@@ -101,8 +157,6 @@ export function registerPoolCommands(
         console.log('ℹ no import performed (no matching deposit found / already imported).');
         return;
       }
-
-      const { stateFile } = deps.getActivePaths();
 
       console.log(`import txid: ${res.txid}`);
       console.log(`shard: ${res.shardIndex}`);

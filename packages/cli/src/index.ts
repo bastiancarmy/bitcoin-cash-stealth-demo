@@ -57,6 +57,10 @@ import { runWithdraw } from './pool/ops/withdraw.js';
 import { resolveProfilePaths } from './paths.js';
 import { registerWalletCommands } from './commands/wallet.js';
 import { registerAddrCommand } from './commands/addr.js';
+import { registerGetCommands } from './commands/get.js';
+import { registerStatusCommand } from './commands/status.js';
+import { registerSendCommand } from './commands/send.js';
+import { registerScanCommand } from './commands/scan.js';
 
 // -------------------------------------------------------------------------------------
 // pool-hash-fold namespace
@@ -242,10 +246,22 @@ async function makePoolCtx(): Promise<PoolOpContext> {
 
 
 registerProfileCommands(program, { getActivePaths });
-
 registerWalletCommands(program, { getActivePaths });
-
+registerGetCommands(program, { getActivePaths });
+registerStatusCommand(program, { getActivePaths });
 registerAddrCommand(program, { getActivePaths, loadMeWallet });
+registerSendCommand(program, {
+  loadMeWallet,
+  getActivePaths,
+  getUtxos,
+});
+registerScanCommand(program, {
+  loadMeWallet,
+  getActivePaths: () => {
+    const p = getActivePaths(); // <-- whatever function already exists in index.ts
+    return { profile: p.profile, stateFile: p.stateFile };
+  },
+});
 
 // -------------------------------------------------------------------------------------
 // Pool namespace

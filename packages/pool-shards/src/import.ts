@@ -8,6 +8,7 @@ import {
   DEFAULT_CAP_BYTE,
   DEFAULT_CATEGORY_MODE,
   DEFAULT_POOL_HASH_FOLD_VERSION,
+  POOL_HASH_FOLD_VERSION,
   DUST_SATS,
   outpointHash32,
 } from './policy.js';
@@ -145,7 +146,7 @@ export function importDepositToShard(args: any) {
   });
 
   const shardUnlock = buildPoolHashFoldUnlockingBytecode({
-    version: DEFAULT_POOL_HASH_FOLD_VERSION,
+    version: POOL_HASH_FOLD_VERSION.V1_1,
     limbs,
     noteHash32,
     proofBlob32,

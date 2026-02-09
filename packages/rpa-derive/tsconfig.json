@@ -1,11 +1,12 @@
-// packages/rpa-derive/tsconfig.json
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "rootDir": "src",
     "outDir": "dist",
     "allowJs": false,
-    "checkJs": false
+    "checkJs": false,
+    "declaration": true,
+    "declarationMap": true
   },
   "include": ["src/**/*.ts"]
 }

@@ -1,17 +1,16 @@
+// packages/src/types.ts
+
 export type Hex = string;
 
 export type RpaMatch = {
   txid: Hex;
   vout: number;
-  valueSats?: bigint;
+  valueSats?: bigint; // keep bigint
   lockingBytecodeHex: Hex;
-
-  // the derived address the scanner believes this is for
   hash160Hex: Hex;
-
-  // optional extra metadata you may want to persist
   roleIndex?: number;
   note?: string;
+  // optionally: rpaContext/matchedInput
 };
 
 export type ScanRawTxForRpaOutputsParams = {

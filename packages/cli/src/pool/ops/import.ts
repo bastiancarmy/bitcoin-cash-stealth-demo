@@ -1,11 +1,10 @@
 // packages/cli/src/pool/ops/import.ts
-import type { DepositRecord, PoolState } from '@bch-stealth/pool-state';
+import type { DepositRecord, PoolState, StealthUtxoRecord } from '@bch-stealth/pool-state';
 import { ensurePoolStateDefaults, getLatestUnimportedDeposit, upsertDeposit } from '@bch-stealth/pool-state';
 
 import * as PoolShards from '@bch-stealth/pool-shards';
-import { bytesToHex, hexToBytes, concat, sha256, hash160, uint32le } from '@bch-stealth/utils';
+import { bytesToHex, hexToBytes, concat, sha256, uint32le } from '@bch-stealth/utils';
 import { deriveRpaOneTimePrivReceiver } from '@bch-stealth/rpa';
-import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 import type { PoolOpContext } from '../context.js';
 import { loadStateOrEmpty, saveState } from '../state.js';
@@ -13,6 +12,8 @@ import { toPoolShardsState, patchShardFromNextPoolState } from '../adapters.js';
 
 import { parsePrivKeyInput, decodeWifToPrivBytes, wifVersionHint } from '../wif.js';
 import { pubkeyHashFromPriv } from '../../utils.js';
+
+import { deriveSpendPriv32FromScanPriv32 } from '@bch-stealth/rpa-derive';
 
 function shouldDebug(): boolean {
   return (
@@ -94,6 +95,97 @@ function loudBaseImportWarning(args: { dep: DepositRecord; expectedH160Hex: stri
   );
 }
 
+function normalizeReceiverSpendPriv(args: {
+  scanPriv32: Uint8Array;
+  spendPriv32?: Uint8Array | null;
+}): { spendPriv32: Uint8Array; wasDerived: boolean; wasOverridden: boolean } {
+  const expected = deriveSpendPriv32FromScanPriv32(args.scanPriv32);
+
+  // missing/invalid => derive
+  if (!(args.spendPriv32 instanceof Uint8Array) || args.spendPriv32.length !== 32) {
+    return { spendPriv32: expected, wasDerived: true, wasOverridden: false };
+  }
+
+  // mismatch => override
+  const a = bytesToHex(args.spendPriv32).toLowerCase();
+  const b = bytesToHex(expected).toLowerCase();
+  if (a !== b) {
+    return { spendPriv32: expected, wasDerived: false, wasOverridden: true };
+  }
+
+  // ok
+  return { spendPriv32: args.spendPriv32, wasDerived: false, wasOverridden: false };
+}
+// --------------------------
+// Stealth record bridge helpers
+// --------------------------
+
+function outpointKey(txid: string, vout: number): string {
+  return `${String(txid).toLowerCase()}:${Number(vout)}`;
+}
+
+function readStealthUtxosFromAnyState(stateAny: any): StealthUtxoRecord[] {
+  // New envelope (preferred)
+  const a = stateAny?.data?.pool?.state?.stealthUtxos;
+  if (Array.isArray(a)) return a as StealthUtxoRecord[];
+
+  // Sometimes pool-state object itself might carry stealthUtxos
+  const c = stateAny?.pool?.state?.stealthUtxos ?? stateAny?.poolState?.stealthUtxos ?? stateAny?.stealthUtxos;
+  if (Array.isArray(c)) return c as StealthUtxoRecord[];
+
+  // Legacy top-level
+  const b = stateAny?.stealthUtxos;
+  if (Array.isArray(b)) return b as StealthUtxoRecord[];
+
+  return [];
+}
+
+function findStealthRecord(stateAny: any, txid: string, vout: number): StealthUtxoRecord | null {
+  const k = outpointKey(txid, vout);
+  for (const r of readStealthUtxosFromAnyState(stateAny)) {
+    const rt = (r as any)?.txid ?? (r as any)?.txidHex;
+    const rv = (r as any)?.vout ?? (r as any)?.n;
+    if (outpointKey(String(rt), Number(rv)) === k) return r as StealthUtxoRecord;
+  }
+  return null;
+}
+
+/**
+ * Attach rpaContext from the scan-recorded stealthUtxo (if present) onto the DepositRecord.
+ * This is the key bridge: pool import logic needs rpaContext to derive the one-time key.
+ */
+function attachRpaContextFromStealthIfMissing(args: {
+  stateAny: any;
+  dep: DepositRecord;
+}): { dep: DepositRecord; source: string } {
+  const depAny: any = args.dep as any;
+
+  // already has context
+  if (depAny?.rpaContext?.senderPub33Hex && (depAny?.rpaContext?.prevoutHashHex || depAny?.rpaContext?.prevoutTxidHex)) {
+    return { dep: args.dep, source: 'already_present' };
+  }
+
+  const rec = findStealthRecord(args.stateAny, args.dep.txid, args.dep.vout);
+  if (!rec) return { dep: args.dep, source: 'not_found' };
+
+  const ctx = (rec as any)?.rpaContext ?? (rec as any)?.matchedInput ?? null;
+  if (!ctx) return { dep: args.dep, source: 'record_missing_context' };
+
+  // Normalize into the fields importDepositToShardOnce expects
+  depAny.rpaContext = {
+    senderPub33Hex: (ctx as any).senderPub33Hex,
+    prevoutHashHex: (ctx as any).prevoutHashHex,
+    prevoutTxidHex: (ctx as any).prevoutTxidHex,
+    prevoutN: (ctx as any).prevoutN,
+    index: (ctx as any).index,
+  };
+
+  return {
+    dep: depAny as DepositRecord,
+    source: Array.isArray(args.stateAny?.data?.pool?.state?.stealthUtxos) ? 'envelope' : 'legacy_or_other',
+  };
+}
+
 async function importDepositToShardOnce(args: {
   ctx: PoolOpContext;
   poolState: PoolState;
@@ -111,9 +203,6 @@ async function importDepositToShardOnce(args: {
     throw new Error('State missing categoryHex/redeemScriptHex. Run init first or repair state.');
   }
 
-  // single-user: covenant signer is me
-  const covenantSignerWallet = ctx.me.wallet;
-
   const shard = st.shards[shardIndex];
   if (!shard) throw new Error(`invalid shardIndex ${shardIndex}`);
 
@@ -130,16 +219,37 @@ async function importDepositToShardOnce(args: {
 
   const rpaCtx = (depositOutpoint as any).rpaContext;
 
-  if (rpaCtx?.senderPub33Hex && rpaCtx?.prevoutHashHex) {
-    // RPA path: receiver is me (scan/spend keys derive one-time priv)
-    const senderPaycodePub33 = hexToBytes(rpaCtx.senderPub33Hex);
+  // ✅ Fix C: accept prevoutTxidHex OR prevoutHashHex for known stealth deposits
+  const hasRpa =
+    !!(rpaCtx?.senderPub33Hex && (rpaCtx?.prevoutHashHex || rpaCtx?.prevoutTxidHex) && rpaCtx?.prevoutN != null && rpaCtx?.index != null);
+
+  if (hasRpa) {
+    const senderPaycodePub33 = hexToBytes(String(rpaCtx.senderPub33Hex));
+
     const receiverWallet = ctx.me.wallet;
 
+    const scanPriv32 = receiverWallet.scanPrivBytes ?? receiverWallet.privBytes;
+    if (!(scanPriv32 instanceof Uint8Array) || scanPriv32.length !== 32) {
+      throw new Error('import: receiver scanPrivBytes must be 32 bytes');
+    }
+    
+    const norm = normalizeReceiverSpendPriv({
+      scanPriv32,
+      spendPriv32: receiverWallet.spendPrivBytes ?? null,
+    });
+    
+    if (shouldDebug()) {
+      if (norm.wasDerived) console.log('[import:debug] spendKey: derived (from scan key)');
+      if (norm.wasOverridden) console.log('[import:debug] spendKey: overridden (config mismatch; using derived)');
+    }
+    
+    const prevoutHashHex = (rpaCtx.prevoutHashHex ?? rpaCtx.prevoutTxidHex) as string;
+    
     const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
-      receiverWallet.scanPrivBytes ?? receiverWallet.privBytes,
-      receiverWallet.spendPrivBytes ?? receiverWallet.privBytes,
+      scanPriv32,
+      norm.spendPriv32,
       senderPaycodePub33,
-      rpaCtx.prevoutHashHex,
+      prevoutHashHex,
       rpaCtx.prevoutN,
       rpaCtx.index
     );
@@ -147,14 +257,13 @@ async function importDepositToShardOnce(args: {
     const { h160 } = pubkeyHashFromPriv(oneTimePriv);
     depositH160Hex = bytesToHex(h160);
 
-    if (depositH160Hex !== expectedH160Hex) {
+    if (depositH160Hex.toLowerCase() !== expectedH160Hex.toLowerCase()) {
       throw new Error(`deposit spend derivation mismatch. expected=${expectedH160Hex} derived=${depositH160Hex}`);
     }
 
     depositSignPrivBytes = oneTimePriv;
     depositKind = 'rpa';
   } else {
-    // BASE P2PKH path: spend with explicit key (or auto if matches my base address)
     depositKind = 'base_p2pkh';
     requireBaseImportUnlocks({ allowBaseFlag });
 
@@ -188,7 +297,7 @@ async function importDepositToShardOnce(args: {
       derivedH160Hex: depositH160Hex,
     });
 
-    if (depositH160Hex !== expectedH160Hex) {
+    if (depositH160Hex.toLowerCase() !== expectedH160Hex.toLowerCase()) {
       throw new Error(
         `Base deposit key mismatch.\n` +
           `deposit output expects h160=${expectedH160Hex}\n` +
@@ -221,8 +330,8 @@ async function importDepositToShardOnce(args: {
     shardPrevout,
     depositPrevout,
     covenantWallet: {
-      signPrivBytes: covenantSignerWallet.privBytes,
-      pubkeyHash160Hex: bytesToHex(covenantSignerWallet.hash160),
+      signPrivBytes: ctx.me.wallet.privBytes,
+      pubkeyHash160Hex: bytesToHex(ctx.me.wallet.hash160),
     },
     depositWallet: {
       signPrivBytes: depositSignPrivBytes,
@@ -244,6 +353,10 @@ async function importDepositToShardOnce(args: {
 
   return { txid, built, depositKind, expectedH160Hex };
 }
+
+// --------------------------
+// Your updated runImport (validated + tiny narrowing improvement)
+// --------------------------
 
 export async function runImport(
   ctx: PoolOpContext,
@@ -274,6 +387,8 @@ export async function runImport(
 
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
   const st = ensurePoolStateDefaults(st0);
+
+  // ensure arrays exist on the pool-state object
   st.deposits ??= [];
   st.withdrawals ??= [];
   st.stealthUtxos ??= [];
@@ -290,7 +405,8 @@ export async function runImport(
     const h160 = parseP2pkhHash160(prev.scriptPubKey);
     if (!h160) throw new Error(`override deposit outpoint is not P2PKH: ${txid}:${vout}`);
 
-    dep = {
+    // ✅ non-null local, so TS is happy
+    const depOverride: DepositRecord = {
       txid,
       vout,
       valueSats: String(prev.value),
@@ -298,33 +414,60 @@ export async function runImport(
       receiverRpaHash160Hex: bytesToHex(h160),
       createdAt: new Date().toISOString(),
     } as any;
+
+    const attached = attachRpaContextFromStealthIfMissing({
+      stateAny: st0 as any,
+      dep: depOverride,
+    });
+
+    dep = attached.dep;
+
+    if (shouldDebug()) {
+      console.log(`[import:debug] override deposit: rpaContext source=${attached.source}`);
+    }
   } else {
-    dep =
+    // ✅ make nullability explicit so TS knows we don't pass null into attachRpaContext...
+    const dep0: DepositRecord | null =
       ((st as any).lastDeposit && !(st as any).lastDeposit.importTxid ? (st as any).lastDeposit : null) ??
       getLatestUnimportedDeposit(st, null);
+
+    if (!dep0) return null;
+
+    const attached = attachRpaContextFromStealthIfMissing({
+      stateAny: st0 as any,
+      dep: dep0,
+    });
+    dep = attached.dep;
+
+    if (shouldDebug()) {
+      console.log(`[import:debug] selected deposit: rpaContext source=${attached.source}`);
+    }
   }
 
   if (!dep) return null;
 
-  if (!fresh && (dep as any).importTxid) {
-    return { txid: (dep as any).importTxid, shardIndex: (dep as any).importedIntoShard! };
+  // ✅ narrow once for the rest of the function (prevents any lingering nullable inference)
+  const depFinal: DepositRecord = dep;
+
+  if (!fresh && (depFinal as any).importTxid) {
+    return { txid: (depFinal as any).importTxid, shardIndex: (depFinal as any).importedIntoShard! };
   }
 
   let stillUnspent = await ctx.chainIO.isP2pkhOutpointUnspent({
-    txid: dep.txid,
-    vout: dep.vout,
-    hash160Hex: (dep as any).receiverRpaHash160Hex,
+    txid: depFinal.txid,
+    vout: depFinal.vout,
+    hash160Hex: (depFinal as any).receiverRpaHash160Hex,
   });
 
   if (!stillUnspent) {
     stillUnspent = await ctx.chainIO.waitForP2pkhOutpointUnspent(
-      { txid: dep.txid, vout: dep.vout, hash160Hex: (dep as any).receiverRpaHash160Hex },
+      { txid: depFinal.txid, vout: depFinal.vout, hash160Hex: (depFinal as any).receiverRpaHash160Hex },
       { attempts: 12, delayMs: 750 }
     );
   }
 
   const shardCount = st.shards.length;
-  const noteHash = outpointHash32(dep.txid, dep.vout);
+  const noteHash = outpointHash32(depFinal.txid, depFinal.vout);
   const derivedIndex = noteHash[0] % shardCount;
 
   const shardIndex =
@@ -343,6 +486,7 @@ export async function runImport(
     } catch {}
   }
 
+  // If BCH_STEALTH_CATEGORY_MODE is set, use it. Otherwise, attempt default then two compatibility modes.
   const forcedMode = normalizeMode(process.env.BCH_STEALTH_CATEGORY_MODE);
   const modeCandidatesRaw: (string | null)[] = forcedMode ? [forcedMode] : [null, 'reverse', 'raw'];
 
@@ -359,22 +503,30 @@ export async function runImport(
   for (const mode of modeCandidates) {
     try {
       if (shouldDebug()) {
-        console.log(`\n[import:debug] attempting import with categoryMode=${mode ?? '<default>'}`);
+        const rc: any = (depFinal as any)?.rpaContext;
+        const hasRpa = !!(rc?.senderPub33Hex && (rc?.prevoutHashHex || rc?.prevoutTxidHex));
+        console.log(
+          `\n[import:debug] attempting import with categoryMode=${mode ?? '<default>'} rpaCtx=${hasRpa ? 'yes' : 'no'}`
+        );
+        if (!hasRpa) {
+          const rec = findStealthRecord(st0 as any, depFinal.txid, depFinal.vout);
+          console.log(`[import:debug] stealthUtxos match: ${rec ? 'yes' : 'no'}`);
+        }
       }
 
       const res = await importDepositToShardOnce({
         ctx,
         poolState: st,
         shardIndex,
-        depositOutpoint: dep,
+        depositOutpoint: depFinal,
         categoryMode: mode,
         baseDepositPrivBytes: basePrivBytes,
         allowBaseFlag: allowBase,
       });
 
-      // Persist deposit record in MY store so reruns are deterministic.
+      // Persist deposit record so reruns are deterministic.
       upsertDeposit(st, {
-        ...dep,
+        ...depFinal,
         importedIntoShard: shardIndex,
         importTxid: res.txid,
         depositKind: res.depositKind,

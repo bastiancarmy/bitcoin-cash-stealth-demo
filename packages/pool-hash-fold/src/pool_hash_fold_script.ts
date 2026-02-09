@@ -3,15 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { bytesToHex } from '@bch-stealth/utils';
+import { bytesToHex, POOL_HASH_FOLD_VERSION, type PoolHashFoldVersion } from '@bch-stealth/utils';
 
-export const POOL_HASH_FOLD_VERSION = {
-  V0: 'v0',
-  V1: 'v1',
-  V1_1: 'v1_1',
-} as const;
-
-export type PoolHashFoldVersion = (typeof POOL_HASH_FOLD_VERSION)[keyof typeof POOL_HASH_FOLD_VERSION];
+export { POOL_HASH_FOLD_VERSION, type PoolHashFoldVersion };
 
 async function getLibauth() {
   return import('@bitauth/libauth');

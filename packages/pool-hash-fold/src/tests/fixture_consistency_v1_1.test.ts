@@ -5,7 +5,71 @@ import stateOutFixtures from '../fixtures/stateout32.v1_1.json' with { type: 'js
 import importSnaps from '../fixtures/import_snapshots.v1_1.json' with { type: 'json' };
 
 import { hexToBytes, bytesToHex } from '@bch-stealth/utils';
-import { parseScriptPushes } from '@bch-stealth/pool-shards';
+
+function parseScriptPushes(script: Uint8Array): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  let i = 0;
+
+  const read = (n: number) => {
+    if (i + n > script.length) throw new Error('parseScriptPushes: truncated push');
+    const v = script.slice(i, i + n);
+    i += n;
+    return v;
+  };
+
+  while (i < script.length) {
+    const op = script[i++];
+
+    // OP_0 (push empty vector)
+    if (op === 0x00) {
+      out.push(new Uint8Array());
+      continue;
+    }
+
+    // direct push 0x01..0x4b
+    if (op >= 0x01 && op <= 0x4b) {
+      const n = op;
+      out.push(read(n));
+      continue;
+    }
+
+    // OP_PUSHDATA1
+    if (op === 0x4c) {
+      if (i >= script.length) throw new Error('parseScriptPushes: truncated PUSHDATA1');
+      const n = script[i++];
+      out.push(read(n));
+      continue;
+    }
+
+    // OP_PUSHDATA2
+    if (op === 0x4d) {
+      if (i + 1 >= script.length) throw new Error('parseScriptPushes: truncated PUSHDATA2');
+      const n = script[i] | (script[i + 1] << 8);
+      i += 2;
+      out.push(read(n));
+      continue;
+    }
+
+    // OP_PUSHDATA4
+    if (op === 0x4e) {
+      if (i + 3 >= script.length) throw new Error('parseScriptPushes: truncated PUSHDATA4');
+      const n =
+        (script[i] |
+          (script[i + 1] << 8) |
+          (script[i + 2] << 16) |
+          (script[i + 3] << 24)) >>> 0;
+      i += 4;
+      out.push(read(n));
+      continue;
+    }
+
+    // If you ever need to support non-push opcodes, expand this.
+    // For covenant unlocking bytecode, we expect pure pushes.
+    throw new Error(`parseScriptPushes: non-push opcode 0x${op.toString(16)}`);
+  }
+
+  return out;
+}
 
 type StateOutFixture = {
   name: string;
@@ -70,8 +134,8 @@ test('fixtures: v1.1 import snapshots are consistent with stateOut32 fixtures', 
 
     // (1) noteHash32Hex equals pushes[0] from parsing vin[0].scriptSig.hex
     const scriptSigBytes = hexToBytes(snap.covenantVinScriptSigHex);
-    const { pushes } = parseScriptPushes(scriptSigBytes);
-
+    const pushes = parseScriptPushes(scriptSigBytes);
+    
     assert.equal(
       pushes.length,
       2,

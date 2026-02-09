@@ -16,10 +16,18 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "clean": "rm -rf dist",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "yarn build && node --test ./dist/tests"
+  },
+  "dependencies": {
+    "@bch-stealth/rpa-derive": "workspace:^",
+    "@bch-stealth/utils": "workspace:^"
   },
   "devDependencies": {
+    "@noble/curves": "^2.0.0",
+    "@noble/hashes": "^2.0.0",
+    "@types/node": "^25.0.3",
     "typescript": "^5.9.3"
   }
 }

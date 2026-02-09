@@ -1,18 +1,16 @@
 // packages/cli/src/wallet/init.ts
 import { bytesToHex, sha256, ensureEvenYPriv } from '@bch-stealth/utils';
 import type { Command } from 'commander';
+import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 import type * as ElectrumNS from '@bch-stealth/electrum';
 
 import { NETWORK } from '../config.js';
 import { readConfig, writeConfig, ensureConfigDefaults, upsertProfile } from '../config_store.js';
-import {
-  getWalletFromConfig,
-  generateMnemonicV1,
-  walletJsonFromMnemonic,
-} from '../wallets.js';
+import { getWalletFromConfig, generateMnemonicV1, walletJsonFromMnemonic } from '../wallets.js';
 import { generatePaycode } from '../paycodes.js';
 import { estimateBirthdayHeightFromAddress } from './birthday.js';
+import { deriveSpendPriv32FromScanPriv32 } from '@bch-stealth/rpa-derive';
 
 export type GetActivePaths = () => {
   configFile: string;
@@ -21,6 +19,68 @@ export type GetActivePaths = () => {
   logFile: string;
   walletFile: string;
 };
+
+function safePub33FromPriv32(priv32?: Uint8Array): Uint8Array | null {
+  if (!(priv32 instanceof Uint8Array) || priv32.length !== 32) return null;
+  return secp256k1.getPublicKey(priv32, true);
+}
+
+function printWalletInitSummary(args: {
+  profile: string;
+  configFile: string;
+  stateFile: string;
+  logFile: string;
+  network: string;
+  birthdayHeight: number;
+  address: string;
+  paycode: string;
+  all?: boolean;
+
+  basePub33?: Uint8Array;
+  baseH160Hex?: string;
+
+  scanPub33?: Uint8Array | null;
+  spendPub33?: Uint8Array | null;
+
+  note?: string | null;
+}) {
+  const {
+    profile,
+    configFile,
+    stateFile,
+    logFile,
+    network,
+    birthdayHeight,
+    address,
+    paycode,
+    all,
+    basePub33,
+    baseH160Hex,
+    scanPub33,
+    spendPub33,
+    note,
+  } = args;
+
+  console.log(`profile:        ${profile}`);
+  console.log(`config file:    ${configFile}`);
+  console.log(`state file:     ${stateFile}`);
+  console.log(`log file:       ${logFile}`);
+  console.log(`network:        ${network}`);
+  console.log(`birthdayHeight: ${birthdayHeight}`);
+  console.log(`address:        ${address}`);
+  console.log(`paycode:        ${paycode}`);
+
+  if (all) {
+    if (basePub33) console.log(`base.pub33Hex:  ${bytesToHex(basePub33)}`);
+    if (baseH160Hex) console.log(`base.hash160:   ${baseH160Hex}`);
+    if (scanPub33) console.log(`scan.pub33Hex:  ${bytesToHex(scanPub33)}`);
+    if (spendPub33) console.log(`spend.pub33Hex: ${bytesToHex(spendPub33)}`);
+  } else {
+    console.log(`\nℹ Tip: run "bchctl --profile ${profile} wallet show --all" to view pubkeys/hash160.\n`);
+  }
+
+  if (note) console.log(note);
+}
 
 export function registerWalletInit(
   wallet: Command,
@@ -36,6 +96,7 @@ export function registerWalletInit(
     .option('--chipnet', 'set wallet network to chipnet', false)
     .option('--mainnet', 'set wallet network to mainnet', false)
     .option('--force', 'overwrite existing wallet in config', false)
+    .option('--all', 'also print pubkeys/hash160 (hex identifiers)', false)
     .action(async (opts) => {
       const { configFile, profile, stateFile, logFile } = getActivePaths();
 
@@ -49,8 +110,8 @@ export function registerWalletInit(
         String(NETWORK ?? '').trim() || 'chipnet';
 
       const force = !!opts.force;
+      const all = !!opts.all;
 
-      // If flag provided, validate. If omitted, we can estimate later.
       const birthdayFlagProvided = opts.birthdayHeight != null && String(opts.birthdayHeight).trim() !== '';
       const birthdayHeight = birthdayFlagProvided ? Number(String(opts.birthdayHeight).trim()) : NaN;
 
@@ -68,10 +129,8 @@ export function registerWalletInit(
       const walletLooksComplete =
         !!existingWallet &&
         (
-          // mnemonic implies initialized
           (typeof (existingWallet as any).mnemonic === 'string' &&
             String((existingWallet as any).mnemonic).trim().length > 0) ||
-          // or scan/spend + birthday implies initialized
           (typeof (existingWallet as any).scanPrivHex === 'string' &&
             typeof (existingWallet as any).spendPrivHex === 'string' &&
             typeof prof0?.birthdayHeight === 'number')
@@ -83,14 +142,13 @@ export function registerWalletInit(
         typeof (existingWallet as any).privHex === 'string' &&
         String((existingWallet as any).privHex).trim().length > 0;
 
-      // If user is forcing, warn (we may overwrite keys in create/overwrite mode).
       if (existingWallet && force) {
         console.error(`warning: overwriting existing wallet in config: ${configFile} (profile=${profile})`);
       }
 
-      // -------------------------
-      // Existing wallet (complete): refresh birthdayHeight (metadata-only) without changing keys
-      // -------------------------
+      // ------------------------------------------------------------
+      // Case A: Existing complete wallet, refresh birthday metadata only
+      // ------------------------------------------------------------
       if (existingWallet && walletLooksComplete && !force) {
         const hasBirthdayInConfig =
           typeof prof0?.birthdayHeight === 'number' && Number.isFinite(prof0.birthdayHeight);
@@ -100,7 +158,6 @@ export function registerWalletInit(
         if (birthdayFlagProvided) {
           finalBirthday = birthdayHeight;
         } else if (!hasBirthdayInConfig || prof0.birthdayHeight === 0) {
-          // Auto-estimate if missing/0 and user didn't provide a birthday
           try {
             const me0 = getWalletFromConfig({ configFile, profile });
             const addr = me0?.address;
@@ -116,25 +173,43 @@ export function registerWalletInit(
             finalBirthday = 0;
           }
         } else {
-          // Nothing to do; keep existing birthday
           finalBirthday = prof0.birthdayHeight as number;
         }
 
-        // If nothing changed, be explicit and exit cleanly
         if (hasBirthdayInConfig && prof0.birthdayHeight === finalBirthday) {
-          console.log(`profile:         ${profile}`);
-          console.log(`config file:     ${configFile}`);
-          console.log(`network:         ${String(prof0?.network ?? network)}`);
-          console.log(`birthdayHeight:  ${finalBirthday}`);
-          console.log(`ℹ wallet already initialized; birthdayHeight unchanged`);
+          const me = getWalletFromConfig({ configFile, profile });
+          if (!me) throw new Error(`[wallets] failed to load wallet from config (profile=${profile})`);
+
+          const paycodeKey = (me as any).scanPrivBytes ?? me.privBytes;
+          const paycode = generatePaycode(paycodeKey);
+          const scanPub33 = safePub33FromPriv32(me.scanPrivBytes);
+          const spendPriv32 =
+            me.spendPrivBytes ?? (me.scanPrivBytes ? deriveSpendPriv32FromScanPriv32(me.scanPrivBytes) : undefined);
+          const spendPub33 = safePub33FromPriv32(spendPriv32);
+
+          printWalletInitSummary({
+            profile,
+            configFile,
+            stateFile,
+            logFile,
+            network: String(prof0?.network ?? network),
+            birthdayHeight: finalBirthday,
+            address: me.address,
+            paycode,
+            all,
+            basePub33: me.pubBytes,
+            baseH160Hex: bytesToHex(me.hash160),
+            scanPub33,
+            spendPub33,
+            note: `ℹ wallet already initialized; birthdayHeight unchanged`,
+          });
           return;
         }
 
         const cfg1 = upsertProfile(cfg0, profile, {
-          // keep whatever network is already in config if present, otherwise use resolved network
           network: String(prof0?.network ?? network),
           birthdayHeight: finalBirthday,
-          wallet: existingWallet, // IMPORTANT: preserve keys
+          wallet: existingWallet,
         });
 
         cfg1.currentProfile = profile;
@@ -143,25 +218,35 @@ export function registerWalletInit(
         const me = getWalletFromConfig({ configFile, profile });
         if (!me) throw new Error(`[wallets] failed to load wallet from config after birthday refresh (profile=${profile})`);
 
-        const paycode = generatePaycode(me.privBytes);
+        const paycodeKey = (me as any).scanPrivBytes ?? me.privBytes;
+        const paycode = generatePaycode(paycodeKey);
+        const scanPub33 = safePub33FromPriv32(me.scanPrivBytes);
+        const spendPriv32 =
+          me.spendPrivBytes ?? (me.scanPrivBytes ? deriveSpendPriv32FromScanPriv32(me.scanPrivBytes) : undefined);
+        const spendPub33 = safePub33FromPriv32(spendPriv32);
 
-        console.log(`profile:         ${profile}`);
-        console.log(`config file:     ${configFile}`);
-        console.log(`state file:      ${stateFile}`);
-        console.log(`log file:        ${logFile}`);
-        console.log(`network:         ${String(prof0?.network ?? network)}`);
-        console.log(`birthdayHeight:  ${finalBirthday}`);
-        console.log(`base (P2PKH):    ${me.address}`);
-        console.log(`paycode:         ${paycode}`);
-        console.log(`pubkey33:        ${bytesToHex(me.pubBytes)}`);
-
-        console.log(`\nℹ refreshed birthdayHeight (keys preserved)\n`);
+        printWalletInitSummary({
+          profile,
+          configFile,
+          stateFile,
+          logFile,
+          network: String(prof0?.network ?? network),
+          birthdayHeight: finalBirthday,
+          address: me.address,
+          paycode,
+          all,
+          basePub33: me.pubBytes,
+          baseH160Hex: bytesToHex(me.hash160),
+          scanPub33,
+          spendPub33,
+          note: `\nℹ refreshed birthdayHeight (keys preserved)\n`,
+        });
         return;
       }
 
-      // -------------------------
-      // Hydration mode (wallet exists but missing scan/spend/birthday, etc.)
-      // -------------------------
+      // ------------------------------------------------------------
+      // Case B: Hydration mode (old wallet format)
+      // ------------------------------------------------------------
       if (walletNeedsHydration && !force) {
         const privHex = String((existingWallet as any).privHex).trim();
 
@@ -186,7 +271,6 @@ export function registerWalletInit(
         } else if (typeof prof0?.birthdayHeight === 'number' && Number.isFinite(prof0.birthdayHeight)) {
           finalBirthday = prof0.birthdayHeight;
         } else {
-          // estimate from address history (best effort)
           try {
             const me0 = getWalletFromConfig({ configFile, profile });
             const addr = me0?.address;
@@ -215,29 +299,36 @@ export function registerWalletInit(
         const me = getWalletFromConfig({ configFile, profile });
         if (!me) throw new Error(`[wallets] failed to load wallet from config after hydrate (profile=${profile})`);
 
-        const paycode = generatePaycode(me.privBytes);
+        const paycodeKey = (me as any).scanPrivBytes ?? me.privBytes;
+        const paycode = generatePaycode(paycodeKey);
+        const scanPub33 = safePub33FromPriv32(me.scanPrivBytes);
+        const spendPriv32 =
+          me.spendPrivBytes ?? (me.scanPrivBytes ? deriveSpendPriv32FromScanPriv32(me.scanPrivBytes) : undefined);
+        const spendPub33 = safePub33FromPriv32(spendPriv32);
 
-        console.log(`profile:         ${profile}`);
-        console.log(`config file:     ${configFile}`);
-        console.log(`state file:      ${stateFile}`);
-        console.log(`log file:        ${logFile}`);
-        console.log(`network:         ${network}`);
-        console.log(`birthdayHeight:  ${finalBirthday}`);
-        console.log(`base (P2PKH):    ${me.address}`);
-        console.log(`paycode:         ${paycode}`);
-        console.log(`pubkey33:        ${bytesToHex(me.pubBytes)}`);
-        console.log(`\nℹ hydrated existing wallet in config (no overwrite)\n`);
+        printWalletInitSummary({
+          profile,
+          configFile,
+          stateFile,
+          logFile,
+          network,
+          birthdayHeight: finalBirthday,
+          address: me.address,
+          paycode,
+          all,
+          basePub33: me.pubBytes,
+          baseH160Hex: bytesToHex(me.hash160),
+          scanPub33,
+          spendPub33,
+          note: `\nℹ hydrated existing wallet in config (no overwrite)\n`,
+        });
         return;
       }
 
-      // -------------------------
-      // Create / overwrite mode
-      // -------------------------
+      // ------------------------------------------------------------
+      // Case C: Create / overwrite mode
+      // ------------------------------------------------------------
       if (existingWallet && !force && !walletNeedsHydration) {
-        // This is the only remaining path where a wallet exists but:
-        // - it's NOT complete (walletLooksComplete=false)
-        // - and it does NOT qualify for hydration (walletNeedsHydration=false)
-        // Safer to stop than overwrite unexpectedly.
         throw new Error(
           `[wallets] wallet exists but is not in a recognized format: ${configFile} (profile=${profile})\n` +
             `Re-run with --force to overwrite.`
@@ -271,18 +362,28 @@ export function registerWalletInit(
       const me = getWalletFromConfig({ configFile, profile });
       if (!me) throw new Error(`[wallets] failed to load wallet from config after write (profile=${profile})`);
 
-      const paycode = generatePaycode(me.privBytes);
+      const paycodeKey = (me as any).scanPrivBytes ?? me.privBytes;
+      const paycode = generatePaycode(paycodeKey);
+      const scanPub33 = safePub33FromPriv32(me.scanPrivBytes);
+      const spendPriv32 =
+        me.spendPrivBytes ?? (me.scanPrivBytes ? deriveSpendPriv32FromScanPriv32(me.scanPrivBytes) : undefined);
+      const spendPub33 = safePub33FromPriv32(spendPriv32);
 
-      console.log(`profile:         ${profile}`);
-      console.log(`config file:     ${configFile}`);
-      console.log(`state file:      ${stateFile}`);
-      console.log(`log file:        ${logFile}`);
-      console.log(`network:         ${network}`);
-      console.log(`birthdayHeight:  ${birthdayFlagProvided ? birthdayHeight : 0}`);
-      console.log(`base (P2PKH):    ${me.address}`);
-      console.log(`paycode:         ${paycode}`);
-      console.log(`pubkey33:        ${bytesToHex(me.pubBytes)}`);
-
-      console.log(`\n⚠️  save this mnemonic (unencrypted for now):\n${mnemonic}\n`);
+      printWalletInitSummary({
+        profile,
+        configFile,
+        stateFile,
+        logFile,
+        network,
+        birthdayHeight: birthdayFlagProvided ? birthdayHeight : 0,
+        address: me.address,
+        paycode,
+        all,
+        basePub33: me.pubBytes,
+        baseH160Hex: bytesToHex(me.hash160),
+        scanPub33,
+        spendPub33,
+        note: `\n⚠️  save this mnemonic (unencrypted for now):\n${mnemonic}\n`,
+      });
     });
 }

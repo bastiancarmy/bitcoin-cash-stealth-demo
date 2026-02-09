@@ -17,8 +17,8 @@ import type { WalletLike } from './context.js';
 
 import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
 import { deriveRpaOneTimePrivReceiver } from '@bch-stealth/rpa';
-import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { pubkeyHashFromPriv } from '../utils.js';
+import { deriveSpendPriv32FromScanPriv32 } from '@bch-stealth/rpa-derive';
 
 /**
  * Create an empty PoolState shell.
@@ -263,7 +263,7 @@ export async function selectFundingUtxo(args: {
 
       const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
         wallet.scanPrivBytes ?? wallet.privBytes,
-        wallet.spendPrivBytes ?? wallet.privBytes,
+        wallet.spendPrivBytes ?? deriveSpendPriv32FromScanPriv32(wallet.scanPrivBytes ?? wallet.privBytes),
         hexToBytes(r.rpaContext.senderPub33Hex),
         r.rpaContext.prevoutHashHex,
         r.rpaContext.prevoutN,

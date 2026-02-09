@@ -1,3 +1,5 @@
+// packages/src/scanChainWindow.ts
+
 import type { RpaMatch, ScanChainWindowParams } from "./types.js";
 import { scanRawTxForRpaOutputs } from "./scanRawTxForRpaOutputs.js";
 

@@ -3,7 +3,7 @@ import type { BuilderDeps } from './di.js';
 
 import { bytesToHex, concat, hexToBytes, sha256, uint32le } from '@bch-stealth/utils';
 
-import { DEFAULT_CAP_BYTE, DEFAULT_CATEGORY_MODE, DEFAULT_POOL_HASH_FOLD_VERSION, DUST_SATS } from './policy.js';
+import { DEFAULT_CAP_BYTE, DEFAULT_CATEGORY_MODE, DEFAULT_POOL_HASH_FOLD_VERSION, DUST_SATS, POOL_HASH_FOLD_VERSION } from './policy.js';
 import { computePoolStateOut, buildPoolHashFoldUnlockingBytecode } from '@bch-stealth/pool-hash-fold';
 
 import type { PoolState, WithdrawDiagnostics } from './types.js';
@@ -155,7 +155,7 @@ export function withdrawFromShard(args: any) {
   });
 
   const shardUnlock = buildPoolHashFoldUnlockingBytecode({
-    version: DEFAULT_POOL_HASH_FOLD_VERSION,
+    version: POOL_HASH_FOLD_VERSION.V1_1,
     limbs,
     noteHash32: nullifier32,
     proofBlob32,
