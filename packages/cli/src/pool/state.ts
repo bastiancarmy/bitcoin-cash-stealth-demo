@@ -1,25 +1,15 @@
 // packages/cli/src/pool/state.ts
 
-import type {
-  PoolState,
-  StealthUtxoRecord,
-  FileBackedPoolStateStore,
-} from '@bch-stealth/pool-state';
+import type { PoolState, StealthUtxoRecord, FileBackedPoolStateStore } from '@bch-stealth/pool-state';
 
-import {
-  ensurePoolStateDefaults,
-  markStealthSpent,
-  readPoolState,
-  writePoolState,
-} from '@bch-stealth/pool-state';
+import { ensurePoolStateDefaults, markStealthSpent, readPoolState, writePoolState } from '@bch-stealth/pool-state';
 
 import type { WalletLike } from './context.js';
 
-import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
+import { bytesToHex, hexToBytes } from '@bch-stealth/utils';
 import { deriveRpaOneTimePrivReceiver } from '@bch-stealth/rpa';
 import { pubkeyHashFromPriv } from '../utils.js';
-import { deriveSpendPriv32FromScanPriv32 } from '@bch-stealth/rpa-derive';
-
+import { normalizeWalletKeys, debugPrintKeyFlags } from '../wallet/normalizeKeys.js';
 /**
  * Create an empty PoolState shell.
  * Keep callable with no args for backwards-compat with older CLI call sites.
@@ -95,32 +85,29 @@ function errToString(e: unknown): string {
   }
 }
 
+// PATCH: selectFundingUtxo()
+// - Stealth: skip locally-marked spent records (spent/spentAt/spentByTxid/spentInTxid) BEFORE any chain calls.
+//           when we detect on-chain spent, mark locally using a backward/forward-compatible marker set.
+// - Base: don’t assume getUtxos is perfectly fresh. Iterate candidates (largest-first) and:
+//         fetch prevout, derive hash160, call isP2pkhOutpointUnspent, and skip/record stale if spent.
+//         (So both “base” and “stealth” paths treat “spent” deterministically.)
+
 export async function selectFundingUtxo(args: {
   mode: 'wallet-send' | 'pool-op';
-  prefer?: Array<'base' | 'stealth'>; // default ['base','stealth']
+  prefer?: Array<'base' | 'stealth'>;
   minConfirmations?: number;
   includeUnconfirmed?: boolean;
-
-  // side effects must be explicit
-  markStaleStealthRecords?: boolean; // default false
-
-  // token safety
-  allowTokens?: boolean; // default false
-
+  markStaleStealthRecords?: boolean;
+  allowTokens?: boolean;
   state?: PoolState | null;
   wallet: WalletLike;
   ownerTag: string;
   minSats?: bigint;
-
   chainIO: {
     isP2pkhOutpointUnspent: (o: { txid: string; vout: number; hash160Hex: string }) => Promise<boolean>;
     getPrevOutput: (txid: string, vout: number) => Promise<any>;
-    // optional, only used if provided
     getTipHeight?: () => Promise<number>;
   };
-
-  // Keep this as unknown/any-ish because callers are inconsistent today.
-  // We'll probe signatures safely.
   getUtxos: (...a: any[]) => Promise<any[]>;
   network: string;
   dustSats: bigint;
@@ -135,12 +122,10 @@ export async function selectFundingUtxo(args: {
 }> {
   const {
     mode,
-    prefer = ['base', 'stealth'],
     minConfirmations = 0,
     includeUnconfirmed = true,
     markStaleStealthRecords = false,
     allowTokens = false,
-
     state,
     wallet,
     ownerTag,
@@ -149,6 +134,14 @@ export async function selectFundingUtxo(args: {
     getUtxos,
     network,
   } = args;
+
+  const preferEnv = String(process.env.BCH_STEALTH_FUNDING_PREFER ?? '').trim().toLowerCase();
+  const prefer =
+    preferEnv === 'stealth-first'
+      ? (['stealth', 'base'] as const)
+      : preferEnv === 'base-first'
+        ? (['base', 'stealth'] as const)
+        : (args.prefer ?? (['base', 'stealth'] as const));
 
   const dbg = process.env.BCH_STEALTH_DEBUG_FUNDING === '1';
   const stale: Array<{ source: 'stealth' | 'base'; txid: string; vout: number; reason: string }> = [];
@@ -205,7 +198,35 @@ export async function selectFundingUtxo(args: {
     return best;
   }
 
-  // --- stealth selection (skips entirely if state missing) ---
+  // --- NEW: local spent markers (forward/backward compatible) ---
+  function isLocallySpentStealth(r: any): boolean {
+    // old marker: spentInTxid
+    // new markers: spent=true, spentByTxid, spentAt
+    return Boolean(
+      r?.spent === true ||
+        (typeof r?.spentInTxid === 'string' && r.spentInTxid.trim()) ||
+        (typeof r?.spentByTxid === 'string' && r.spentByTxid.trim()) ||
+        (typeof r?.spentAt === 'string' && r.spentAt.trim())
+    );
+  }
+
+  function markStealthSpentCompat(st: any, txid: string, vout: number, spentByTxid: string) {
+    const recs = st?.stealthUtxos ?? [];
+    for (const r of recs) {
+      if (!r) continue;
+      if (String(r.txid) === String(txid) && Number(r.vout) === Number(vout)) {
+        // keep both old + new marker styles
+        (r as any).spent = true;
+        (r as any).spentAt = new Date().toISOString();
+        (r as any).spentByTxid = String(spentByTxid);
+        (r as any).spentInTxid = String(spentByTxid); // backward compat
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // --- stealth selection ---
   async function tryStealth(): Promise<{
     txid: string;
     vout: number;
@@ -221,62 +242,123 @@ export async function selectFundingUtxo(args: {
 
     const st = ensurePoolStateDefaults(state);
 
+    // ✅ Canonical normalization (single source of truth)
+    let nk: ReturnType<typeof normalizeWalletKeys> | null = null;
+    try {
+      nk = normalizeWalletKeys(wallet);
+    } catch {
+      dlog({ mode, stage: 'stealth', skipped: true, reason: 'missing/invalid wallet keys' });
+      return null;
+    }
+
+    debugPrintKeyFlags('funding', nk.flags);
+
+    const scanPriv32 = nk.scanPriv32;
+    const spendPriv32 = nk.spendPriv32;
+
     const tipHeight = !includeUnconfirmed && minConfirmations > 1 ? await getTipHeightMaybe() : undefined;
 
     const stealthRecs = (st?.stealthUtxos ?? [])
-      .filter((r) => r && r.owner === ownerTag && !r.spentInTxid)
-      .sort((a, b) => (toBigIntSats(b.valueSats ?? b.value ?? 0) > toBigIntSats(a.valueSats ?? a.value ?? 0) ? 1 : -1));
+      .filter((r) => r && r.owner === ownerTag)
+      // ✅ skip local spent markers before any chain IO
+      .filter((r) => !isLocallySpentStealth(r))
+      .sort((a, b) =>
+        toBigIntSats(b.valueSats ?? b.value ?? 0) > toBigIntSats(a.valueSats ?? a.value ?? 0) ? 1 : -1
+      );
 
     dlog({ mode, stage: 'stealth', records: stealthRecs.length, minSats: minSats.toString() });
+
+    function rejectStealth(r: StealthUtxoRecord, reason: string, extra?: any) {
+      stale.push({ source: 'stealth', txid: r.txid, vout: r.vout, reason });
+      dlog({
+        mode,
+        stage: 'stealth',
+        reject: { outpoint: `${r.txid}:${r.vout}`, reason, valueSats: r.valueSats, hash160Hex: r.hash160Hex },
+        ...(extra ? { extra } : {}),
+      });
+    }
 
     for (const r of stealthRecs) {
       const unspent = await chainIO.isP2pkhOutpointUnspent({ txid: r.txid, vout: r.vout, hash160Hex: r.hash160Hex });
       if (!unspent) {
-        stale.push({ source: 'stealth', txid: r.txid, vout: r.vout, reason: 'spent' });
-        if (markStaleStealthRecords) markStealthSpent(st, r.txid, r.vout, '<spent>');
+        rejectStealth(r, 'spent');
+        if (markStaleStealthRecords) markStealthSpentCompat(st, r.txid, r.vout, '<spent>');
         continue;
       }
 
       const prev = await chainIO.getPrevOutput(r.txid, r.vout);
 
       if (!allowTokens && isTokenUtxo(prev)) {
-        stale.push({ source: 'stealth', txid: r.txid, vout: r.vout, reason: 'token-utxo-excluded' });
+        rejectStealth(r, 'token-utxo-excluded');
         continue;
       }
 
       if (!confirmedEnough(prev, tipHeight)) {
-        stale.push({ source: 'stealth', txid: r.txid, vout: r.vout, reason: 'unconfirmed' });
+        rejectStealth(r, 'unconfirmed', { tipHeight, minConfirmations, includeUnconfirmed });
         continue;
       }
 
       const value = toBigIntSats(prev.value);
       if (value < minSats) {
-        stale.push({ source: 'stealth', txid: r.txid, vout: r.vout, reason: 'below-min-sats' });
+        rejectStealth(r, 'below-min-sats', { value: value.toString(), minSats: minSats.toString() });
         continue;
       }
 
       const expectedH160 = parseP2pkhHash160(prev.scriptPubKey);
       if (!expectedH160 || bytesToHex(expectedH160) !== r.hash160Hex) {
-        stale.push({ source: 'stealth', txid: r.txid, vout: r.vout, reason: 'prevout-mismatch' });
+        rejectStealth(r, 'prevout-mismatch', {
+          expected: expectedH160 ? bytesToHex(expectedH160) : null,
+          record: r.hash160Hex,
+        });
+        continue;
+      }
+
+      const ctxAny: any = (r as any)?.rpaContext;
+      const senderPub33Hex = String(ctxAny?.senderPub33Hex ?? '').trim();
+      const prevoutHashHex = String(ctxAny?.prevoutHashHex ?? ctxAny?.prevoutTxidHex ?? '').trim();
+      const prevoutN = Number(ctxAny?.prevoutN);
+      const index = Number(ctxAny?.index);
+
+      if (!/^[0-9a-fA-F]{66}$/.test(senderPub33Hex)) {
+        rejectStealth(r, 'missing-rpaContext.senderPub33Hex', { senderPub33Hex });
+        continue;
+      }
+      if (!/^[0-9a-fA-F]{64}$/.test(prevoutHashHex)) {
+        rejectStealth(r, 'missing-rpaContext.prevoutHashHex', { prevoutHashHex });
+        continue;
+      }
+      if (!Number.isFinite(prevoutN) || prevoutN < 0) {
+        rejectStealth(r, 'missing-rpaContext.prevoutN', { prevoutN });
+        continue;
+      }
+      if (!Number.isFinite(index) || index < 0) {
+        rejectStealth(r, 'missing-rpaContext.index', { index });
         continue;
       }
 
       const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
-        wallet.scanPrivBytes ?? wallet.privBytes,
-        wallet.spendPrivBytes ?? deriveSpendPriv32FromScanPriv32(wallet.scanPrivBytes ?? wallet.privBytes),
-        hexToBytes(r.rpaContext.senderPub33Hex),
-        r.rpaContext.prevoutHashHex,
-        r.rpaContext.prevoutN,
-        r.rpaContext.index
+        scanPriv32,
+        spendPriv32,
+        hexToBytes(senderPub33Hex),
+        prevoutHashHex.toLowerCase(),
+        prevoutN,
+        index
       );
 
       const { h160 } = pubkeyHashFromPriv(oneTimePriv);
       if (bytesToHex(h160) !== r.hash160Hex) {
-        stale.push({ source: 'stealth', txid: r.txid, vout: r.vout, reason: 'derivation-mismatch' });
+        rejectStealth(r, 'derivation-mismatch', { derived: bytesToHex(h160), record: r.hash160Hex });
         continue;
       }
 
-      return { txid: r.txid, vout: r.vout, prevOut: prev, signPrivBytes: oneTimePriv, source: 'stealth', record: r };
+      return {
+        txid: r.txid,
+        vout: r.vout,
+        prevOut: prev,
+        signPrivBytes: oneTimePriv,
+        source: 'stealth',
+        record: r,
+      };
     }
 
     return null;
@@ -292,9 +374,6 @@ export async function selectFundingUtxo(args: {
   } | null> {
     const tipHeight = !includeUnconfirmed && minConfirmations > 1 ? await getTipHeightMaybe() : undefined;
 
-    // Probe both possible getUtxos signatures.
-    // A) (address, network, includeUnconfirmed)  [preferred]
-    // B) (address, includeUnconfirmed, network)  [legacy/caller mistake]
     let utxos: any[] = [];
 
     try {
@@ -316,7 +395,9 @@ export async function selectFundingUtxo(args: {
     const candidates = (utxos ?? [])
       .filter((u) => u && (allowTokens ? true : !u.token_data && !isTokenUtxo(u)))
       .filter((u) => confirmedEnough(u, tipHeight))
-      .filter((u) => toValueSats(u) >= minSats);
+      .filter((u) => toValueSats(u) >= minSats)
+      // sort largest-first so we can iterate with validation
+      .sort((a, b) => (toValueSats(b) > toValueSats(a) ? 1 : -1));
 
     dlog({
       mode,
@@ -329,32 +410,51 @@ export async function selectFundingUtxo(args: {
       allowTokens,
     });
 
-    const best = pickLargest(candidates);
-    if (!best) return null;
+    for (const cand of candidates) {
+      const prev = await chainIO.getPrevOutput(cand.txid, cand.vout);
 
-    const prev = await chainIO.getPrevOutput(best.txid, best.vout);
+      if (!allowTokens && isTokenUtxo(prev)) {
+        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'token-utxo-excluded' });
+        continue;
+      }
 
-    if (!allowTokens && isTokenUtxo(prev)) {
-      stale.push({ source: 'base', txid: best.txid, vout: best.vout, reason: 'token-utxo-excluded' });
-      return null;
+      if (!confirmedEnough(prev, tipHeight)) {
+        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'unconfirmed' });
+        continue;
+      }
+
+      const value = toBigIntSats(prev.value);
+      if (value < minSats) {
+        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'below-min-sats' });
+        continue;
+      }
+
+      const h160 = parseP2pkhHash160(prev.scriptPubKey);
+      if (!h160) {
+        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'non-p2pkh' });
+        continue;
+      }
+
+      // ✅ parity with stealth: verify “actually unspent” using the same chainIO helper
+      const unspent = await chainIO.isP2pkhOutpointUnspent({
+        txid: cand.txid,
+        vout: cand.vout,
+        hash160Hex: bytesToHex(h160),
+      });
+
+      if (!unspent) {
+        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'spent' });
+        continue;
+      }
+
+      return { txid: cand.txid, vout: cand.vout, prevOut: prev, signPrivBytes: wallet.privBytes, source: 'base' };
     }
 
-    if (!confirmedEnough(prev, tipHeight)) {
-      stale.push({ source: 'base', txid: best.txid, vout: best.vout, reason: 'unconfirmed' });
-      return null;
-    }
-
-    const value = toBigIntSats(prev.value);
-    if (value < minSats) return null;
-
-    if (!parseP2pkhHash160(prev.scriptPubKey)) return null;
-
-    return { txid: best.txid, vout: best.vout, prevOut: prev, signPrivBytes: wallet.privBytes, source: 'base' };
+    return null;
   }
 
   dlog({ mode, prefer, ownerTag, network });
 
-  // Preference pipeline (wallet-first by default)
   for (const src of prefer) {
     if (src === 'base') {
       const hit = await tryBase();
@@ -363,6 +463,10 @@ export async function selectFundingUtxo(args: {
       const hit = await tryStealth();
       if (hit) return { ...hit, stale: stale.length ? stale : undefined };
     }
+  }
+
+  if (dbg && stale.length) {
+    console.log(`[funding] stale: ${JSON.stringify(stale, null, 2)}`);
   }
 
   throw new Error(

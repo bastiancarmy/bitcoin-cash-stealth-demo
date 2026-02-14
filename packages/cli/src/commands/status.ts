@@ -26,19 +26,22 @@ export function registerStatusCommand(program: Command, deps: { getActivePaths: 
     const { configFile, profile, stateFile, logFile } = deps.getActivePaths();
 
     const cfg0 = ensureConfigDefaults(readConfig({ configFile }) ?? null);
-    const currentProfile = String(cfg0.currentProfile ?? 'default');
 
-    const profCfg = (cfg0.profiles ?? {})[profile] ?? {};
+    // Single resolved profile rule:
+    // - If CLI provided a non-empty profile, use it
+    // - Else fall back to config.currentProfile
+    const resolvedProfile = String(profile ?? '').trim() || String(cfg0.currentProfile ?? 'default');
+
+    const profCfg = (cfg0.profiles ?? {})[resolvedProfile] ?? {};
     const network = String((profCfg as any).network ?? '(unknown)');
     const birthdayHeight = (profCfg as any).birthdayHeight;
     const birthdayStr =
       typeof birthdayHeight === 'number' && Number.isFinite(birthdayHeight) ? String(birthdayHeight) : '(unset)';
 
-    const w = getWalletFromConfig({ configFile, profile });
+    const w = getWalletFromConfig({ configFile, profile: resolvedProfile });
     const walletReady = !!w;
 
-    console.log(`profile(flag):    ${profile}`);
-    console.log(`currentProfile:   ${currentProfile}`);
+    console.log(`profile:          ${resolvedProfile}`);
     console.log(`config:           ${configFile}`);
     console.log(`network:          ${network}`);
     console.log(`birthdayHeight:   ${birthdayStr}`);
@@ -50,7 +53,7 @@ export function registerStatusCommand(program: Command, deps: { getActivePaths: 
       console.log(`transparent:      ${w.address}`);
       console.log(`paycode:          ${paycode}`);
     } else {
-      console.log(`hint:             run "bchctl --profile ${profile} wallet init"`);
+      console.log(`hint:             run "bchctl --profile ${resolvedProfile} wallet init"`);
     }
 
     console.log(`state file:       ${stateFile} ${fs.existsSync(stateFile) ? '(exists)' : '(missing)'}`);

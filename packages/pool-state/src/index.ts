@@ -1,14 +1,31 @@
 // packages/pool-state/src/index.ts
+//
+// Public exports for @bch-stealth/pool-state (strict mode).
+// Legacy migration exports intentionally removed to avoid tech debt.
 
+export {
+  POOL_STATE_STORE_KEY,
+  DEFAULT_STATE_DIRNAME,
+  DEFAULT_STATE_FILENAME,
+  resolveDefaultPoolStatePaths,
+  readPoolState,
+  writePoolState,
+} from './io.js';
+
+export { FileBackedPoolStateStore } from './filestore.js';
+
+export type { PoolStateStore } from './types.js';
+
+// Canonical state types (CLI imports these from @bch-stealth/pool-state)
 export type {
   PoolState,
-  ShardPointer,
-  DepositRecord,
-  WithdrawalRecord,
-  StealthUtxoRecord,
   RpaContext,
+  StealthUtxoRecord,
+  DepositRecord,
+  ShardPointer,
 } from './state.js';
 
+// Canonical state helpers (CLI imports these from @bch-stealth/pool-state)
 export {
   ensurePoolStateDefaults,
   upsertDeposit,
@@ -16,28 +33,3 @@ export {
   upsertStealthUtxo,
   markStealthSpent,
 } from './helpers.js';
-
-export {
-  POOL_STATE_STORE_KEY,
-  LEGACY_POOL_STATE_STORE_KEY,
-  LEGACY_POOL_STATE_STORE_KEY_V0,
-  DEFAULT_STATE_DIRNAME,
-  DEFAULT_STATE_FILENAME,
-  resolveDefaultPoolStatePaths,
-  migrateLegacyPoolStateDirSync,
-  readPoolState,
-  writePoolState,
-} from './io.js';
-
-export { FileBackedPoolStateStore } from './filestore.js';
-
-export { repairFromChain } from './repair.js';
-export type {
-  RepairFromChainOptions,
-  RepairFromChainResult,
-  RepairDiagnostics,
-  RepairDiagnosticsReceived,
-} from './repair.js';
-
-// Optional legacy file importer (kept for MVP transition)
-export { importLegacyShardedPoolState } from './legacy.js';

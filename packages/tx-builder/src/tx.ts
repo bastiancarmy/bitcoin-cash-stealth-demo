@@ -20,7 +20,8 @@ import {
   uint64le,
   hash160,
   pushDataPrefix,
-  minimalScriptNumber,
+  minimalScriptNumber,decodeCashTokensPrefix, 
+  splitCashTokensPrefix,
 } from '@bch-stealth/utils';
 
 import { bchSchnorrSign, bchSchnorrVerify } from '@bch-stealth/crypto';
@@ -169,7 +170,34 @@ function toU8Script(lockingScript) {
 }
 
 /**
+ * Extract the 32-byte "state commitment" from a shard UTXO's CashTokens prefix.
+ * Assumes the pool encodes state as an NFT commitment of exactly 32 bytes.
+ */
+export function getCommitment32FromShardPrevoutScript(scriptPubKey: Uint8Array): Uint8Array {
+  const { prefix } = splitCashTokensPrefix(scriptPubKey);
+
+  if (!prefix) {
+    throw new Error('getCommitment32FromShardPrevoutScript: missing CashTokens prefix (expected shard token UTXO)');
+  }
+
+  const decoded = decodeCashTokensPrefix(prefix);
+
+  const c = decoded.commitment;
+  if (!(c instanceof Uint8Array) || c.length !== 32) {
+    throw new Error(
+      `getCommitment32FromShardPrevoutScript: expected 32-byte NFT commitment, got ${c ? c.length : 'null'}`
+    );
+  }
+
+  return c;
+}
+
+/**
  * Prepend a CashTokens token prefix to a locking script.
+ *
+ * NOTE:
+ * - This function MUST remain pure (token encoding + concatenation only).
+ * - Do NOT derive stateIn32 here (no access to prevouts/state; that belongs in pool-shards or signer code).
  */
 export function addTokenToScript(token, lockingScript) {
   console.log('Using updated addTokenToScript with nft handling');
@@ -193,8 +221,7 @@ export function addTokenToScript(token, lockingScript) {
 
   // Normalize capability to a number 0–2
   let capability = 0;
-  /** @type {Uint8Array | undefined} */
-  let commitment;
+  let commitment: Uint8Array | undefined;
   let hasCommitment = false;
 
   if (hasNft) {
@@ -226,7 +253,7 @@ export function addTokenToScript(token, lockingScript) {
   if (!hasNft && capability !== 0) {
     throw new Error('Invalid: Capability set without NFT (must be 0 per spec)');
   }
-  if (hasCommitment && (commitment.length < 1 || commitment.length > 40)) {
+  if (hasCommitment && (commitment!.length < 1 || commitment!.length > 40)) {
     throw new Error('Commitment must be 1-40 bytes per spec');
   }
   if (hasAmount && (token.amount < 1n || token.amount > 9223372036854775807n)) {
@@ -242,18 +269,19 @@ export function addTokenToScript(token, lockingScript) {
   prefixParts.push(new Uint8Array([bitfield]));
 
   if (hasCommitment) {
-    const commitLen = commitment.length;
-    prefixParts.push(varInt(commitLen) as unknown as Uint8Array, commitment);
+    const commitLen = commitment!.length;
+    prefixParts.push(varInt(commitLen) as unknown as Uint8Array, commitment!);
   }
 
   if (hasAmount) {
+    // CashTokens amount is VM-number varint in prefix encoding
     prefixParts.push(varInt(Number(token.amount)) as unknown as Uint8Array);
   }
 
   const tokenPrefix = concat(...prefixParts);
   console.log('Token Prefix (hex):', bytesToHex(tokenPrefix));
 
-  // 🔒 Concat only Uint8Arrays
+  // Concat only Uint8Arrays
   return concat(tokenPrefix, script);
 }
 
@@ -562,7 +590,7 @@ export function signP2SHInput(tx, inputIndex, privBytes, redeemScript, value, ra
   const pubCompressed = secp256k1.getPublicKey(privBytes, true);
 
   // IMPORTANT: token prefix comes from the RAW prevout scriptPubKey
-  const { prefix: prevTokenPrefix, locking } = splitTokenPrefix(rawPrevScript);
+  const { prefix: prevTokenPrefix, locking } = splitCashTokensPrefix(rawPrevScript);
 
   // IMPORTANT: scriptCode MUST be the redeemScript (never token-prefixed)
   const scriptCode = redeemScript;
@@ -653,6 +681,11 @@ export function signCovenantInput(
     console.log(`[sighash]   rawPrevScript[0]=0x${rawPrevScript[0]?.toString(16)}`);
     console.log(`[sighash]   locking[0..12]=${bytesToHex(locking).slice(0, 24)}`);
     console.log(`[sighash]   scriptCodeLen=${scriptCode.length} redeemLen=${redeemScript.length}`);
+  }
+
+  if (debugSighashEnabled() && prevTokenPrefix) {
+    const dec = decodeCashTokensPrefix(prevTokenPrefix);
+    console.log(`[sighash]   token.bitfield=0x${dec.bitfield.toString(16)} hasCommit=${dec.hasCommitment} commitLen=${dec.commitment?.length ?? 0}`);
   }
 
   // Debug assertions per ticket

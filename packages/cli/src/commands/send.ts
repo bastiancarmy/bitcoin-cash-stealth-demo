@@ -1,21 +1,25 @@
 // packages/cli/src/commands/send.ts
 //
-// Drop-in replacement (Phase 2 UX):
-// - Adds optional sender-side grinding controls that affect paycode sends.
-// - Defaults to "auto grind" for paycode destinations (like Electron Cash behavior),
-//   but keeps escape hatches for Phase 2 pragmatism.
+// Drop-in replacement: TKT-B4H2 Option A (send loads + persists profile state).
+// Fixes incorrect import of resolveProfilePaths (use ../paths.js).
 //
-// New flags:
-//   --no-grind            Disable paycode grinding (forces index=0 derivation).
-//   --grind-max <N>       Max grind attempts (default 256). 0 => disable grinding.
-//   --grind-prefix <hex>  Override grind prefix byte (1 byte hex like "56").
-//                         (Normally derived from receiver scanPub33 via sha256(tag||Q)[0].)
+// Behavior:
+// - Always resolves config/state paths via resolveProfilePaths({ cwd, profile, ... }).
+// - Loads state via loadStateOrEmpty and persists it after broadcast.
+// - Passes state into runSend so stealth change can allocate index + record stealthUtxos.
+// - Supports --self-paycode override (temporary UX).
 
+import fs from 'node:fs';
+import path from 'node:path';
 import { Command } from 'commander';
 
 import * as Electrum from '@bch-stealth/electrum';
+import { FileBackedPoolStateStore } from '@bch-stealth/pool-state';
+
 import { DUST, NETWORK } from '../config.js';
 import { makeChainIO } from '../pool/io.js';
+import { loadStateOrEmpty, saveState } from '../pool/state.js';
+
 import type { LoadedWallet } from '../wallets.js';
 import { runSend } from '../ops/send.js';
 
@@ -23,8 +27,10 @@ import { readConfig, ensureConfigDefaults } from '../config_store.js';
 import { getWalletFromConfig } from '../wallets.js';
 import { generatePaycode } from '../paycodes.js';
 
+// ✅ correct import
+import { resolveProfilePaths } from '../paths.js';
+
 function stripAnsi(s: string): string {
-  // Good-enough ANSI stripper for CLI piping issues
   return String(s ?? '').replace(/\u001b\[[0-9;]*m/g, '');
 }
 
@@ -54,11 +60,16 @@ function parseNonNegativeInt(raw: unknown, label: string): number | null {
   return Math.floor(n);
 }
 
+function ensureDirForFile(filename: string) {
+  const dir = path.dirname(filename);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
 export function registerSendCommand(
   program: Command,
   deps: {
     loadMeWallet: () => Promise<LoadedWallet>;
-    getActivePaths: () => { profile: string; configFile?: string };
+    getActivePaths: () => { profile: string };
     getUtxos: (...a: any[]) => Promise<any[]>;
   }
 ) {
@@ -71,12 +82,10 @@ export function registerSendCommand(
     .option('--dry-run', 'Build and sign the transaction but do not broadcast.')
     .option('--no-paycode', 'Reject paycode destinations (require cashaddr).')
     .option('--all', 'Also print hex internals (hash160, raw tx hex).', false)
-    // --- Phase 2 grinding controls ---
     .option('--no-grind', 'Disable paycode grinding (forces index=0 derivation).')
-    .option('--grind-max <N>', 'Max grind attempts for paycode sends (default 256). 0 disables grinding.', (v) =>
-      Number(v)
-    )
+    .option('--grind-max <N>', 'Max grind attempts for paycode sends (default 256). 0 disables grinding.', (v) => Number(v))
     .option('--grind-prefix <HH>', 'Override grind prefix byte (1 byte hex like "56"). Optional.', (v) => String(v))
+    .option('--self-paycode <pm>', 'Override: your own paycode (for stealth change).', '')
     .action(
       async (
         destMaybe: string | undefined,
@@ -89,25 +98,34 @@ export function registerSendCommand(
           grind?: boolean; // commander sets --no-grind => grind=false
           grindMax?: number;
           grindPrefix?: string;
+          selfPaycode?: string;
         }
       ) => {
         const sats = BigInt(String(satsRaw).trim());
         const me = await deps.loadMeWallet();
-        const { profile } = deps.getActivePaths();
+        const active0 = deps.getActivePaths();
+        const profile = String(active0.profile ?? '').trim() || 'default';
         const all = !!opts?.all;
+
+        // ✅ canonical path resolution (no non-existent profile_paths module)
+        const p = resolveProfilePaths({
+          cwd: process.cwd(),
+          profile,
+          walletOverride: null,
+          stateOverride: null,
+          logOverride: null,
+          envWalletPath: process.env.BCH_STEALTH_WALLET ?? null,
+        });
+
+        const configFile = p.configFile;
+        const stateFile = p.stateFile;
 
         let destStr = stripAnsi(String(destMaybe ?? '').trim());
 
         // If --to-profile is provided, resolve paycode from config and ignore dest argument
         if (opts.toProfile) {
-          const active = deps.getActivePaths();
-          const configFile = String(active.configFile ?? '').trim();
-          if (!configFile) {
-            throw new Error('send: deps.getActivePaths() must include configFile when using --to-profile');
-          }
-
           const cfg0 = ensureConfigDefaults(readConfig({ configFile }) ?? null);
-          void cfg0; // keep lint quiet if unused in some builds
+          void cfg0;
 
           const target = String(opts.toProfile).trim();
           if (!target) throw new Error('send: --to-profile cannot be empty');
@@ -115,7 +133,7 @@ export function registerSendCommand(
           const w = getWalletFromConfig({ configFile, profile: target });
           if (!w) throw new Error(`send: could not find wallet for --to-profile "${target}"`);
 
-          const paycodeKey = (w as any).scanPrivBytes ?? w.privBytes;
+          const paycodeKey = (w as any).scanPrivBytes ?? (w as any).privBytes;
           destStr = generatePaycode(paycodeKey);
         }
 
@@ -125,31 +143,49 @@ export function registerSendCommand(
           throw new Error('send: paycode destinations disabled by --no-paycode (provide a cashaddr)');
         }
 
-        const electrum: any = Electrum as any;
-        const chainIO = makeChainIO({ network: NETWORK, electrum });
+        const chainIO = makeChainIO({ network: NETWORK, electrum: Electrum as any });
 
-        // Grinding policy defaults:
-        // - Enabled for paycodes unless user passes --no-grind or --grind-max 0.
         const grindEnabled = opts.grind !== false;
         const grindMaxUser = parseNonNegativeInt(opts.grindMax, '--grind-max') ?? 256;
         const grindMax = grindEnabled ? grindMaxUser : 0;
         const grindPrefixByte = parseOptionalHexByte(opts.grindPrefix);
 
+        // --- Load state (even without pool) ---
+        const filename = path.resolve(stateFile);
+
+        ensureDirForFile(filename);
+        const store = new FileBackedPoolStateStore({ filename });
+        const state = await loadStateOrEmpty({ store, networkDefault: String(NETWORK) });
+
+        // --- Compute self paycode (prefer derived from wallet keys), allow override ---
+        const defaultSelfPaycode = generatePaycode(((me as any).scanPrivBytes ?? (me as any).privBytes) as Uint8Array);
+        const selfPaycodeOverride = String(opts.selfPaycode ?? '').trim();
+        const selfPaycode = selfPaycodeOverride || defaultSelfPaycode;
+
+        if (selfPaycode && !selfPaycode.startsWith('PM')) {
+          throw new Error('send: --self-paycode must be a paycode starting with "PM"');
+        }
+
+        const ctx: any = {
+          network: NETWORK,
+          me,
+          ownerTag: profile,
+          dustSats: BigInt(DUST),
+          state,
+          chainIO,
+          getUtxos: deps.getUtxos,
+          selfPaycode,
+        };
+
+        ctx.me = ctx.me ?? {};
+        ctx.me.selfPaycode = selfPaycode;
+
         const res = await runSend(
-          {
-            network: NETWORK,
-            me,
-            ownerTag: profile,
-            dustSats: BigInt(DUST),
-            state: null,
-            chainIO,
-            getUtxos: deps.getUtxos,
-          },
+          ctx,
           {
             dest: destStr,
             sats,
             dryRun: !!opts?.dryRun,
-            // pass through grind policy (ops layer implements it only for paycodes)
             grind: {
               enabled: grindMax > 0,
               maxAttempts: grindMax,
@@ -158,15 +194,18 @@ export function registerSendCommand(
           } as any
         );
 
+        // Persist state if we broadcasted (this is where stealth change gets recorded)
+        if (!opts?.dryRun) {
+          await saveState({ store, state: ctx.state, networkDefault: String(NETWORK) });
+        }
+
         console.log(`network:     ${String(NETWORK)}`);
         console.log(`profile:     ${profile}`);
         console.log(`amountSats:  ${String(sats)}`);
         console.log(`destType:    ${res.destType}`);
         console.log(`dest:        ${res.destAddress}`);
 
-        if (all) {
-          console.log(`destHash160: ${res.destHash160Hex}`);
-        }
+        if (all) console.log(`destHash160: ${res.destHash160Hex}`);
 
         if (res.txid) {
           console.log(`txid:        ${res.txid}`);
@@ -175,29 +214,13 @@ export function registerSendCommand(
           console.log(`txid:        (dry-run)`);
         }
 
-        // Optional debug: show grind result if ops returns it
-        if (all && (res as any).grind) {
-          const g = (res as any).grind;
-          if (g && typeof g === 'object') {
-            console.log(`grind:       ${g.used ? 'yes' : 'no'}`);
-            if (g.used) {
-              console.log(`grindIndex:  ${String(g.index)}`);
-              console.log(`grindMax:    ${String(g.maxAttempts)}`);
-              if (g.prefixByte != null) {
-                const b = Number(g.prefixByte) & 0xff;
-                console.log(`grindByte:   ${b.toString(16).padStart(2, '0')}`);
-              }
-              if (g.found === false) {
-                console.log(`grindFound:  no (fell back to index=0)`);
-              }
-            }
-          }
-        }
-
         if (all) {
           console.log(`rawHex:      ${res.rawHex}`);
-        } else {
-          console.log(`\nℹ Tip: add --all to print hex internals (destHash160/rawHex).\n`);
+          if (res.change) {
+            console.log(
+              `change:      vout=${res.change.vout} sats=${res.change.valueSats} h160=${res.change.hash160Hex} idx=${res.change.index}`
+            );
+          }
         }
       }
     );

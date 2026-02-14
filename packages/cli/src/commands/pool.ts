@@ -9,6 +9,9 @@ import { runInit } from '../pool/ops/init.js';
 import { runImport } from '../pool/ops/import.js';
 import { runWithdraw } from '../pool/ops/withdraw.js';
 
+// ✅ already present in your file
+import { registerPoolWithdrawCheck } from './pool-withdraw-check.js';
+
 export type MakePoolCtx = () => Promise<any>;
 export type GetActivePaths = () => { stateFile: string };
 
@@ -28,6 +31,26 @@ function readJsonOrNull(p: string): any | null {
   }
 }
 
+// NOTE: your state file is currently wrapped like:
+// { schemaVersion, updatedAt, data: { pool: { state: {...} } } }
+function extractPoolStateFromStateFileJson(stFileJson: any): any | null {
+  if (!stFileJson || typeof stFileJson !== 'object') return null;
+
+  // Preferred: current wrapper shape
+  const wrapped = stFileJson?.data?.pool?.state;
+  if (wrapped && typeof wrapped === 'object') return wrapped;
+
+  // Alternate: if a store writes by key at top-level
+  const byKey = stFileJson?.[POOL_STATE_STORE_KEY];
+  if (byKey && typeof byKey === 'object') return byKey;
+
+  // Legacy-ish: stFileJson.pool?.state
+  const legacy = stFileJson?.pool?.state;
+  if (legacy && typeof legacy === 'object') return legacy;
+
+  return null;
+}
+
 function parseOutpointOrThrow(outpoint: string): { txid: string; vout: number } {
   const [txidRaw, voutRaw] = String(outpoint).split(':');
   const txid = String(txidRaw ?? '').trim();
@@ -39,6 +62,12 @@ function parseOutpointOrThrow(outpoint: string): { txid: string; vout: number } 
   return { txid: txid.toLowerCase(), vout };
 }
 
+function shortHex(x: any, n = 10): string {
+  const s = String(x ?? '');
+  if (!s) return '';
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
 export function registerPoolCommands(
   program: Command,
   deps: {
@@ -48,6 +77,81 @@ export function registerPoolCommands(
   }
 ) {
   const pool = getOrCreateSubcommand(program, 'pool', 'Pool (optional vault/policy layer)');
+
+  // pool shards
+  pool
+    .command('shards')
+    .description('List pool shards from the active profile state.')
+    .option('--json', 'print raw JSON', false)
+    .action(async (opts) => {
+      const { stateFile } = deps.getActivePaths();
+      const stFile = readJsonOrNull(stateFile);
+
+      const poolState = extractPoolStateFromStateFileJson(stFile);
+      if (!poolState) {
+        throw new Error(`pool shards: no pool state found in ${stateFile} (did you run "bchctl pool init"?)`);
+      }
+
+      const shards: any[] = Array.isArray(poolState.shards) ? poolState.shards : [];
+      if (!shards.length) {
+        console.log('no shards');
+        return;
+      }
+
+      // Compute total (BigInt-safe)
+      let totalSats = 0n;
+      for (const s of shards) {
+        const vRaw = s?.valueSats ?? s?.value ?? '0';
+        try {
+          totalSats += BigInt(String(vRaw));
+        } catch {
+          // ignore malformed entries
+        }
+      }
+
+      if (opts.json) {
+        console.log(
+          JSON.stringify(
+            {
+              meta: {
+                stateFile,
+                poolIdHex: String(poolState.poolIdHex ?? ''),
+                categoryHex: String(poolState.categoryHex ?? ''),
+                shardCount: Number(poolState.shardCount ?? shards.length),
+                totalSats: totalSats.toString(),
+              },
+              shards,
+            },
+            null,
+            2
+          )
+        );
+        return;
+      }
+
+      // pretty output
+      console.log(`state: ${stateFile}`);
+      console.log(`poolId: ${shortHex(poolState.poolIdHex, 40)}`);
+      console.log(`category: ${shortHex(poolState.categoryHex, 40)}`);
+      console.log(`shardCount: ${String(poolState.shardCount ?? shards.length)}`);
+      console.log(`total: ${totalSats.toString()} sats`);
+      console.log('');
+
+      for (const s of shards) {
+        const idx = Number(s?.index ?? -1);
+        const txid = String(s?.txid ?? '');
+        const vout = Number(s?.vout ?? -1);
+        const valueSats = String(s?.valueSats ?? s?.value ?? '');
+        const comm = String(s?.commitmentHex ?? '');
+
+        console.log(
+          `[${Number.isFinite(idx) ? idx : '?'}] ` +
+            `value=${valueSats || '?'} ` +
+            `outpoint=${txid && Number.isFinite(vout) ? `${txid}:${vout}` : '?'} ` +
+            `commit=${comm ? shortHex(comm, 12) : ''}`
+        );
+      }
+    });
 
   // pool init
   pool
@@ -96,10 +200,6 @@ export function registerPoolCommands(
       let depositTxid = '';
       let depositVout = 0;
 
-      // Priority:
-      // 1) explicit outpoint arg
-      // 2) --txid/--vout
-      // 3) --latest (from state)
       if (outpointArg) {
         const p = parseOutpointOrThrow(String(outpointArg));
         depositTxid = p.txid;
@@ -112,8 +212,11 @@ export function registerPoolCommands(
         depositTxid = txid.toLowerCase();
         depositVout = vout;
       } else if (opts.latest) {
-        const st = readJsonOrNull(stateFile) ?? {};
-        const utxos = Array.isArray(st.stealthUtxos) ? st.stealthUtxos : [];
+        const stFile = readJsonOrNull(stateFile);
+        const poolState = extractPoolStateFromStateFileJson(stFile);
+        if (!poolState) throw new Error(`pool import --latest: no pool state found in ${stateFile}`);
+
+        const utxos = Array.isArray(poolState.stealthUtxos) ? poolState.stealthUtxos : [];
         if (utxos.length === 0) {
           throw new Error(`pool import --latest: no stealthUtxos found in state file: ${stateFile}`);
         }
@@ -199,6 +302,9 @@ export function registerPoolCommands(
       console.log(`withdraw txid: ${res.txid}`);
       console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
     });
+
+  // This registers: `pool withdraw-check <dest> <amountSats> [--shard] [--broadcast] [--category-mode]`
+  registerPoolWithdrawCheck(pool, deps.makePoolCtx);
 
   return pool;
 }

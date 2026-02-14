@@ -1,5 +1,17 @@
 // packages/rpa/src/index.ts
+
+// Canonical exports (derive owns the core types like RpaContext)
 export * from '@bch-stealth/rpa-derive';
-export * from '@bch-stealth/rpa-scan';
-export * as Derive from '@bch-stealth/rpa-derive';
-export * as Scan from '@bch-stealth/rpa-scan';
+
+// Selective exports from rpa-scan to avoid name collisions
+export {
+  scanRawTxForRpaOutputs,
+  scanChainWindow,
+} from '@bch-stealth/rpa-scan';
+
+export type {
+  // keep these only if you actually want them at the umbrella level
+  RpaMatch,
+  ScanRawTxForRpaOutputsParams,
+  ScanChainWindowParams,
+} from '@bch-stealth/rpa-scan';

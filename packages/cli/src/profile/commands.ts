@@ -1,5 +1,5 @@
 // packages/cli/src/profile/commands.ts
-import type { Command } from 'commander';
+import { Command } from 'commander';
 import { readConfig, writeConfig, ensureConfigDefaults } from '../config_store.js';
 import { sanitizeProfileName } from '../paths.js';
 
@@ -11,8 +11,12 @@ function normalizeNetwork(x: string): 'chipnet' | 'mainnet' {
   throw new Error(`invalid network "${x}" (expected: chipnet|mainnet)`);
 }
 
-export function registerProfileCommands(program: Command, deps: { getActivePaths: GetActivePaths }) {
-  const profile = program.command('profile').description('Profile commands');
+/**
+ * Build the "profile" command as a standalone command, then the caller adds it to the program:
+ *   program.addCommand(makeProfileCommand(...))
+ */
+export function makeProfileCommand(deps: { getActivePaths: GetActivePaths }): Command {
+  const profile = new Command('profile').description('Profile commands');
 
   profile
     .command('set')
@@ -44,7 +48,9 @@ export function registerProfileCommands(program: Command, deps: { getActivePaths
       const cfg0 = ensureConfigDefaults(readConfig({ configFile }) ?? null);
 
       const targetProfileRaw = String(opts.profile ?? '').trim();
-      const targetProfile = sanitizeProfileName(targetProfileRaw || activeProfile || String(cfg0.currentProfile ?? 'default'));
+      const targetProfile = sanitizeProfileName(
+        targetProfileRaw || activeProfile || String(cfg0.currentProfile ?? 'default')
+      );
 
       const network = normalizeNetwork(networkRaw);
 
@@ -80,4 +86,12 @@ export function registerProfileCommands(program: Command, deps: { getActivePaths
     });
 
   return profile;
+}
+
+/**
+ * Backwards-compatible wrapper: if callers still want "registerProfileCommands(program, deps)".
+ * This guarantees the command is added to the actual root program.
+ */
+export function registerProfileCommands(program: Command, deps: { getActivePaths: GetActivePaths }) {
+  program.addCommand(makeProfileCommand(deps));
 }

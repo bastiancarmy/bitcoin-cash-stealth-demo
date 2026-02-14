@@ -1,9 +1,10 @@
 // packages/cli/src/pool/ops/withdraw.ts
-import type { StealthUtxoRecord, PoolState } from '@bch-stealth/pool-state';
-import { ensurePoolStateDefaults, upsertStealthUtxo, markStealthSpent } from '@bch-stealth/pool-state';
+
+import type { PoolState } from '@bch-stealth/pool-state';
+import { ensurePoolStateDefaults, markStealthSpent } from '@bch-stealth/pool-state';
 
 import * as PoolShards from '@bch-stealth/pool-shards';
-import { bytesToHex, decodeCashAddress } from '@bch-stealth/utils';
+import { bytesToHex, decodeCashAddress, hexToBytes } from '@bch-stealth/utils';
 
 import type { PoolOpContext } from '../context.js';
 import { loadStateOrEmpty, saveState, selectFundingUtxo } from '../state.js';
@@ -11,6 +12,11 @@ import { toPoolShardsState, patchShardFromNextPoolState } from '../adapters.js';
 import { deriveStealthP2pkhLock } from '../stealth.js';
 import { extractPubKeyFromPaycode } from '../../paycodes.js';
 import { NETWORK } from '../../config.js';
+
+import { deriveSelfStealthChange, recordDerivedChangeUtxo } from '../../stealth/change.js';
+
+import { secp256k1 } from '@noble/curves/secp256k1.js';
+import { normalizeWalletKeys, debugPrintKeyFlags } from '../../wallet/normalizeKeys.js';
 
 function shouldDebug(): boolean {
   const v = String(process.env.BCH_STEALTH_DEBUG_WITHDRAW ?? '').trim().toLowerCase();
@@ -60,16 +66,16 @@ function parseDestToPub33OrH160(dest: string): { paycodePub33?: Uint8Array; p2pk
 }
 
 /**
- * Pick a shard that can satisfy a single-shard withdraw:
- *   shardValue >= payment + dust
+ * Pick a shard that can satisfy a withdraw from a single shard.
  *
- * Strategy: best-fit (smallest shard that works).
+ * Strategy: best-fit (smallest shard that works), prefer keep-alive if possible.
  */
-function pickShardIndexForSingleShardWithdraw(st: PoolState, payment: bigint, dust: bigint): number | null {
-  const need = payment + dust;
-
-  let bestIndex: number | null = null;
-  let bestValue: bigint | null = null;
+function pickShardIndexForWithdrawSingleShard(st: PoolState, payment: bigint, dust: bigint): {
+  shardIndex: number;
+  willKeepAlive: boolean;
+} | null {
+  let bestKeep: { i: number; v: bigint } | null = null;
+  let bestClose: { i: number; v: bigint } | null = null;
 
   for (let i = 0; i < (st.shards?.length ?? 0); i++) {
     const s: any = st.shards[i];
@@ -82,15 +88,17 @@ function pickShardIndexForSingleShardWithdraw(st: PoolState, payment: bigint, du
       continue;
     }
 
-    if (v < need) continue;
-
-    if (bestValue === null || v < bestValue) {
-      bestValue = v;
-      bestIndex = i;
+    if (v >= payment) {
+      if (!bestClose || v < bestClose.v) bestClose = { i, v };
+    }
+    if (v >= payment + dust) {
+      if (!bestKeep || v < bestKeep.v) bestKeep = { i, v };
     }
   }
 
-  return bestIndex;
+  if (bestKeep) return { shardIndex: bestKeep.i, willKeepAlive: true };
+  if (bestClose) return { shardIndex: bestClose.i, willKeepAlive: false };
+  return null;
 }
 
 function maxShardValue(st: PoolState): bigint {
@@ -106,12 +114,26 @@ function maxShardValue(st: PoolState): bigint {
 }
 
 function assertCovenantSignerIsMe(ctx: PoolOpContext, st: PoolState) {
-  if (!st.covenantSigner?.pubkeyHash160Hex) return; // allow legacy states; init should set it
+  if (!st.covenantSigner?.pubkeyHash160Hex) return;
   const want = String(st.covenantSigner.pubkeyHash160Hex).toLowerCase();
   const have = bytesToHex(ctx.me.wallet.hash160).toLowerCase();
   if (want && want !== have) {
     throw new Error(`covenantSigner mismatch: state=${want} me=${have}`);
   }
+}
+
+function parseP2pkhHash160(scriptPubKey: Uint8Array): Uint8Array | null {
+  if (
+    scriptPubKey.length === 25 &&
+    scriptPubKey[0] === 0x76 &&
+    scriptPubKey[1] === 0xa9 &&
+    scriptPubKey[2] === 0x14 &&
+    scriptPubKey[23] === 0x88 &&
+    scriptPubKey[24] === 0xac
+  ) {
+    return scriptPubKey.slice(3, 23);
+  }
+  return null;
 }
 
 export async function runWithdraw(
@@ -140,40 +162,62 @@ export async function runWithdraw(
   const payment = BigInt(amountSats);
   if (payment < BigInt(ctx.config.DUST)) throw new Error('withdraw amount below dust');
 
-  // shard selection
   let shardIndex =
     typeof opts.shardIndex === 'number' && Number.isFinite(opts.shardIndex) ? opts.shardIndex : undefined;
 
   if (shardIndex == null) {
     if (opts.requireShard) throw new Error('Missing --shard and requireShard=true. Provide --shard explicitly.');
+    const dust = BigInt(ctx.config.DUST);
 
-    const picked = pickShardIndexForSingleShardWithdraw(st, payment, BigInt(ctx.config.DUST));
+    const picked = pickShardIndexForWithdrawSingleShard(st, payment, dust);
     if (picked == null) {
       const max = maxShardValue(st);
+      const needKeep = payment + dust;
+      const needClose = payment;
       throw new Error(
-        `No shard can satisfy single-shard withdraw. Need >= ${(payment + BigInt(ctx.config.DUST)).toString()} sats in one shard, ` +
+        `No shard can satisfy withdraw from a single shard.\n` +
+          `Need >= ${needKeep.toString()} sats in one shard (keep-alive), or >= ${needClose.toString()} sats (close-shard), ` +
           `but max shard is ${max.toString()} sats.`
       );
     }
-    shardIndex = picked;
+    shardIndex = picked.shardIndex;
   }
 
   const shard = st.shards[shardIndex];
   if (!shard) throw new Error(`Unknown shard index ${shardIndex}`);
 
   const shardPrev = await ctx.chainIO.getPrevOutput(shard.txid, shard.vout);
+  const dust = BigInt(ctx.config.DUST);
 
-  // single-user: covenant signer + fee wallet are "me"
+  const shardValueSats = (() => {
+    try {
+      return BigInt((shard as any).valueSats ?? (shard as any).value ?? '0');
+    } catch {
+      return BigInt(shardPrev.value);
+    }
+  })();
+
+  const remainder = shardValueSats - payment;
+  if (remainder < 0n) {
+    throw new Error(
+      `withdraw: insufficient shard funds: shard=${shardIndex} in=${shardValueSats.toString()} need=${payment.toString()}`
+    );
+  }
+
+  const willCloseShard = remainder === 0n || remainder < dust;
+
   const covenantSignerWallet = ctx.me.wallet;
   const senderWallet = ctx.me.wallet;
 
+  const ownerTag = String((ctx as any)?.profile ?? (ctx as any)?.ownerTag ?? '').trim();
+  if (!ownerTag) throw new Error('withdraw: missing active profile (ownerTag)');
+
   const feeUtxo = await selectFundingUtxo({
     mode: 'pool-op',
-    // fee funding should be wallet-first
     state: st,
     wallet: senderWallet,
-    ownerTag: 'me',
-    minSats: BigInt(ctx.config.DUST) + 2_000n,
+    ownerTag,
+    minSats: BigInt(ctx.config.DUST) + BigInt(ctx.config.DEFAULT_FEE) + 2_000n,
     chainIO: ctx.chainIO,
     getUtxos: ctx.getUtxos,
     network: ctx.network,
@@ -190,11 +234,22 @@ export async function runWithdraw(
     } satisfies PoolShards.PrevoutLike,
   };
 
-  const changeValueSats = String(BigInt(feePrevouts.chain.value) - BigInt(ctx.config.DEFAULT_FEE));
+  const feeValueSats = BigInt(feePrevouts.chain.value);
+  const feeSats = BigInt(ctx.config.DEFAULT_FEE);
+  const changeValueSatsBig = feeValueSats - feeSats;
+
+  if (changeValueSatsBig > 0n && changeValueSatsBig < BigInt(ctx.config.DUST)) {
+    throw new Error(
+      `withdraw: fee funding would create dust change (${changeValueSatsBig.toString()} sats). ` +
+        `Use a larger fee UTXO (fund wallet) or bump DEFAULT_FEE logic.`
+    );
+  }
 
   const { paycodePub33, p2pkhH160 } = parseDestToPub33OrH160(dest);
 
-  // receiver hash160
+  const anchorTxidHex = feeUtxo.txid;
+  const anchorVout = feeUtxo.vout;
+
   let receiverH160: Uint8Array;
   let payContext: any = null;
 
@@ -202,8 +257,8 @@ export async function runWithdraw(
     const { intent: payIntent, rpaContext } = deriveStealthP2pkhLock({
       senderWallet,
       receiverPaycodePub33: paycodePub33,
-      prevoutTxidHex: feeUtxo.txid,
-      prevoutN: feeUtxo.vout,
+      prevoutTxidHex: anchorTxidHex,
+      prevoutN: anchorVout,
       index: 0,
     });
     receiverH160 = payIntent.childHash160;
@@ -214,13 +269,25 @@ export async function runWithdraw(
     throw new Error('unable to parse dest (expected paycode or cashaddr)');
   }
 
-  // change back to me (stealth)
-  const { intent: changeIntent, rpaContext: changeContext } = deriveStealthP2pkhLock({
-    senderWallet,
-    receiverPaycodePub33: ctx.me.paycodePub33,
-    prevoutTxidHex: feeUtxo.txid,
-    prevoutN: feeUtxo.vout,
-    index: 1,
+  if (!(ctx.me.paycodePub33 instanceof Uint8Array) || ctx.me.paycodePub33.length !== 33) {
+    throw new Error('withdraw: ctx.me.paycodePub33 missing/invalid (expected 33 bytes)');
+  }
+
+  // --- normalize once ---
+  const nk = normalizeWalletKeys(ctx.me.wallet);
+  debugPrintKeyFlags('pool-withdraw', nk.flags);
+
+  const selfSpendPub33 = secp256k1.getPublicKey(nk.spendPriv32, true);
+
+  const selfChange = deriveSelfStealthChange({
+    st,
+    senderPrivBytes: senderWallet.privBytes,
+    selfPaycodePub33: ctx.me.paycodePub33,
+    selfSpendPub33,
+    anchorTxidHex,
+    anchorVout,
+    purpose: 'pool_withdraw_change',
+    fundingOutpoint: { txid: feeUtxo.txid, vout: feeUtxo.vout },
   });
 
   const pool = toPoolShardsState(st, ctx.network);
@@ -235,13 +302,18 @@ export async function runWithdraw(
   const forcedMode = normalizeMode(process.env.BCH_STEALTH_CATEGORY_MODE);
 
   if (shouldDebug()) {
-    console.log(`\n[withdraw:debug] shard=${shardIndex} payment=${payment.toString()} fee=${String(ctx.config.DEFAULT_FEE)}`);
+    console.log(
+      `\n[withdraw:debug] shard=${shardIndex} payment=${payment.toString()} fee=${feeSats.toString()} closeShard=${willCloseShard}`
+    );
     console.log(`[withdraw:debug] categoryMode=${forcedMode ?? '<default>'}`);
     console.log(`[withdraw:debug] me.h160=${bytesToHex(ctx.me.wallet.hash160)}`);
     console.log(`[withdraw:debug] dest=${dest}`);
+    console.log(
+      `[withdraw:debug] change(self-stealth) index=${selfChange.index} anchor=${anchorTxidHex}:${anchorVout} h160=${selfChange.changeHash160Hex}`
+    );
   }
 
-  const built = PoolShards.withdrawFromShard({
+  const built: any = PoolShards.withdrawFromShard({
     pool,
     shardIndex,
     shardPrevout,
@@ -256,28 +328,51 @@ export async function runWithdraw(
     },
     receiverP2pkhHash160Hex: bytesToHex(receiverH160),
     amountSats: payment,
-    feeSats: BigInt(ctx.config.DEFAULT_FEE),
-    changeP2pkhHash160Hex: bytesToHex(changeIntent.childHash160),
-    categoryMode: forcedMode ?? undefined,
+    feeSats,
+    changeP2pkhHash160Hex: selfChange.changeHash160Hex,
+    remainderPolicy: 'close-if-dust',
   } as any);
 
   const rawHex = bytesToHex(built.rawTx);
   const txid = await ctx.chainIO.broadcastRawTx(rawHex);
 
-  const changeRec: StealthUtxoRecord = {
-    owner: 'me',
-    purpose: 'withdraw_change',
-    txid,
-    vout: 2,
-    valueSats: changeValueSats,
-    value: changeValueSats,
-    hash160Hex: bytesToHex(changeIntent.childHash160),
-    rpaContext: changeContext,
-    createdAt: new Date().toISOString(),
-  } as any;
-  upsertStealthUtxo(st, changeRec);
+  // Determine change vout robustly.
+  let changeVout: number | null = null;
 
-  if (feeUtxo.source === 'stealth') markStealthSpent(st, feeUtxo.txid, feeUtxo.vout, txid);
+  if (typeof built?.changeVout === 'number' && Number.isFinite(built.changeVout)) {
+    changeVout = built.changeVout;
+  } else if (typeof built?.changeOutputIndex === 'number' && Number.isFinite(built.changeOutputIndex)) {
+    changeVout = built.changeOutputIndex;
+  } else if (Array.isArray(built?.outputs)) {
+    for (let i = 0; i < built.outputs.length; i++) {
+      const spk = built.outputs[i]?.scriptPubKey;
+      if (!(spk instanceof Uint8Array)) continue;
+      const h160 = parseP2pkhHash160(spk);
+      if (!h160) continue;
+      if (bytesToHex(h160).toLowerCase() === selfChange.changeHash160Hex.toLowerCase()) {
+        changeVout = i;
+        break;
+      }
+    }
+  }
+
+  if (changeVout != null && changeValueSatsBig > 0n) {
+    recordDerivedChangeUtxo({
+      st,
+      txid,
+      vout: changeVout,
+      valueSats: changeValueSatsBig,
+      derived: selfChange,
+      owner: ownerTag,
+      fundingOutpoint: { txid: feeUtxo.txid, vout: feeUtxo.vout },
+    });
+  } else if (shouldDebug()) {
+    console.log('[withdraw:debug] WARNING: could not determine change vout; change not recorded');
+  }
+
+  if (feeUtxo.source === 'stealth') {
+    markStealthSpent(st, feeUtxo.txid, feeUtxo.vout, txid);
+  }
 
   patchShardFromNextPoolState({ poolState: st, shardIndex, txid, nextPool: built.nextPoolState });
 

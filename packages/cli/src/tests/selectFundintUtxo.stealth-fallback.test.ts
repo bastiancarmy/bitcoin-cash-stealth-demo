@@ -1,3 +1,4 @@
+// packages/cli/src/tests/selectFundintUtxo.stealth-fallback.test.ts
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -5,6 +6,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { bytesToHex, hexToBytes, hash160 } from '@bch-stealth/utils';
 import { deriveRpaOneTimePrivReceiver } from '@bch-stealth/rpa';
 
+import { normalizeWalletKeys } from '../wallet/normalizeKeys.js';
 import { selectFundingUtxo } from '../pool/state.js';
 
 function p2pkhScriptPubKeyFromH160(h160Hex: string): Uint8Array {
@@ -14,12 +16,17 @@ function p2pkhScriptPubKeyFromH160(h160Hex: string): Uint8Array {
 test('selectFundingUtxo: base empty -> selects stealth record when valid', async () => {
   // Receiver wallet (the one selecting funding)
   const receiverPriv = hexToBytes('11'.repeat(32));
+  const receiverScan = hexToBytes('12'.repeat(32)); // distinct scan key to exercise normalization
+
   const receiverWallet = {
     address: 'bitcoincash:qq000000000000000000000000000000000000000',
     privBytes: receiverPriv,
-    scanPrivBytes: receiverPriv,
-    spendPrivBytes: receiverPriv,
+    scanPrivBytes: receiverScan,
+    // IMPORTANT: omit spendPrivBytes so normalizeWalletKeys derives it
+    spendPrivBytes: null,
   } as any;
+
+  const nk = normalizeWalletKeys(receiverWallet);
 
   // Sender pubkey used in RPA context (must be a real compressed pubkey)
   const senderPriv = hexToBytes('22'.repeat(32));
@@ -33,8 +40,8 @@ test('selectFundingUtxo: base empty -> selects stealth record when valid', async
 
   // Compute the expected one-time priv and its hash160 (must match record.hash160Hex)
   const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
-    receiverWallet.scanPrivBytes ?? receiverWallet.privBytes,
-    receiverWallet.spendPrivBytes ?? receiverWallet.privBytes,
+    nk.scanPriv32,
+    nk.spendPriv32,
     senderPub33,
     prevoutHashHex,
     prevoutN,

@@ -8,9 +8,25 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 import { registerScanCommand } from '../commands/scan.js';
 
+function b32(fill: number): Uint8Array {
+  const a = new Uint8Array(32);
+  a.fill(fill & 0xff);
+  return a;
+}
+
 function makeWallet(scanPrivHex: string) {
+  // scan command now normalizes keys and requires a 32-byte base priv
+  const basePrivBytes = b32(0x99);
+  const basePrivHex = bytesToHex(basePrivBytes);
+
   return {
-    wallet: { scanPrivHex },
+    privBytes: basePrivBytes,
+    wallet: {
+      privHex: basePrivHex,
+      scanPrivHex,
+      birthdayHeight: 0,
+    },
+    birthdayHeight: 0,
   } as any;
 }
 
@@ -150,6 +166,7 @@ describe('cli scan: prefix normalization + defaults (Fulcrum 1–2 byte prefix)'
       loadMeWallet: async () => me,
       getActivePaths: () => ({ profile: 'bob', stateFile: '/tmp/ignore.json' }),
       electrum: { connectElectrum: async () => makeFakeElectrumClient(calls) },
+      // critical: ensure we don’t hit the real scanner which fetches raw tx
       scanChainWindow: async () => [],
     });
 

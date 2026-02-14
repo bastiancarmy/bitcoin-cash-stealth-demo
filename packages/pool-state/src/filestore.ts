@@ -13,8 +13,28 @@ export type FileBackedStoreOptions = {
   filename: string;
 };
 
+function isPlainObject(x: unknown): x is Record<string, unknown> {
+  return typeof x === 'object' && x !== null && !Array.isArray(x);
+}
+
+function assertCanonicalFile(parsed: unknown): PoolStateFile {
+  if (!isPlainObject(parsed)) {
+    throw new Error(`Unsupported schemaVersion: ${String((parsed as any)?.schemaVersion)}`);
+  }
+  const sv = (parsed as any).schemaVersion;
+  if (sv !== 1) {
+    throw new Error(`Unsupported schemaVersion: ${String(sv)}`);
+  }
+  const data = (parsed as any).data;
+  if (!isPlainObject(data)) {
+    throw new Error('Invalid state file: missing/invalid data object');
+  }
+  const updatedAt = typeof (parsed as any).updatedAt === 'string' ? (parsed as any).updatedAt : new Date().toISOString();
+  return { schemaVersion: 1, updatedAt, data };
+}
+
 export class FileBackedPoolStateStore implements PoolStateStore {
-  public readonly filename: string; // <-- changed (was private)
+  public readonly filename: string;
   private file: PoolStateFile = structuredClone(DEFAULT_FILE);
   private loaded = false;
 
@@ -27,16 +47,10 @@ export class FileBackedPoolStateStore implements PoolStateStore {
 
     try {
       const raw = await fs.readFile(this.filename, 'utf8');
-      const parsed = JSON.parse(raw) as PoolStateFile;
-
-      if (parsed.schemaVersion !== 1) {
-        throw new Error(`Unsupported schemaVersion: ${String((parsed as any).schemaVersion)}`);
-      }
-
-      this.file = parsed;
+      const parsed = JSON.parse(raw) as unknown;
+      this.file = assertCanonicalFile(parsed);
     } catch (e: any) {
       if (e?.code === 'ENOENT') {
-        // start new
         this.file = structuredClone(DEFAULT_FILE);
       } else {
         throw e;

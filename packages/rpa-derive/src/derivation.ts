@@ -333,13 +333,17 @@ export function deriveRpaOneTimeAddressSender(
   return { address: null, childPubkey, childHash160, sharedSecret };
 }
 
+// ✅ Synthesized: deriveRpaOneTimePrivReceiver (current version + optional sharedSecret32 reuse)
+
 export function deriveRpaOneTimePrivReceiver(
   scanPrivBytes: Uint8Array,
   spendPrivBytes: Uint8Array,
   senderPub33: Uint8Array,
   prevoutHashHex: string,
   prevoutN: number,
-  index = 0
+  index = 0,
+  // (optional): caller may provide a precomputed sharedSecret to avoid recomputing per-index
+  sharedSecret32: Uint8Array | null = null
 ): { oneTimePriv: Uint8Array; sharedSecret: Uint8Array } {
   if (!(scanPrivBytes instanceof Uint8Array) || scanPrivBytes.length !== 32) {
     throw new Error('scanPrivBytes must be 32-byte Uint8Array');
@@ -359,12 +363,46 @@ export function deriveRpaOneTimePrivReceiver(
   if (!Number.isInteger(index) || index < 0) {
     throw new Error('index must be a non-negative integer');
   }
+  if (sharedSecret32 != null) {
+    if (!(sharedSecret32 instanceof Uint8Array) || sharedSecret32.length !== 32) {
+      throw new Error('sharedSecret32 must be 32-byte Uint8Array when provided');
+    }
+  }
 
   const outpointStr = `${prevoutHashHex}${String(prevoutN)}`;
-  const sharedSecret = calculatePaycodeSharedSecret(scanPrivBytes, senderPub33, outpointStr);
+
+  // ✅ compute shared secret once per (scanPrivBytes, senderPub33, outpointStr) when caller provides it
+  const sharedSecret =
+    sharedSecret32 ?? calculatePaycodeSharedSecret(scanPrivBytes, senderPub33, outpointStr);
+
+  // ✅ per-index derivation remains the same
   const oneTimePriv = ckdPrivFromSecret(spendPrivBytes, sharedSecret, index);
 
   return { oneTimePriv, sharedSecret };
+}
+
+// Optional convenience helper (encourages callers to do the 1x-per-input computation)
+export function deriveRpaSharedSecretReceiver(
+  scanPrivBytes: Uint8Array,
+  senderPub33: Uint8Array,
+  prevoutHashHex: string,
+  prevoutN: number
+): Uint8Array {
+  if (!(scanPrivBytes instanceof Uint8Array) || scanPrivBytes.length !== 32) {
+    throw new Error('scanPrivBytes must be 32-byte Uint8Array');
+  }
+  if (!(senderPub33 instanceof Uint8Array) || senderPub33.length !== 33) {
+    throw new Error('senderPub33 must be 33-byte compressed pubkey');
+  }
+  if (typeof prevoutHashHex !== 'string' || !/^[0-9a-fA-F]{64}$/.test(prevoutHashHex)) {
+    throw new Error('prevoutHashHex must be 32-byte txid hex (64 chars)');
+  }
+  if (!Number.isInteger(prevoutN) || prevoutN < 0) {
+    throw new Error('prevoutN must be a non-negative integer');
+  }
+
+  const outpointStr = `${prevoutHashHex}${String(prevoutN)}`;
+  return calculatePaycodeSharedSecret(scanPrivBytes, senderPub33, outpointStr);
 }
 
 export function deriveRpaSessionKeys(sharedSecret: Uint8Array, txidHex = '', vout = 0): RpaSessionKeys {

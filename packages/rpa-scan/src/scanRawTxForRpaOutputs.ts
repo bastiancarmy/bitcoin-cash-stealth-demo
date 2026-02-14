@@ -1,10 +1,7 @@
-// packages/src/scanRawTxForRpaOutputs.ts
-
-import type { RpaMatch, ScanRawTxForRpaOutputsParams } from "./types.js";
+// packages/rpa-scan/src/scanRawTxForRpaOutputs.ts
 
 import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { sha256 } from "@noble/hashes/sha2.js";
-import { ripemd160 } from "@noble/hashes/legacy.js";
 
 import {
   bytesToHex,
@@ -12,20 +9,29 @@ import {
   reverseBytes,
   bytesToBigInt,
   decodeVarInt,
+  hash160,
 } from "@bch-stealth/utils";
 
-import { deriveRpaOneTimePrivReceiver } from "@bch-stealth/rpa-derive";
+import {
+  deriveRpaOneTimePrivReceiver,
+  deriveRpaSharedSecretReceiver,
+} from "@bch-stealth/rpa-derive";
+
+import type { RpaMatch, ScanRawTxForRpaOutputsParams } from "./types.js";
 
 /**
- * Minimal hash160 helper (sha256 -> ripemd160).
+ * Txid = reverseBytes(sha256(sha256(rawTxBytes))).
  */
-function hash160(b: Uint8Array): Uint8Array {
-  return ripemd160(sha256(b));
+function txidFromRawTxHex(rawTxHex: string): string {
+  const raw = hexToBytes(rawTxHex);
+  const h1 = sha256(raw);
+  const h2 = sha256(h1);
+  return bytesToHex(reverseBytes(h2));
 }
 
 /**
  * Raw tx stores input outpoint txid as little-endian bytes.
- * Normalize to standard (display) txid hex.
+ * Normalize to standard (display) txid hex (big-endian display).
  */
 function txidHexFromRawInputTxidLE(txidBytesLE: Uint8Array): string {
   if (!(txidBytesLE instanceof Uint8Array) || txidBytesLE.length !== 32) {
@@ -43,49 +49,43 @@ function readU32LE(bytes: Uint8Array, pos: number): number {
   ) >>> 0;
 }
 
-/**
- * Txid = reverseBytes(sha256(sha256(rawTxBytes))).
- */
-function txidFromRawTxHex(rawTxHex: string): string {
-  const raw = hexToBytes(rawTxHex);
-  const h1 = sha256(raw);
-  const h2 = sha256(h1);
-  return bytesToHex(reverseBytes(h2));
-}
-
-type ParsedTx = {
-  txidHex: string;
+type ParsedTxLike = {
+  txid?: string; // optional convenience
+  txidHex?: string; // legacy name, optional
   inputs: Array<{
-    prevoutTxidHex: string;         // BE display txid hex
-    prevoutTxidBytesLE: Uint8Array; // raw LE bytes as encoded in tx
-    prevoutN: number;
+    txid: string; // prevout txid (display hex, BE)
+    vout: number; // prevout index
     scriptSig: Uint8Array;
   }>;
   outputs: Array<{
-    vout: number;
-    valueSats: bigint;
+    value: string; // sats as string (matches current scanner expectations)
     scriptPubKey: Uint8Array;
   }>;
 };
 
-function parseTx(rawTxHex: string): ParsedTx {
+/**
+ * Minimal raw tx parser sufficient for scanning:
+ * - reads inputs (prevout txid, vout, scriptSig)
+ * - reads outputs (value, scriptPubKey)
+ * - tolerates typical tx format (no token/covenant special-casing needed here)
+ */
+function parseTx(rawTxHex: string): ParsedTxLike {
   const bytes = hexToBytes(rawTxHex);
   let pos = 0;
 
-  // version
+  // version (4)
   pos += 4;
 
   // inputs
   const inCount = decodeVarInt(bytes, pos);
   pos += inCount.length;
 
-  const inputs: ParsedTx["inputs"] = [];
+  const inputs: ParsedTxLike["inputs"] = [];
   for (let i = 0; i < inCount.value; i++) {
     const prevHashLE = bytes.slice(pos, pos + 32);
     pos += 32;
 
     const prevoutTxidHex = txidHexFromRawInputTxidLE(prevHashLE);
-    const prevoutTxidBytesLE = prevHashLE;
 
     const prevoutN = readU32LE(bytes, pos);
     pos += 4;
@@ -96,17 +96,21 @@ function parseTx(rawTxHex: string): ParsedTx {
     const scriptSig = bytes.slice(pos, pos + scrLen.value);
     pos += scrLen.value;
 
-    // sequence
+    // sequence (4)
     pos += 4;
 
-    inputs.push({ prevoutTxidHex, prevoutTxidBytesLE, prevoutN, scriptSig });
+    inputs.push({
+      txid: prevoutTxidHex,
+      vout: prevoutN,
+      scriptSig,
+    });
   }
 
   // outputs
   const outCount = decodeVarInt(bytes, pos);
   pos += outCount.length;
 
-  const outputs: ParsedTx["outputs"] = [];
+  const outputs: ParsedTxLike["outputs"] = [];
   for (let vout = 0; vout < outCount.value; vout++) {
     const valueLE = bytes.slice(pos, pos + 8);
     const valueSats = bytesToBigInt(reverseBytes(valueLE));
@@ -118,314 +122,272 @@ function parseTx(rawTxHex: string): ParsedTx {
     const scriptPubKey = bytes.slice(pos, pos + scrLen.value);
     pos += scrLen.value;
 
-    outputs.push({ vout, valueSats, scriptPubKey });
+    outputs.push({
+      value: valueSats.toString(),
+      scriptPubKey,
+    });
   }
 
+  const txidHex = txidFromRawTxHex(rawTxHex);
+
   return {
-    txidHex: txidFromRawTxHex(rawTxHex),
+    txid: txidHex,
+    txidHex,
     inputs,
     outputs,
   };
 }
 
 /**
- * Parse script pushes (enough for P2PKH scriptSig).
+ * Extract the pubkey from a standard P2PKH scriptSig.
+ * Typical form: <sigPush ...> <pubPush 33B>
  */
-function parseScriptPushes(script: Uint8Array): Uint8Array[] {
-  const pushes: Uint8Array[] = [];
-  let i = 0;
+function extractP2pkhPubkeyFromScriptSig(scriptSig: Uint8Array | string): Uint8Array | null {
+  const ss = scriptSig instanceof Uint8Array ? scriptSig : hexToBytes(scriptSig);
+  if (ss.length < 35) return null;
 
-  while (i < script.length) {
-    const op = script[i++];
+  // For standard P2PKH: final push is pubkey (33 bytes)
+  const pushLen = ss[ss.length - 34];
+  if (pushLen !== 33) return null;
 
-    if (op >= 1 && op <= 75) {
-      const n = op;
-      pushes.push(script.slice(i, i + n));
-      i += n;
-      continue;
-    }
+  const pub33 = ss.slice(ss.length - 33);
+  if (pub33.length !== 33) return null;
+  if (pub33[0] !== 0x02 && pub33[0] !== 0x03) return null;
 
-    if (op === 0x4c) {
-      if (i + 1 > script.length) break;
-      const n = script[i++];
-      pushes.push(script.slice(i, i + n));
-      i += n;
-      continue;
-    }
-
-    if (op === 0x4d) {
-      if (i + 2 > script.length) break;
-      const n = script[i] | (script[i + 1] << 8);
-      i += 2;
-      pushes.push(script.slice(i, i + n));
-      i += n;
-      continue;
-    }
-
-    if (op === 0x4e) {
-      if (i + 4 > script.length) break;
-      const n =
-        script[i] |
-        (script[i + 1] << 8) |
-        (script[i + 2] << 16) |
-        (script[i + 3] << 24);
-      i += 4;
-      pushes.push(script.slice(i, i + n));
-      i += n;
-      continue;
-    }
-
-    break;
-  }
-
-  return pushes;
+  return pub33;
 }
 
-function extractP2pkhPubkeyFromScriptSig(scriptSig: Uint8Array): Uint8Array | null {
-  const pushes = parseScriptPushes(scriptSig);
-  if (pushes.length < 2) return null;
+/** P2PKH scriptPubKey -> hash160 (20B) or null */
+function parseP2pkhHash160(scriptPubKey: Uint8Array | string): Uint8Array | null {
+  const spk = scriptPubKey instanceof Uint8Array ? scriptPubKey : hexToBytes(scriptPubKey);
 
-  // Standard P2PKH: <sig> <pubkey33>
-  const pub = pushes[1];
-  if (!(pub instanceof Uint8Array) || pub.length !== 33) return null;
-  if (pub[0] !== 0x02 && pub[0] !== 0x03) return null;
-
-  return pub;
-}
-
-/**
- * Find a P2PKH pattern *anywhere* inside scriptPubKey.
- * Pattern: 76 a9 14 <20> 88 ac
- */
-function findP2pkhHash160(scriptPubKey: Uint8Array): Uint8Array | null {
-  for (let i = 0; i + 25 <= scriptPubKey.length; i++) {
-    if (
-      scriptPubKey[i] === 0x76 &&
-      scriptPubKey[i + 1] === 0xa9 &&
-      scriptPubKey[i + 2] === 0x14 &&
-      scriptPubKey[i + 23] === 0x88 &&
-      scriptPubKey[i + 24] === 0xac
-    ) {
-      return scriptPubKey.slice(i + 3, i + 23);
-    }
+  // OP_DUP OP_HASH160 PUSH20 <20B> OP_EQUALVERIFY OP_CHECKSIG
+  if (
+    spk.length === 25 &&
+    spk[0] === 0x76 &&
+    spk[1] === 0xa9 &&
+    spk[2] === 0x14 &&
+    spk[23] === 0x88 &&
+    spk[24] === 0xac
+  ) {
+    return spk.slice(3, 23);
   }
   return null;
 }
 
-function getDebugLevel(): 0 | 1 | 2 {
-  const raw = String(process.env.BCH_STEALTH_DEBUG_SCAN ?? "").trim().toLowerCase();
-  if (!raw || raw === "0" || raw === "false") return 0;
-  if (raw === "2") return 2;
-  return 1;
-}
-
-// DROP-IN REPLACEMENT for: export function scanRawTxForRpaOutputs(...)
+/**
+ * Scan raw tx for RPA stealth P2PKH outputs spendable by (scanPrivBytes, spendPrivBytes).
+ *
+ * Additions:
+ * - indexHints?: number[] (tried first)
+ * - stopOnFirstMatch?: boolean (useful for --txid mode)
+ * - off-by-one fix: scans indices [0..maxRoleIndex-1] by default
+ *
+ * Speedup:
+ * - compute sharedSecret ONCE per vin and reuse across indices
+ */
 export function scanRawTxForRpaOutputs(params: ScanRawTxForRpaOutputsParams): RpaMatch[] {
   const {
     rawTxHex,
     scanPrivBytes,
     spendPrivBytes,
-    maxRoleIndex = 8,
-    maxMatches = 64,
-  } = params as any;
+    maxRoleIndex = 2048,
+    parsedTx = null,
 
-  const dbg = getDebugLevel();
-  const tx = parseTx(rawTxHex);
+    indexHints = null,
+    stopOnFirstMatch = false,
+    maxMatches = Infinity,
+  } = params ?? ({} as any);
 
-  // Only consider outputs that contain a P2PKH pattern (tolerates token prefix)
-  const outs: Array<{
-    vout: number;
-    valueSats: bigint;
-    scriptPubKey: Uint8Array;
-    hash160Hex: string;
-  }> = [];
+  if (typeof rawTxHex !== "string" || rawTxHex.length < 20) {
+    throw new Error("scanRawTxForRpaOutputs: rawTxHex required");
+  }
+  if (!(scanPrivBytes instanceof Uint8Array) || scanPrivBytes.length !== 32) {
+    throw new Error("scanRawTxForRpaOutputs: scanPrivBytes must be 32 bytes");
+  }
+  if (!(spendPrivBytes instanceof Uint8Array) || spendPrivBytes.length !== 32) {
+    throw new Error("scanRawTxForRpaOutputs: spendPrivBytes must be 32 bytes");
+  }
 
-  for (const o of tx.outputs) {
-    const h160 = findP2pkhHash160(o.scriptPubKey);
+  // ✅ Use provided parsedTx if caller has it; otherwise use our minimal parser.
+  const tx: any = parsedTx ?? parseTx(rawTxHex);
+
+  // Prefer tx.txid if present; else compute from raw.
+  const txid: string = (tx as any)?.txid ?? (tx as any)?.txidHex ?? txidFromRawTxHex(rawTxHex);
+
+  // Map output hash160Hex -> outputs
+  const outputsByH160 = new Map<
+    string,
+    Array<{ txid: string; vout: number; valueSats: string; hash160Hex: string; lockingBytecodeHex: string }>
+  >();
+
+  let totalP2pkhOutputs = 0;
+
+  for (let vout = 0; vout < (tx.outputs?.length ?? 0); vout++) {
+    const out = tx.outputs[vout];
+    const h160 = parseP2pkhHash160(out.scriptPubKey);
     if (!h160) continue;
 
-    outs.push({
-      vout: o.vout,
-      valueSats: o.valueSats,
-      scriptPubKey: o.scriptPubKey,
-      hash160Hex: bytesToHex(h160),
-    });
+    totalP2pkhOutputs++;
+
+    const hash160Hex = bytesToHex(h160);
+    const lockingBytecodeHex =
+      typeof out.scriptPubKey === "string" ? out.scriptPubKey : bytesToHex(out.scriptPubKey);
+
+    const entry = {
+      txid,
+      vout,
+      valueSats: String(out.value),
+      hash160Hex,
+      lockingBytecodeHex,
+    };
+
+    const arr = outputsByH160.get(hash160Hex) ?? [];
+    arr.push(entry);
+    outputsByH160.set(hash160Hex, arr);
   }
 
-  if (outs.length === 0) return [];
-
-  // Dedupe guarantee: only one match per outpoint (txid:vout)
-  const matchedOutpoints = new Set<string>();
+  if (outputsByH160.size === 0) return [];
 
   const matches: RpaMatch[] = [];
+  const seen = new Set<string>(); // txid:vout
 
-  if (dbg >= 1) {
-    // eslint-disable-next-line no-console
-    console.log("🔎 scanRawTxForRpaOutputs v4: dedupe+stop-on-match", {
-      txid: tx.txidHex,
-      inputs: tx.inputs.length,
-      outs: outs.length,
-      maxRoleIndex,
-    });
+  const maxN = Math.max(0, Math.floor(Number(maxRoleIndex) || 0));
+  const maxM = Number.isFinite(Number(maxMatches))
+    ? Math.max(0, Math.floor(Number(maxMatches)))
+    : Infinity;
+
+  // prepare hints: dedupe + clamp
+  let hintList: number[] = [];
+  if (Array.isArray(indexHints) && indexHints.length > 0) {
+    const s = new Set<number>();
+    for (const x of indexHints) {
+      const n = Math.floor(Number(x));
+      if (!Number.isFinite(n)) continue;
+      if (n < 0 || n >= maxN) continue;
+      s.add(n);
+    }
+    hintList = Array.from(s);
   }
 
-  // Prefer vout-first index probing (because your builder uses index=0 payment, index=1 change)
-  // but still allow 0..maxRoleIndex to be searched for non-vout-aligned builders.
-  const buildIndexCandidates = (vout: number): number[] => {
-    const set = new Set<number>();
-    if (vout >= 0 && vout <= maxRoleIndex) set.add(vout);
-    for (let i = 0; i <= maxRoleIndex; i++) set.add(i);
-    return Array.from(set.values());
+  const maybeStop = (): boolean => {
+    if (stopOnFirstMatch && matches.length > 0) return true;
+    if (Number.isFinite(maxM) && matches.length >= maxM) return true;
+    if (seen.size >= totalP2pkhOutputs && totalP2pkhOutputs > 0) return true;
+    return false;
   };
 
-  for (let inIdx = 0; inIdx < tx.inputs.length; inIdx++) {
-    const inp = tx.inputs[inIdx];
+  for (let vin = 0; vin < (tx.inputs?.length ?? 0); vin++) {
+    const inp = tx.inputs[vin];
 
-    const senderPubFromSig = extractP2pkhPubkeyFromScriptSig(inp.scriptSig);
+    // only scan standard P2PKH inputs (needs pubkey)
+    const senderPub33 = extractP2pkhPubkeyFromScriptSig(inp.scriptSig);
+    if (!senderPub33) continue;
 
-    const senderPubCandidates: Uint8Array[] = [];
-    if (senderPubFromSig) senderPubCandidates.push(senderPubFromSig);
+    const senderPub33Hex = bytesToHex(senderPub33);
 
-    const extra = String(process.env.BCH_STEALTH_SENDER_PUB33_HEXES ?? "").trim();
-    if (extra) {
-      for (const h of extra.split(",").map((s) => s.trim()).filter(Boolean)) {
-        try {
-          const b = hexToBytes(h);
-          if (b.length === 33 && (b[0] === 0x02 || b[0] === 0x03)) senderPubCandidates.push(b);
-        } catch {
-          // ignore
-        }
-      }
-    }
+    // ✅ locked-in policy: use display txid hex "as-is"
+    // With our local parseTx, inp.txid is the BE display txid.
+    const prevoutHashHex = inp.txid;
+    const prevoutTxidHex = inp.txid; // compatibility
+    const prevoutN = inp.vout;
 
-    if (senderPubCandidates.length === 0) {
-      if (dbg >= 2) {
-        // eslint-disable-next-line no-console
-        console.log("🔎 scan skip input (no sender pubkey)", {
-          txid: tx.txidHex,
-          inputIndex: inIdx,
-          prevout: `${inp.prevoutTxidHex}:${inp.prevoutN}`,
-          scriptSigLen: inp.scriptSig?.length ?? 0,
-        });
-      }
+    if (typeof prevoutHashHex !== "string" || prevoutHashHex.length !== 64) continue;
+    if (!Number.isFinite(prevoutN)) continue;
+
+    // ✅ compute shared secret ONCE per vin
+    let sharedSecret32: Uint8Array;
+    try {
+      sharedSecret32 = deriveRpaSharedSecretReceiver(
+        scanPrivBytes,
+        senderPub33,
+        prevoutHashHex,
+        prevoutN
+      );
+    } catch {
       continue;
     }
+    const sharedSecretHex = bytesToHex(sharedSecret32);
 
-    // Try both txid interpretations (BE display vs LE raw) because earlier codepaths differed.
-    const prevoutTxidHexBE = inp.prevoutTxidHex;
-    const prevoutTxidHexLE = bytesToHex(inp.prevoutTxidBytesLE);
-    const prevoutVariants = [prevoutTxidHexBE, prevoutTxidHexLE];
+    const tried = new Set<number>();
 
-    for (const senderPub33 of senderPubCandidates) {
-      const senderPub33Hex = bytesToHex(senderPub33);
+    const tryIndex = (index: number): boolean => {
+      if (index < 0 || index >= maxN) return false;
+      if (tried.has(index)) return false;
+      tried.add(index);
 
-      for (const out of outs) {
-        const outpointKey = `${tx.txidHex}:${out.vout}`;
-        if (matchedOutpoints.has(outpointKey)) continue; // ✅ dedupe + stop scanning this outpoint
+      let oneTimePriv: Uint8Array;
+      try {
+        // IMPORTANT: rpa-derive must expose the new optional param in its published types.
+        // After rebuilding rpa-derive, this call compiles and runs.
+        ({ oneTimePriv } = deriveRpaOneTimePrivReceiver(
+          scanPrivBytes,
+          spendPrivBytes,
+          senderPub33,
+          prevoutHashHex,
+          prevoutN,
+          index,
+          sharedSecret32 // ✅ reuse
+        ) as any);
+      } catch {
+        return false;
+      }
 
-        const indexCandidates = buildIndexCandidates(out.vout);
+      const pub33 = secp256k1.getPublicKey(oneTimePriv, true);
+      const h160Hex = bytesToHex(hash160(pub33));
 
-        let matched: {
-          oneTimePriv: Uint8Array;
-          sharedSecret: Uint8Array;
-          usedPrevoutTxidHex: string;
-          usedIndex: number;
-          oneTimeHash160Hex: string;
-        } | null = null;
+      const outs = outputsByH160.get(h160Hex);
+      if (!outs) return false;
 
-        outer: for (const prevoutTxidHex of prevoutVariants) {
-          for (const idx of indexCandidates) {
-            let r: any;
-            try {
-              r = deriveRpaOneTimePrivReceiver(
-                scanPrivBytes,
-                spendPrivBytes,
-                senderPub33,
-                prevoutTxidHex,
-                inp.prevoutN,
-                idx
-              );
-            } catch {
-              continue;
-            }
-
-            const oneTimePriv = r.oneTimePriv as Uint8Array;
-            const sharedSecret = r.sharedSecret as Uint8Array;
-
-            const oneTimePub33 = secp256k1.getPublicKey(oneTimePriv, true);
-            const oneTimeHash160Hex = bytesToHex(hash160(oneTimePub33));
-
-            if (dbg >= 2) {
-              // eslint-disable-next-line no-console
-              console.log("🔎 probe", {
-                txid: tx.txidHex,
-                inputIndex: inIdx,
-                vout: out.vout,
-                want: out.hash160Hex,
-                got: oneTimeHash160Hex,
-                prevoutTxidHex,
-                prevoutN: inp.prevoutN,
-                idx,
-                senderPub33Hex,
-              });
-            }
-
-            if (oneTimeHash160Hex !== out.hash160Hex) continue;
-
-            matched = {
-              oneTimePriv,
-              sharedSecret,
-              usedPrevoutTxidHex: prevoutTxidHex,
-              usedIndex: idx,
-              oneTimeHash160Hex,
-            };
-            break outer;
-          }
-        }
-
-        if (!matched) continue;
-
-        // ✅ Mark as matched so we never emit duplicates for this outpoint.
-        matchedOutpoints.add(outpointKey);
-
-        if (dbg >= 1) {
-          // eslint-disable-next-line no-console
-          console.log("🔎 match", {
-            outpoint: outpointKey,
-            valueSats: String(out.valueSats),
-            senderPub33Hex,
-            prevoutTxidHex: matched.usedPrevoutTxidHex,
-            prevoutN: inp.prevoutN,
-            index: matched.usedIndex,
-          });
-        }
+      for (const o of outs) {
+        const key = `${o.txid}:${o.vout}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
 
         matches.push({
-          txid: tx.txidHex,
-          vout: out.vout,
-          valueSats: out.valueSats,
-          lockingBytecodeHex: bytesToHex(out.scriptPubKey),
-          hash160Hex: matched.oneTimeHash160Hex,
-          roleIndex: matched.usedIndex,
+          txid: o.txid,
+          vout: o.vout,
 
-          matchedInput: {
-            prevoutTxidHex: inp.prevoutTxidHex,
-            prevoutN: inp.prevoutN,
-            senderPub33Hex,
-          },
+          // keep both
+          valueSats: o.valueSats,
+          value: o.valueSats,
+
+          lockingBytecodeHex: o.lockingBytecodeHex,
+          hash160Hex: o.hash160Hex,
+
+          roleIndex: index,
 
           rpaContext: {
             senderPub33Hex,
-            prevoutTxidHex: matched.usedPrevoutTxidHex,
-            prevoutHashHex: matched.usedPrevoutTxidHex,
-            prevoutN: inp.prevoutN,
-            index: matched.usedIndex,
-            sharedSecretHex: bytesToHex(matched.sharedSecret),
+            prevoutTxidHex,
+            prevoutHashHex,
+            prevoutN,
+            index,
+            sharedSecretHex,
+          },
+          matchedInput: {
+            vin,
+            prevoutTxidHex,
+            prevoutHashHex,
+            prevoutN,
+            senderPub33Hex,
           },
         } as any);
 
-        if (matches.length >= maxMatches) return matches;
+        if (maybeStop()) return true;
       }
+
+      return false;
+    };
+
+    // 1) hints first
+    for (let i = 0; i < hintList.length; i++) {
+      if (tryIndex(hintList[i]!)) return matches;
+    }
+
+    // 2) full scan: OFF-BY-ONE FIX: [0 .. maxN-1]
+    for (let index = 0; index < maxN; index++) {
+      if (tryIndex(index)) return matches;
     }
   }
 

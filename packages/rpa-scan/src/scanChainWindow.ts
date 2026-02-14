@@ -1,11 +1,11 @@
-// packages/src/scanChainWindow.ts
+// packages/rpa-scan/src/scanChainWindow.ts
 
 import type { RpaMatch, ScanChainWindowParams } from "./types.js";
 import { scanRawTxForRpaOutputs } from "./scanRawTxForRpaOutputs.js";
 
 /**
  * Scan a bounded chain window by txid list.
- * This stays library-friendly by asking the caller for `listTxidsInWindow` and `fetchRawTxHex`.
+ * Stays library-friendly by asking the caller for `listTxidsInWindow` and `fetchRawTxHex`.
  */
 export async function scanChainWindow(params: ScanChainWindowParams): Promise<RpaMatch[]> {
   const {
@@ -15,7 +15,10 @@ export async function scanChainWindow(params: ScanChainWindowParams): Promise<Rp
     endHeight,
     scanPrivBytes,
     spendPrivBytes,
-    maxRoleIndex
+    maxRoleIndex,
+
+    indexHints = null,
+    stopOnFirstMatch = false,
   } = params;
 
   const txids = await listTxidsInWindow({ startHeight, endHeight });
@@ -23,13 +26,18 @@ export async function scanChainWindow(params: ScanChainWindowParams): Promise<Rp
   const matches: RpaMatch[] = [];
   for (const txid of txids) {
     const rawTxHex = await fetchRawTxHex(txid);
+
     const found = scanRawTxForRpaOutputs({
       rawTxHex,
       scanPrivBytes,
       spendPrivBytes,
-      maxRoleIndex
-    });
+      maxRoleIndex,
+      indexHints,
+      stopOnFirstMatch,
+    } as any);
+
     matches.push(...found);
+    if (stopOnFirstMatch && matches.length > 0) break;
   }
 
   return matches;

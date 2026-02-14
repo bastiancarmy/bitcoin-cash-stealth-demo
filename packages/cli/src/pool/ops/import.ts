@@ -13,7 +13,8 @@ import { toPoolShardsState, patchShardFromNextPoolState } from '../adapters.js';
 import { parsePrivKeyInput, decodeWifToPrivBytes, wifVersionHint } from '../wif.js';
 import { pubkeyHashFromPriv } from '../../utils.js';
 
-import { deriveSpendPriv32FromScanPriv32 } from '@bch-stealth/rpa-derive';
+import { normalizeWalletKeys, debugPrintKeyFlags } from '../../wallet/normalizeKeys.js';
+
 
 function shouldDebug(): boolean {
   return (
@@ -95,27 +96,6 @@ function loudBaseImportWarning(args: { dep: DepositRecord; expectedH160Hex: stri
   );
 }
 
-function normalizeReceiverSpendPriv(args: {
-  scanPriv32: Uint8Array;
-  spendPriv32?: Uint8Array | null;
-}): { spendPriv32: Uint8Array; wasDerived: boolean; wasOverridden: boolean } {
-  const expected = deriveSpendPriv32FromScanPriv32(args.scanPriv32);
-
-  // missing/invalid => derive
-  if (!(args.spendPriv32 instanceof Uint8Array) || args.spendPriv32.length !== 32) {
-    return { spendPriv32: expected, wasDerived: true, wasOverridden: false };
-  }
-
-  // mismatch => override
-  const a = bytesToHex(args.spendPriv32).toLowerCase();
-  const b = bytesToHex(expected).toLowerCase();
-  if (a !== b) {
-    return { spendPriv32: expected, wasDerived: false, wasOverridden: true };
-  }
-
-  // ok
-  return { spendPriv32: args.spendPriv32, wasDerived: false, wasOverridden: false };
-}
 // --------------------------
 // Stealth record bridge helpers
 // --------------------------
@@ -125,17 +105,14 @@ function outpointKey(txid: string, vout: number): string {
 }
 
 function readStealthUtxosFromAnyState(stateAny: any): StealthUtxoRecord[] {
-  // New envelope (preferred)
-  const a = stateAny?.data?.pool?.state?.stealthUtxos;
+  const a = stateAny?.data?.stealthUtxos;
   if (Array.isArray(a)) return a as StealthUtxoRecord[];
 
-  // Sometimes pool-state object itself might carry stealthUtxos
-  const c = stateAny?.pool?.state?.stealthUtxos ?? stateAny?.poolState?.stealthUtxos ?? stateAny?.stealthUtxos;
-  if (Array.isArray(c)) return c as StealthUtxoRecord[];
-
-  // Legacy top-level
-  const b = stateAny?.stealthUtxos;
+  const b = stateAny?.data?.pool?.state?.stealthUtxos;
   if (Array.isArray(b)) return b as StealthUtxoRecord[];
+
+  const c = stateAny?.stealthUtxos;
+  if (Array.isArray(c)) return c as StealthUtxoRecord[];
 
   return [];
 }
@@ -228,26 +205,14 @@ async function importDepositToShardOnce(args: {
 
     const receiverWallet = ctx.me.wallet;
 
-    const scanPriv32 = receiverWallet.scanPrivBytes ?? receiverWallet.privBytes;
-    if (!(scanPriv32 instanceof Uint8Array) || scanPriv32.length !== 32) {
-      throw new Error('import: receiver scanPrivBytes must be 32 bytes');
-    }
-    
-    const norm = normalizeReceiverSpendPriv({
-      scanPriv32,
-      spendPriv32: receiverWallet.spendPrivBytes ?? null,
-    });
-    
-    if (shouldDebug()) {
-      if (norm.wasDerived) console.log('[import:debug] spendKey: derived (from scan key)');
-      if (norm.wasOverridden) console.log('[import:debug] spendKey: overridden (config mismatch; using derived)');
-    }
-    
-    const prevoutHashHex = (rpaCtx.prevoutHashHex ?? rpaCtx.prevoutTxidHex) as string;
+    const nk = normalizeWalletKeys(receiverWallet);
+    debugPrintKeyFlags('pool-import', nk.flags);
+
+    const prevoutHashHex = String((rpaCtx.prevoutHashHex ?? rpaCtx.prevoutTxidHex) as string);
     
     const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
-      scanPriv32,
-      norm.spendPriv32,
+      nk.scanPriv32,
+      nk.spendPriv32,
       senderPaycodePub33,
       prevoutHashHex,
       rpaCtx.prevoutN,
