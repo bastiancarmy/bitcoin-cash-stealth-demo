@@ -1,16 +1,25 @@
 // packages/cli/src/commands/pool.ts
 import type { Command } from 'commander';
-import fs from 'node:fs';
+import type { Network } from '@bch-stealth/electrum';
 
-import { POOL_STATE_STORE_KEY } from '@bch-stealth/pool-state';
-import { DUST } from '../config.js';
+import { connectElectrum } from '@bch-stealth/electrum';
+import {
+  FileBackedPoolStateStore,
+  POOL_STATE_STORE_KEY,
+  ensurePoolStateDefaults,
+  getLatestUnimportedDeposit,
+  markStealthSpent,
+} from '@bch-stealth/pool-state';
+import { bytesToHex, hexToBytes, reverseBytes, sha256 } from '@bch-stealth/utils';
+
+import { DUST, NETWORK } from '../config.js';
 
 import { runInit } from '../pool/ops/init.js';
 import { runImport } from '../pool/ops/import.js';
 import { runWithdraw } from '../pool/ops/withdraw.js';
 
-// ✅ already present in your file
 import { registerPoolWithdrawCheck } from './pool-withdraw-check.js';
+import { loadStateOrEmpty, saveState } from '../pool/state.js';
 
 export type MakePoolCtx = () => Promise<any>;
 export type GetActivePaths = () => { stateFile: string };
@@ -19,36 +28,6 @@ function getOrCreateSubcommand(program: Command, name: string, description: stri
   const existing = (program.commands ?? []).find((c) => c.name() === name);
   if (existing) return existing;
   return program.command(name).description(description);
-}
-
-function readJsonOrNull(p: string): any | null {
-  try {
-    if (!p) return null;
-    if (!fs.existsSync(p)) return null;
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-// NOTE: your state file is currently wrapped like:
-// { schemaVersion, updatedAt, data: { pool: { state: {...} } } }
-function extractPoolStateFromStateFileJson(stFileJson: any): any | null {
-  if (!stFileJson || typeof stFileJson !== 'object') return null;
-
-  // Preferred: current wrapper shape
-  const wrapped = stFileJson?.data?.pool?.state;
-  if (wrapped && typeof wrapped === 'object') return wrapped;
-
-  // Alternate: if a store writes by key at top-level
-  const byKey = stFileJson?.[POOL_STATE_STORE_KEY];
-  if (byKey && typeof byKey === 'object') return byKey;
-
-  // Legacy-ish: stFileJson.pool?.state
-  const legacy = stFileJson?.pool?.state;
-  if (legacy && typeof legacy === 'object') return legacy;
-
-  return null;
 }
 
 function parseOutpointOrThrow(outpoint: string): { txid: string; vout: number } {
@@ -68,6 +47,31 @@ function shortHex(x: any, n = 10): string {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
+async function isOutpointUnspentByLockingScript(args: {
+  network: Network;
+  txid: string;
+  vout: number;
+  lockingBytecodeHex: string;
+}): Promise<boolean> {
+  const script = hexToBytes(args.lockingBytecodeHex);
+  const scripthash = bytesToHex(reverseBytes(sha256(script)));
+
+  const c = await connectElectrum(args.network);
+  try {
+    const utxos = await c.request('blockchain.scripthash.listunspent', scripthash);
+    if (!Array.isArray(utxos)) return false;
+
+    const wantTxid = args.txid.toLowerCase();
+    const wantVout = Number(args.vout);
+
+    return utxos.some(
+      (u: any) => String(u?.tx_hash ?? '').toLowerCase() === wantTxid && Number(u?.tx_pos) === wantVout
+    );
+  } finally {
+    await c.disconnect().catch(() => {});
+  }
+}
+
 export function registerPoolCommands(
   program: Command,
   deps: {
@@ -85,14 +89,13 @@ export function registerPoolCommands(
     .option('--json', 'print raw JSON', false)
     .action(async (opts) => {
       const { stateFile } = deps.getActivePaths();
-      const stFile = readJsonOrNull(stateFile);
 
-      const poolState = extractPoolStateFromStateFileJson(stFile);
-      if (!poolState) {
-        throw new Error(`pool shards: no pool state found in ${stateFile} (did you run "bchctl pool init"?)`);
-      }
+      const store = new FileBackedPoolStateStore({ filename: stateFile });
+      const st0 = await loadStateOrEmpty({ store, networkDefault: String(NETWORK) });
+      const poolState = ensurePoolStateDefaults(st0, String(NETWORK));
 
-      const shards: any[] = Array.isArray(poolState.shards) ? poolState.shards : [];
+      // Preserve prior UX: show "no shards" if not initialized
+      const shards: any[] = Array.isArray((poolState as any).shards) ? (poolState as any).shards : [];
       if (!shards.length) {
         console.log('no shards');
         return;
@@ -115,9 +118,9 @@ export function registerPoolCommands(
             {
               meta: {
                 stateFile,
-                poolIdHex: String(poolState.poolIdHex ?? ''),
-                categoryHex: String(poolState.categoryHex ?? ''),
-                shardCount: Number(poolState.shardCount ?? shards.length),
+                poolIdHex: String((poolState as any).poolIdHex ?? ''),
+                categoryHex: String((poolState as any).categoryHex ?? ''),
+                shardCount: Number((poolState as any).shardCount ?? shards.length),
                 totalSats: totalSats.toString(),
               },
               shards,
@@ -129,11 +132,10 @@ export function registerPoolCommands(
         return;
       }
 
-      // pretty output
       console.log(`state: ${stateFile}`);
-      console.log(`poolId: ${shortHex(poolState.poolIdHex, 40)}`);
-      console.log(`category: ${shortHex(poolState.categoryHex, 40)}`);
-      console.log(`shardCount: ${String(poolState.shardCount ?? shards.length)}`);
+      console.log(`poolId: ${shortHex((poolState as any).poolIdHex, 40)}`);
+      console.log(`category: ${shortHex((poolState as any).categoryHex, 40)}`);
+      console.log(`shardCount: ${String((poolState as any).shardCount ?? shards.length)}`);
       console.log(`total: ${totalSats.toString()} sats`);
       console.log('');
 
@@ -205,33 +207,97 @@ export function registerPoolCommands(
         depositTxid = p.txid;
         depositVout = p.vout;
       } else if (opts.txid && String(opts.txid).trim()) {
-        const txid = String(opts.txid).trim();
-        if (!/^[0-9a-fA-F]{64}$/.test(txid)) throw new Error(`invalid --txid (expected 64-hex): ${txid}`);
+        // Strict parsing for user-provided input (do not "continue" here)
+        const txid = String(opts.txid).trim().toLowerCase();
+        if (!/^[0-9a-f]{64}$/.test(txid)) {
+          throw new Error(`invalid --txid (expected 64-hex): ${String(opts.txid)}`);
+        }
+
         const vout = Number(String(opts.vout ?? '0').trim());
-        if (!Number.isFinite(vout) || vout < 0) throw new Error(`invalid --vout: ${String(opts.vout)}`);
-        depositTxid = txid.toLowerCase();
+        if (!Number.isFinite(vout) || vout < 0) {
+          throw new Error(`invalid --vout: ${String(opts.vout)}`);
+        }
+
+        depositTxid = txid;
         depositVout = vout;
       } else if (opts.latest) {
-        const stFile = readJsonOrNull(stateFile);
-        const poolState = extractPoolStateFromStateFileJson(stFile);
-        if (!poolState) throw new Error(`pool import --latest: no pool state found in ${stateFile}`);
+        // ✅ single source of truth: load via store helpers
+        const store = new FileBackedPoolStateStore({ filename: stateFile });
+        const st0 = await loadStateOrEmpty({ store, networkDefault: String(NETWORK) });
+        const st = ensurePoolStateDefaults(st0, String(NETWORK));
 
-        const utxos = Array.isArray(poolState.stealthUtxos) ? poolState.stealthUtxos : [];
-        if (utxos.length === 0) {
-          throw new Error(`pool import --latest: no stealthUtxos found in state file: ${stateFile}`);
+        // 1) Prefer: latest unimported deposit (canonical intent)
+        const latestDep = getLatestUnimportedDeposit(st, null);
+        if (latestDep && /^[0-9a-fA-F]{64}$/.test(String(latestDep.txid ?? ''))) {
+          depositTxid = String(latestDep.txid).toLowerCase();
+          depositVout = Number(latestDep.vout ?? 0);
+          if (!Number.isFinite(depositVout) || depositVout < 0) {
+            throw new Error(`pool import --latest: malformed vout in latest deposit record`);
+          }
+          console.log(`ℹ using latest unimported deposit: ${depositTxid}:${depositVout}`);
+        } else {
+        // 2) Fallback: latest stealthUtxo that is NOT change AND is unspent
+        const utxos = Array.isArray(st.stealthUtxos) ? st.stealthUtxos : [];
+
+        const isChange = (r: any): boolean => {
+          const p = String(r?.purpose ?? '').toLowerCase();
+          return p.includes('change'); // covers pool_withdraw_change, send_change, etc.
+        };
+
+        // iterate newest -> oldest so "latest" means most recent eligible
+        let chosen: { txid: string; vout: number } | null = null;
+
+        for (let i = utxos.length - 1; i >= 0; i--) {
+          const r = utxos[i];
+
+          if (!r || isChange(r)) continue;
+
+          const txid = String(r?.txid ?? '').trim();
+          const vout = Number(r?.vout ?? 0);
+
+          // NOTE: lockingBytecodeHex is currently present in your stored records but not in the type,
+          // so we access it via `any` to avoid TS errors.
+          const lockingBytecodeHex = String((r as any)?.lockingBytecodeHex ?? '').trim();
+
+          if (!/^[0-9a-fA-F]{64}$/.test(txid)) continue;
+          if (!Number.isFinite(vout) || vout < 0) continue;
+          if (!lockingBytecodeHex) continue;
+
+          const unspent = await isOutpointUnspentByLockingScript({
+            network: String(st.network ?? NETWORK ?? 'chipnet'),
+            txid,
+            vout,
+            lockingBytecodeHex,
+          });
+
+          if (!unspent) {
+            // ✅ mark as spent-ish so it stops being confusing; we don't know the spending txid here
+            markStealthSpent(st, txid.toLowerCase(), vout, 'unknown');
+            continue;
+          }
+
+          chosen = { txid: txid.toLowerCase(), vout };
+          break;
         }
-        const last = utxos[utxos.length - 1];
-        const txid = String(last.txid ?? last.txidHex ?? '').trim();
-        const vout = Number(last.vout ?? last.n ?? 0);
-        if (!/^[0-9a-fA-F]{64}$/.test(txid)) {
-          throw new Error(`pool import --latest: malformed txid in last stealthUtxo record`);
+
+        if (!chosen) {
+          // Persist any "spent" markings we made while filtering
+          await saveState({ store, state: st, networkDefault: String(st.network ?? NETWORK ?? 'chipnet') });
+
+          throw new Error(
+            `pool import --latest: no deposit candidates found.\n` +
+              `Tip: --latest prefers state.deposits; fallback excludes *change* stealthUtxos and requires unspent.\n` +
+              `stateFile=${stateFile}`
+          );
         }
-        if (!Number.isFinite(vout) || vout < 0) {
-          throw new Error(`pool import --latest: malformed vout in last stealthUtxo record`);
+
+        // Persist any "spent" markings we made while filtering (and keep state tidy)
+        await saveState({ store, state: st, networkDefault: String(st.network ?? NETWORK ?? 'chipnet') });
+
+        depositTxid = chosen.txid;
+        depositVout = chosen.vout;
+        console.log(`ℹ using latest deposit-candidate stealthUtxo: ${depositTxid}:${depositVout}`);
         }
-        depositTxid = txid.toLowerCase();
-        depositVout = vout;
-        console.log(`ℹ using latest stealthUtxo: ${depositTxid}:${depositVout}`);
       } else {
         throw new Error('pool import: provide <outpoint> or --txid (optionally --vout) or --latest');
       }

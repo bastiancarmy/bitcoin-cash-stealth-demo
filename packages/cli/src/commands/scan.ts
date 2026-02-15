@@ -1,23 +1,11 @@
 // packages/cli/src/commands/scan.ts
 //
-// What this changes:
-// - Dedupe discovered results by outpoint before printing (so "found: 1").
-// - Dedupe merged state by outpoint before writing.
-// - Default (no flags): derive a 1-byte RPA prefix from wallet scanPrivBytes.
-// - Normalize --rpa-prefix into the *server-expected* 1–2 byte hex prefix (2–4 hex chars).
-//   (Your server rejects longer strings like "76a91456".)
-// - Keeps --txid mode as a bypass/debug tool (no prefix required).
-// - More defensive raw-tx fetch: tolerates Fulcrum returning an object (verbose) with a `.hex` field.
-// - Adds a small fetch progress indicator for better UX.
-// - Fixes state split-brain: when stateFile is a pool-state envelope (schemaVersion + data.pool.state),
-//   --update-state writes into data.pool.state.stealthUtxos (the canonical location pool import reads),
-//   and removes top-level stealthUtxos to avoid confusion.
-// - BigInt-safe state writes (no JSON.stringify crash).
-//
-// Server RPC constraint observed on chipnet/Fulcrum:
-//   prefixHex must be 2..4 hex chars (1–2 bytes).
+// Single-source-of-truth update:
+// - indexHints and update-state now go through pool-state store helpers (no raw JSON writes).
+// - scan logic remains unchanged otherwise.
 
 import type { Command } from 'commander';
+
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -27,17 +15,13 @@ import { NETWORK } from '../config.js';
 import type { LoadedWallet } from '../wallets.js';
 
 import type { StealthUtxoRecord } from '@bch-stealth/pool-state';
-import {
-  hexToBytes,
-  bytesToHex,
-  encodeCashAddr,
-  decodeCashAddress,
-  sha256,
-  concat,
-} from '@bch-stealth/utils';
+import { FileBackedPoolStateStore, upsertStealthUtxo } from '@bch-stealth/pool-state';
+
+import { hexToBytes, bytesToHex, encodeCashAddr, decodeCashAddress, sha256, concat } from '@bch-stealth/utils';
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 
 import { normalizeWalletKeys, debugPrintKeyFlags } from '../wallet/normalizeKeys.js';
+import { loadStateOrEmpty, saveState } from '../pool/state.js';
 
 type ScanFlags = {
   sinceHeight?: number;
@@ -49,35 +33,8 @@ type ScanFlags = {
   txid?: string;
 };
 
-function fileExists(p: string): boolean {
-  try {
-    fs.accessSync(p, fs.constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function ensureDirForFile(filePath: string) {
   fs.mkdirSync(path.dirname(path.resolve(filePath)), { recursive: true });
-}
-
-function readJsonOrNull<T>(p: string): T | null {
-  if (!fileExists(p)) return null;
-  return JSON.parse(fs.readFileSync(p, 'utf8')) as T;
-}
-
-// BigInt-safe + Uint8Array-safe JSON write
-function writeJsonPretty(p: string, v: unknown) {
-  ensureDirForFile(p);
-
-  const bigIntReplacer = (_k: string, value: unknown) => {
-    if (typeof value === 'bigint') return value.toString(10);
-    if (value instanceof Uint8Array) return bytesToHex(value);
-    return value;
-  };
-
-  fs.writeFileSync(p, JSON.stringify(v, bigIntReplacer, 2) + '\n', 'utf8');
 }
 
 function getOutpointKey(r: any): string {
@@ -98,64 +55,27 @@ function dedupeByOutpoint<T>(records: T[]): T[] {
   return out;
 }
 
-// Detect pool-state envelope and return canonical stealthUtxos container
-function getPoolStateStealthUtxosContainer(obj: any): { root: any; key: 'stealthUtxos' } | null {
-  const poolState = obj?.data?.pool?.state;
-  if (poolState && typeof poolState === 'object') {
-    return { root: poolState, key: 'stealthUtxos' };
-  }
-  return null;
-}
-
-function coerceArray<T>(v: any): T[] {
-  return Array.isArray(v) ? (v as T[]) : [];
-}
-
 // ✅ Robust normalization for Electrum/Fulcrum responses.
-// Handles:
-// - string hex
-// - Uint8Array / Buffer
-// - String object
-// - verbose tx objects that include a `.hex` field (even if non-enumerable)
-// - wrappers like `{ result: <hex> }`, `{ raw: <hex> }`, etc.
 function normalizeHexString(value: unknown, label: string): string {
   if (typeof value === 'string') return value;
-
   if (value instanceof Uint8Array) return bytesToHex(value);
-
-  // Handle String objects (rare, but can happen)
   if (value instanceof String) return String(value.valueOf());
 
-  // Node Buffer is a Uint8Array subclass, but keep this anyway:
   const anyVal: any = value as any;
-  if (
-    anyVal &&
-    typeof anyVal === 'object' &&
-    typeof anyVal.length === 'number' &&
-    typeof anyVal.readUInt8 === 'function'
-  ) {
-    return bytesToHex(new Uint8Array(anyVal));
-  }
-
-  if (value && typeof value === 'object') {
-    const o: any = value;
-
-    // Check common fields using `in` so non-enumerable fields still work
+  if (anyVal && typeof anyVal === 'object') {
     const fieldCandidates = ['hex', 'raw', 'result', 'data', 'tx', 'transaction'];
     for (const k of fieldCandidates) {
-      if (k in o) {
-        const v = o[k];
+      if (k in anyVal) {
+        const v = anyVal[k];
         if (typeof v === 'string') return v;
         if (v instanceof Uint8Array) return bytesToHex(v);
         if (v instanceof String) return String(v.valueOf());
       }
     }
-
-    // Some servers may wrap bytes as ArrayBuffer
-    if (o instanceof ArrayBuffer) return bytesToHex(new Uint8Array(o));
-    if (o?.buffer instanceof ArrayBuffer && typeof o?.byteLength === 'number') {
+    if (anyVal instanceof ArrayBuffer) return bytesToHex(new Uint8Array(anyVal));
+    if (anyVal?.buffer instanceof ArrayBuffer && typeof anyVal?.byteLength === 'number') {
       try {
-        return bytesToHex(new Uint8Array(o.buffer, o.byteOffset ?? 0, o.byteLength));
+        return bytesToHex(new Uint8Array(anyVal.buffer, anyVal.byteOffset ?? 0, anyVal.byteLength));
       } catch {
         // ignore
       }
@@ -171,9 +91,7 @@ function unwrapRpcValue<T = unknown>(v: unknown, label: string): T {
   if (v instanceof Error) throw new Error(`${label}: electrum returned Error: ${v.message}`);
   if (v && typeof v === 'object' && (v as any).error) {
     const msg =
-      (v as any).error?.message ??
-      (v as any).error?.error ??
-      JSON.stringify((v as any).error);
+      (v as any).error?.message ?? (v as any).error?.error ?? JSON.stringify((v as any).error);
     throw new Error(`${label}: electrum returned error: ${msg}`);
   }
   return v as T;
@@ -222,13 +140,6 @@ function parseTxidOrThrow(raw: unknown): string {
   return txid;
 }
 
-/**
- * Server expects 1–2 bytes hex (2–4 chars).
- * User may pass:
- *  - "56" or "56ab" (preferred)
- *  - cashaddr -> derive 1 byte from decoded hash160
- *  - "76a91456" (script prefix) -> we extract "56"
- */
 const P2PKH_SCRIPT_PREFIX_HEX = '76a914';
 
 function normalizeRpaPrefixHexOrThrow(opts: ScanFlags): string {
@@ -242,20 +153,16 @@ function normalizeRpaPrefixHexOrThrow(opts: ScanFlags): string {
     );
   }
 
-  // Cashaddr: decode to hash160 and default to 1-byte prefix
+  // Cashaddr -> 1 byte prefix from hash160
   if (raw.includes(':')) {
     const decoded: any = decodeCashAddress(raw);
     const h: unknown = decoded?.hash;
     const type: unknown = decoded?.type;
 
-    if (type !== 'P2PKH') {
-      throw new Error(`scan: --rpa-prefix cashaddr must be P2PKH (got ${String(type ?? 'unknown')})`);
-    }
-    if (!(h instanceof Uint8Array) || h.length !== 20) {
-      throw new Error('scan: --rpa-prefix cashaddr decode failed (expected 20-byte hash160)');
-    }
+    if (type !== 'P2PKH') throw new Error(`scan: --rpa-prefix cashaddr must be P2PKH (got ${String(type ?? 'unknown')})`);
+    if (!(h instanceof Uint8Array) || h.length !== 20) throw new Error('scan: --rpa-prefix cashaddr decode failed (expected 20-byte hash160)');
 
-    return bytesToHex(h.slice(0, 1)).toLowerCase(); // 1 byte => 2 hex chars
+    return bytesToHex(h.slice(0, 1)).toLowerCase();
   }
 
   const p0 = cleanHexPrefix(raw);
@@ -264,19 +171,12 @@ function normalizeRpaPrefixHexOrThrow(opts: ScanFlags): string {
 
   let p = p0.toLowerCase();
 
-  // If user passed script prefix: 76a914<hash160...>, extract after 76a914
-  if (p.startsWith(P2PKH_SCRIPT_PREFIX_HEX)) {
-    p = p.slice(P2PKH_SCRIPT_PREFIX_HEX.length);
-  }
+  if (p.startsWith(P2PKH_SCRIPT_PREFIX_HEX)) p = p.slice(P2PKH_SCRIPT_PREFIX_HEX.length);
 
-  // Server constraint: 1–2 bytes only
   if (p.length < 2) throw new Error('scan: --rpa-prefix must be at least 1 byte (2 hex chars)');
-  if (p.length > 4) p = p.slice(0, 4); // truncate to 2 bytes max
+  if (p.length > 4) p = p.slice(0, 4);
 
-  if (p.length !== 2 && p.length !== 4) {
-    throw new Error('scan: --rpa-prefix must resolve to 1–2 bytes (2–4 hex chars)');
-  }
-
+  if (p.length !== 2 && p.length !== 4) throw new Error('scan: --rpa-prefix must resolve to 1–2 bytes (2–4 hex chars)');
   return p;
 }
 
@@ -300,10 +200,6 @@ function p2pkhCashaddrFromHash160Hex(network: string, h160Hex: string): string {
   return encodeCashAddr(cashaddrPrefixFromNetwork(network), 'P2PKH', hexToBytes(h160Hex));
 }
 
-/**
- * Resolve profile/stateFile using commander "global" opts when available, to prevent
- * profile leaks (e.g. `--profile bob scan` writing to alice state).
- */
 function resolveProfileAndStateFile(
   program: Command,
   depsActive: { profile: string; stateFile: string },
@@ -323,9 +219,8 @@ function resolveProfileAndStateFile(
   return { profile, stateFile };
 }
 
-function detectOwnerHint(existing: any): string | null {
+function detectOwnerHintFromPoolState(st: any): string | null {
   try {
-    const st = existing?.data?.pool?.state;
     const a = st?.restoreHints?.ownerTag;
     if (typeof a === 'string' && a.trim()) return a.trim();
 
@@ -336,12 +231,6 @@ function detectOwnerHint(existing: any): string | null {
   }
   return null;
 }
-
-// ✅ Updated registerScanCommand: add indexHints extraction + wire indexHints/stopOnFirstMatch into scanChainWindowAny
-// Notes:
-// - Reads state once at the top (existingStateJson) and reuses it for update-state merge.
-// - indexHints is null when empty (so rpa-scan can treat as "no hints").
-// - stopOnFirstMatch is enabled only for --txid mode.
 
 export function registerScanCommand(
   program: Command,
@@ -363,25 +252,18 @@ export function registerScanCommand(
     .option('--include-mempool', 'also scan unconfirmed RPA txs', false)
     .option('--txid <TXID>', 'Scan a single txid (bypasses Fulcrum RPA candidate selection).')
     .option('--all', 'Also print hex internals (hash160 + RPA context fields).', false)
-    // IMPORTANT: receive `cmd` as 2nd arg so we can read global flags reliably
     .action(async (opts: ScanFlags, cmd: any) => {
       const me = await deps.loadMeWallet();
       const all = !!opts.all;
 
-      // Resolve profile + stateFile safely (globals win)
       const ap = deps.getActivePaths();
       const { profile, stateFile } = resolveProfileAndStateFile(program, ap, cmd);
 
-      // Read existing state ONCE (for hints + optional update-state merge later)
-      // If file doesn't exist, this becomes {} and hints stay empty.
-      const existingStateJson = readJsonOrNull<any>(stateFile) ?? {};
+      // ✅ Single source of truth: use store/state for indexHints too
+      const store0 = new FileBackedPoolStateStore({ filename: stateFile });
+      const st0 = await loadStateOrEmpty({ store: store0, networkDefault: String(NETWORK) });
 
-      // ✅ indexHints: last few observed indices (roleIndex or rpaContext.index)
-      const poolContainer0 = getPoolStateStealthUtxosContainer(existingStateJson);
-      const targetRoot0 = poolContainer0 ? poolContainer0.root : existingStateJson;
-      const existingRecords0 = coerceArray<any>(
-        targetRoot0[poolContainer0 ? poolContainer0.key : ('stealthUtxos' as const)]
-      );
+      const existingRecords0 = Array.isArray(st0.stealthUtxos) ? st0.stealthUtxos : [];
 
       const lastIdxs = existingRecords0
         .map((r: any) => r?.roleIndex ?? r?.rpaContext?.index)
@@ -404,7 +286,6 @@ export function registerScanCommand(
         console.log(`[scan:debug] indexHints=${indexHints ? indexHints.join(',') : '(none)'}`);
       }
 
-      // use injected deps when provided (tests), otherwise default adapter
       const electrumAny: { connectElectrum: (args: { network: string }) => Promise<any> } =
         deps.electrum ??
         ({
@@ -432,7 +313,6 @@ export function registerScanCommand(
 
         const endHeight = tipHeight;
 
-        // direct txid scan mode
         const singleTxid = opts.txid ? parseTxidOrThrow(opts.txid) : null;
 
         // --- keys ---
@@ -461,9 +341,7 @@ export function registerScanCommand(
 
         const rpaPrefixHex: string = singleTxid
           ? (opts.rpaPrefix ? normalizeRpaPrefixHexOrThrow(opts) : '(none)')
-          : (opts.rpaPrefix
-              ? normalizeRpaPrefixHexOrThrow(opts)
-              : deriveWalletDefaultRpaPrefixHex(receiverScanPriv32));
+          : (opts.rpaPrefix ? normalizeRpaPrefixHexOrThrow(opts) : deriveWalletDefaultRpaPrefixHex(receiverScanPriv32));
 
         if (nk.flags.spendWasDerived) console.log(`spendKey:       derived (from scan key)`);
         if (nk.flags.spendWasOverridden) console.log(`spendKey:       overridden (config mismatch; using derived)`);
@@ -534,10 +412,8 @@ export function registerScanCommand(
           fetched++;
           if (total > 0 && (fetched === 1 || fetched === total || fetched % 25 === 0)) tickFetch();
 
-          // Try non-verbose raw first
           let resp: any = await client.request('blockchain.transaction.get', txid, false);
 
-          // Fulcrum sometimes returns an object (verbose) with .hex even when false-ish
           try {
             const rawHex = normalizeHexString(resp, 'scan: transaction.get');
             if (rawHex.length % 2 !== 0) throw new Error(`scan: invalid rawtx hex length for ${txid}`);
@@ -546,7 +422,6 @@ export function registerScanCommand(
             // retry below
           }
 
-          // Some servers accept 0
           resp = await client.request('blockchain.transaction.get', txid, 0);
 
           const rawHex = normalizeHexString(resp, 'scan: transaction.get');
@@ -569,7 +444,6 @@ export function registerScanCommand(
         console.log(`candidates:     ${candidateTxids.length}`);
         console.log(`updateState:    ${opts.updateState ? 'yes' : 'no'}`);
 
-        // ✅ NEW: indexHints + stopOnFirstMatch wiring
         const discoveredRaw = await scanChainWindowAny({
           startHeight,
           endHeight,
@@ -589,7 +463,6 @@ export function registerScanCommand(
         const discovered = dedupeByOutpoint(discoveredRaw as any[]);
         console.log(`found:          ${discovered.length}`);
 
-        // Optional detailed output for --all (preserve "internals" feature)
         if (all && discovered.length > 0) {
           for (const r of discovered as any[]) {
             const h160 = String(r?.hash160Hex ?? '');
@@ -607,11 +480,12 @@ export function registerScanCommand(
 
         ensureDirForFile(stateFile);
 
-        // ✅ Reuse already-read JSON (so hints + merge are consistent)
-        const existing = existingStateJson;
+        // ✅ Load canonical state (again) using a fresh store instance (safe, avoids any tool caching assumptions)
+        const store = new FileBackedPoolStateStore({ filename: stateFile });
+        const st = await loadStateOrEmpty({ store, networkDefault: String(NETWORK) });
 
-        // Safety guard: refuse cross-profile writes (helps prevent silent corruption)
-        const ownerHint = detectOwnerHint(existing);
+        // Safety guard: refuse cross-profile writes
+        const ownerHint = detectOwnerHintFromPoolState(st);
         if (ownerHint && ownerHint !== profile) {
           throw new Error(
             `scan: refusing to write: state file appears to belong to another profile.\n` +
@@ -621,39 +495,21 @@ export function registerScanCommand(
           );
         }
 
-        const poolContainer = getPoolStateStealthUtxosContainer(existing);
-        const targetRoot = poolContainer ? poolContainer.root : existing;
-        const targetKey = poolContainer ? poolContainer.key : ('stealthUtxos' as const);
+        // Merge discovered into canonical list
+        for (const recAny of discovered as any[]) {
+          const rec = recAny as StealthUtxoRecord;
 
-        const existingRecords = coerceArray<StealthUtxoRecord>(targetRoot[targetKey]);
+          // Ensure owner tag for new records (do NOT overwrite if present)
+          if (!(rec as any).owner) (rec as any).owner = profile;
 
-        // merge + dedupe
-        const merged = dedupeByOutpoint<StealthUtxoRecord>([
-          ...existingRecords,
-          ...(discovered as any as StealthUtxoRecord[]),
-        ]);
-
-        // Ensure owner tag is set for newly added records (do NOT overwrite if present)
-        for (const r of merged as any[]) {
-          if (!r.owner) r.owner = profile;
+          upsertStealthUtxo(st, rec);
         }
 
-        targetRoot[targetKey] = merged;
-
-        // Prevent split-brain legacy field if needed
-        if (poolContainer && Array.isArray((existing as any).stealthUtxos)) {
-          delete (existing as any).stealthUtxos;
-        }
-
-        // Make sure top-level envelope timestamps exist if you use them
-        (existing as any).updatedAt = new Date().toISOString();
-        if (!(existing as any).schemaVersion) (existing as any).schemaVersion = 1;
-
-        writeJsonPretty(stateFile, existing);
+        await saveState({ store, state: st, networkDefault: String(NETWORK) });
 
         console.log('');
         console.log(`stateFile:      ${stateFile}`);
-        console.log(`stateUtxos:     ${merged.length}`);
+        console.log(`stateUtxos:     ${Array.isArray(st.stealthUtxos) ? st.stealthUtxos.length : 0}`);
       } finally {
         try {
           await client.disconnect();

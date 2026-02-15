@@ -1,15 +1,112 @@
 // packages/cli/src/pool/state.ts
 
-import type { PoolState, StealthUtxoRecord, FileBackedPoolStateStore } from '@bch-stealth/pool-state';
-
-import { ensurePoolStateDefaults, markStealthSpent, readPoolState, writePoolState } from '@bch-stealth/pool-state';
-
+import type { PoolState, PoolStateStore, StealthUtxoRecord, FileBackedPoolStateStore } from '@bch-stealth/pool-state';
 import type { WalletLike } from './context.js';
+
+import {
+  POOL_STATE_STORE_KEY,
+  ensurePoolStateDefaults,
+  readPoolState,
+  upsertStealthUtxo,
+} from '@bch-stealth/pool-state';
 
 import { bytesToHex, hexToBytes } from '@bch-stealth/utils';
 import { deriveRpaOneTimePrivReceiver } from '@bch-stealth/rpa';
 import { pubkeyHashFromPriv } from '../utils.js';
 import { normalizeWalletKeys, debugPrintKeyFlags } from '../wallet/normalizeKeys.js';
+
+// -------------------------------------------------------------------------------------
+// Canonicalization helpers
+// -------------------------------------------------------------------------------------
+
+/**
+ * Legacy store keys that may contain stealth utxos arrays.
+ *
+ * IMPORTANT:
+ * - PoolState itself lives under `POOL_STATE_STORE_KEY` (== "pool.state")
+ *   which maps to file.data.pool.state in FileBackedPoolStateStore.
+ * - These legacy keys therefore refer to file.data.<keyPath>.
+ */
+const LEGACY_STEALTH_KEYS = [
+  // written by packages/pool-state/src/legacy.ts
+  'stealth.utxos',
+
+  // possible older CLI key(s)
+  'stealthUtxos',
+] as const;
+
+function isLikelyTxid(x: unknown): x is string {
+  return typeof x === 'string' && /^[0-9a-f]{64}$/i.test(x);
+}
+
+function toOutpointKey(txid: unknown, vout: unknown): string | null {
+  if (!isLikelyTxid(txid)) return null;
+  const n = Number(vout);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return `${txid.toLowerCase()}:${n}`;
+}
+
+/**
+ * Merge legacy stealth-utxo arrays (stored under separate store keys)
+ * into canonical `pool.state.stealthUtxos`, deduping by txid:vout.
+ *
+ * - Prefers canonical list if duplicates exist
+ * - Normalizes entries via pool-state helper upsertStealthUtxo()
+ * - Returns diagnostic counts
+ */
+function mergeLegacyStealthUtxosIntoPoolState(args: {
+  store: PoolStateStore;
+  poolState: PoolState;
+}): { mergedCount: number; sources: Record<string, number> } {
+  const { store } = args;
+  const st = ensurePoolStateDefaults(args.poolState);
+
+  // ensure canonical list exists
+  st.stealthUtxos ??= [];
+
+  // index existing canonical outpoints
+  const have = new Set<string>();
+  for (const r of st.stealthUtxos) {
+    const k = toOutpointKey((r as any)?.txid, (r as any)?.vout);
+    if (k) have.add(k);
+  }
+
+  let mergedCount = 0;
+  const sources: Record<string, number> = {};
+
+  for (const key of LEGACY_STEALTH_KEYS) {
+    const legacy = store.get<any>(key);
+    if (!Array.isArray(legacy) || legacy.length === 0) continue;
+
+    let fromThisKey = 0;
+
+    for (const rec of legacy) {
+      const k = toOutpointKey(rec?.txid, rec?.vout);
+      if (!k) continue;
+
+      // canonical wins
+      if (have.has(k)) continue;
+
+      try {
+        upsertStealthUtxo(st, rec);
+        have.add(k);
+        mergedCount++;
+        fromThisKey++;
+      } catch {
+        // ignore malformed legacy entries
+      }
+    }
+
+    if (fromThisKey > 0) sources[key] = fromThisKey;
+  }
+
+  return { mergedCount, sources };
+}
+
+function deleteLegacyStealthKeys(store: PoolStateStore): void {
+  for (const key of LEGACY_STEALTH_KEYS) store.delete(key);
+}
+
 /**
  * Create an empty PoolState shell.
  * Keep callable with no args for backwards-compat with older CLI call sites.
@@ -24,8 +121,11 @@ export function emptyPoolState(networkDefault: string = 'chipnet'): PoolState {
 
 /**
  * Load state via pool-state store helpers; return an empty state if missing.
- * NOTE: uses @bch-stealth/pool-state readPoolState/writePoolState to avoid coupling
- * to FileBackedPoolStateStore method names.
+ *
+ * SINGLE SOURCE OF TRUTH:
+ * - Reads canonical pool.state (via readPoolState)
+ * - Merges legacy stealth keys into st.stealthUtxos IN-MEMORY
+ * - Does not flush on load (saveState is responsible for canonical-only writes)
  */
 export async function loadStateOrEmpty(args: {
   store: FileBackedPoolStateStore;
@@ -33,12 +133,26 @@ export async function loadStateOrEmpty(args: {
 }): Promise<PoolState> {
   const { store, networkDefault } = args;
 
-  const st = await readPoolState({ store, networkDefault });
-  if (!st) return emptyPoolState(networkDefault);
+  const st0 = await readPoolState({ store, networkDefault });
+  const st = ensurePoolStateDefaults(st0 ?? emptyPoolState(networkDefault));
+
+  // store is loaded by readPoolState; we can safely read legacy keys now
+  const { mergedCount } = mergeLegacyStealthUtxosIntoPoolState({ store, poolState: st });
+
+  // keep canonical-only in memory; legacy keys are removed on save
+  if (mergedCount > 0) {
+    // nothing else needed here; saveState will delete legacy keys
+  }
 
   return ensurePoolStateDefaults(st);
 }
 
+/**
+ * Save state canonically:
+ * - Writes only POOL_STATE_STORE_KEY (pool.state)
+ * - Deletes legacy stealth keys in the store (to prevent split-brain)
+ * - Flushes once
+ */
 export async function saveState(args: {
   store: FileBackedPoolStateStore;
   state: PoolState;
@@ -46,8 +160,18 @@ export async function saveState(args: {
 }): Promise<void> {
   const { store, state, networkDefault } = args;
 
-  const st = ensurePoolStateDefaults(state);
-  await writePoolState({ store, state: st, networkDefault });
+  const st = ensurePoolStateDefaults(state, networkDefault);
+
+  // Ensure store loaded (writePoolState would do this too, but we need to delete legacy keys pre-flush)
+  await store.load();
+
+  // Canonical write
+  store.set(POOL_STATE_STORE_KEY, ensurePoolStateDefaults(st, networkDefault));
+
+  // Legacy cleanup (single source of truth)
+  deleteLegacyStealthKeys(store);
+
+  await store.flush();
 }
 
 // -------------------------------------------------------------------------------------
@@ -85,13 +209,11 @@ function errToString(e: unknown): string {
   }
 }
 
-// PATCH: selectFundingUtxo()
-// - Stealth: skip locally-marked spent records (spent/spentAt/spentByTxid/spentInTxid) BEFORE any chain calls.
-//           when we detect on-chain spent, mark locally using a backward/forward-compatible marker set.
-// - Base: don’t assume getUtxos is perfectly fresh. Iterate candidates (largest-first) and:
-//         fetch prevout, derive hash160, call isP2pkhOutpointUnspent, and skip/record stale if spent.
-//         (So both “base” and “stealth” paths treat “spent” deterministically.)
-
+/**
+ * PATCH: selectFundingUtxo()
+ * - Stealth: skip locally-marked spent records BEFORE chain calls.
+ * - Base: iterate candidates largest-first; validate prevout and isP2pkhOutpointUnspent to avoid stale UTXO lists.
+ */
 export async function selectFundingUtxo(args: {
   mode: 'wallet-send' | 'pool-op';
   prefer?: Array<'base' | 'stealth'>;
@@ -184,24 +306,8 @@ export async function selectFundingUtxo(args: {
     return confirmationsFrom(utxo, tipHeight) >= minConfirmations;
   }
 
-  function pickLargest(utxos: any[]): any | null {
-    if (!utxos.length) return null;
-    let best = utxos[0];
-    let bestV = toValueSats(best);
-    for (let i = 1; i < utxos.length; i++) {
-      const v = toValueSats(utxos[i]);
-      if (v > bestV) {
-        best = utxos[i];
-        bestV = v;
-      }
-    }
-    return best;
-  }
-
-  // --- NEW: local spent markers (forward/backward compatible) ---
+  // --- local spent markers (forward/backward compatible) ---
   function isLocallySpentStealth(r: any): boolean {
-    // old marker: spentInTxid
-    // new markers: spent=true, spentByTxid, spentAt
     return Boolean(
       r?.spent === true ||
         (typeof r?.spentInTxid === 'string' && r.spentInTxid.trim()) ||
@@ -215,7 +321,6 @@ export async function selectFundingUtxo(args: {
     for (const r of recs) {
       if (!r) continue;
       if (String(r.txid) === String(txid) && Number(r.vout) === Number(vout)) {
-        // keep both old + new marker styles
         (r as any).spent = true;
         (r as any).spentAt = new Date().toISOString();
         (r as any).spentByTxid = String(spentByTxid);
@@ -242,7 +347,6 @@ export async function selectFundingUtxo(args: {
 
     const st = ensurePoolStateDefaults(state);
 
-    // ✅ Canonical normalization (single source of truth)
     let nk: ReturnType<typeof normalizeWalletKeys> | null = null;
     try {
       nk = normalizeWalletKeys(wallet);
@@ -260,10 +364,11 @@ export async function selectFundingUtxo(args: {
 
     const stealthRecs = (st?.stealthUtxos ?? [])
       .filter((r) => r && r.owner === ownerTag)
-      // ✅ skip local spent markers before any chain IO
       .filter((r) => !isLocallySpentStealth(r))
       .sort((a, b) =>
-        toBigIntSats(b.valueSats ?? b.value ?? 0) > toBigIntSats(a.valueSats ?? a.value ?? 0) ? 1 : -1
+        toBigIntSats((b as any).valueSats ?? (b as any).value ?? 0) > toBigIntSats((a as any).valueSats ?? (a as any).value ?? 0)
+          ? 1
+          : -1
       );
 
     dlog({ mode, stage: 'stealth', records: stealthRecs.length, minSats: minSats.toString() });
@@ -273,13 +378,17 @@ export async function selectFundingUtxo(args: {
       dlog({
         mode,
         stage: 'stealth',
-        reject: { outpoint: `${r.txid}:${r.vout}`, reason, valueSats: r.valueSats, hash160Hex: r.hash160Hex },
+        reject: { outpoint: `${r.txid}:${r.vout}`, reason, valueSats: r.valueSats, hash160Hex: (r as any).hash160Hex },
         ...(extra ? { extra } : {}),
       });
     }
 
     for (const r of stealthRecs) {
-      const unspent = await chainIO.isP2pkhOutpointUnspent({ txid: r.txid, vout: r.vout, hash160Hex: r.hash160Hex });
+      const unspent = await chainIO.isP2pkhOutpointUnspent({
+        txid: r.txid,
+        vout: r.vout,
+        hash160Hex: (r as any).hash160Hex,
+      });
       if (!unspent) {
         rejectStealth(r, 'spent');
         if (markStaleStealthRecords) markStealthSpentCompat(st, r.txid, r.vout, '<spent>');
@@ -305,10 +414,10 @@ export async function selectFundingUtxo(args: {
       }
 
       const expectedH160 = parseP2pkhHash160(prev.scriptPubKey);
-      if (!expectedH160 || bytesToHex(expectedH160) !== r.hash160Hex) {
+      if (!expectedH160 || bytesToHex(expectedH160) !== (r as any).hash160Hex) {
         rejectStealth(r, 'prevout-mismatch', {
           expected: expectedH160 ? bytesToHex(expectedH160) : null,
-          record: r.hash160Hex,
+          record: (r as any).hash160Hex,
         });
         continue;
       }
@@ -346,8 +455,8 @@ export async function selectFundingUtxo(args: {
       );
 
       const { h160 } = pubkeyHashFromPriv(oneTimePriv);
-      if (bytesToHex(h160) !== r.hash160Hex) {
-        rejectStealth(r, 'derivation-mismatch', { derived: bytesToHex(h160), record: r.hash160Hex });
+      if (bytesToHex(h160) !== (r as any).hash160Hex) {
+        rejectStealth(r, 'derivation-mismatch', { derived: bytesToHex(h160), record: (r as any).hash160Hex });
         continue;
       }
 
@@ -396,7 +505,6 @@ export async function selectFundingUtxo(args: {
       .filter((u) => u && (allowTokens ? true : !u.token_data && !isTokenUtxo(u)))
       .filter((u) => confirmedEnough(u, tipHeight))
       .filter((u) => toValueSats(u) >= minSats)
-      // sort largest-first so we can iterate with validation
       .sort((a, b) => (toValueSats(b) > toValueSats(a) ? 1 : -1));
 
     dlog({
@@ -435,7 +543,6 @@ export async function selectFundingUtxo(args: {
         continue;
       }
 
-      // ✅ parity with stealth: verify “actually unspent” using the same chainIO helper
       const unspent = await chainIO.isP2pkhOutpointUnspent({
         txid: cand.txid,
         vout: cand.vout,
