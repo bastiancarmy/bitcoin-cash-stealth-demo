@@ -229,7 +229,10 @@ async function makePoolCtx(): Promise<PoolOpContext> {
 // Command registration
 // -------------------------------------------------------------------------------------
 registerProfileCommands(program, { getActivePaths });
-registerWalletCommands(program, { getActivePaths });
+
+// UPDATED: pass network so wallet utxos can query Electrum
+registerWalletCommands(program, { getActivePaths, network: NETWORK });
+
 registerGetCommands(program, { getActivePaths });
 registerStatusCommand(program, { getActivePaths });
 registerAddrCommand(program, { getActivePaths, loadMeWallet });
