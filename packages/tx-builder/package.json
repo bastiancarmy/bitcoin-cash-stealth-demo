@@ -1,5 +1,5 @@
 {
-  "name": "@bch/tx-builder",
+  "name": "@bch-stealth/tx-builder",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -20,7 +20,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@bch/utils": "workspace:^"
+    "@bch-stealth/crypto": "workspace:^",
+    "@bch-stealth/utils": "workspace:^"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

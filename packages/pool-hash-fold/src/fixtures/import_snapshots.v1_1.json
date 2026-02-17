@@ -1,0 +1,10 @@
+[
+  {
+    "name": "chipnet_import_e20c7466_shard1_base_deposit_edbe0960_vout0",
+    "stateCategory32Hex": "688ce7200313082dc04e3d4040edcee7e80ccb26c79b3db492dbb4e7184dd232",
+    "importTxid": "e20c7466eeee2197672eb463dc32629a98655dfb91090936e0660be7c10c8361",
+    "covenantVinScriptSigHex": "20491f37e3b54729c24453321908e0ef7bbffccf2eaedbc006439b74e261626d102075289c06a66c033c7d9664836afe2046cbb45e0196c0d9ae797e6362f15f5c63",
+    "output0NftCommitment32Hex": "1f40cd6ac05364bb38e0145e30d55e2d78ccc3d7bedfecb5e7cac194fd44eed3",
+    "notes": "Pulled from chipnet import tx JSON: vin[0].scriptSig.hex and vout[0].tokenData.nft.commitment. stateCategory32Hex pulled from state.pool.state.categoryHex."
+  }
+]

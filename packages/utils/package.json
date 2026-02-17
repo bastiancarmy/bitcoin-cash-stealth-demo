@@ -1,14 +1,16 @@
 {
-  "name": "@bch/utils",
+  "name": "@bch-stealth/utils",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./cashaddr": {
+      "types": "./dist/cashaddr.d.ts",
+      "default": "./dist/cashaddr.js"
     }
   },
   "files": [
@@ -19,8 +21,11 @@
     "clean": "rm -rf dist",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
+  "dependencies": {
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1"
+  },
   "devDependencies": {
-    "@types/node": "^25.0.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.5.0"
   }
 }

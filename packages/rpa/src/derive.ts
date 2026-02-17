@@ -1,1 +1,1 @@
-export * from "@bch/rpa-derive";
+export * from "@bch-stealth/rpa-derive";

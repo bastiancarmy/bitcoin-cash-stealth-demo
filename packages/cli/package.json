@@ -1,0 +1,42 @@
+{
+  "name": "@bch-stealth/cli",
+  "description": "bchctl: CLI for BCH vault/stealth/pool operations (bch-stealth is a compatibility alias).",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "bch-stealth": "./dist/bch-stealth.js",
+    "bchctl": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "yarn build && node --test ./dist/tests"
+  },
+  "dependencies": {
+    "@bch-stealth/utils": "workspace:^",
+    "@bch-stealth/electrum": "workspace:^",
+    "@bch-stealth/rpa": "workspace:^",
+    "@bch-stealth/rpa-scan": "workspace:^",
+    "@bch-stealth/pool-state": "workspace:^",
+    "@bch-stealth/pool-shards": "workspace:^",
+    "@bch-stealth/pool-hash-fold": "workspace:^",
+    "@bch-stealth/tx-builder": "workspace:^",
+    "@noble/curves": "^2.0.0",
+    "commander": "^12.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "typescript": "^5.9.3"
+  }
+}

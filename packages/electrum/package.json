@@ -1,5 +1,5 @@
 {
-  "name": "@bch/electrum",
+  "name": "@bch-stealth/electrum",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -8,6 +8,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
       "default": "./dist/index.js"
     }
   },
@@ -17,12 +18,19 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "smoke:chipnet": "node ./dist/smoke_chipnet.js"
   },
   "dependencies": {
-    "@bch/utils": "workspace:^"
+    "@bch-stealth/utils": "workspace:*",
+    "@electrum-cash/network": "^4.1.4",
+    "@electrum-cash/web-socket": "^1.0.3",
+    "@noble/hashes": "^2.0.1",
+    "eventemitter3": "^5.0.1"
   },
   "devDependencies": {
-    "typescript": "^5.9.3"
+    "@types/node": "^25.0.3",
+    "eventemitter3": "^5.0.1",
+    "typescript": "^5.5.0"
   }
 }

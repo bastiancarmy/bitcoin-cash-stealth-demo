@@ -1,5 +1,5 @@
 {
-  "name": "@bch/pool-hash-fold",
+  "name": "@bch-stealth/pool-hash-fold",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -16,12 +16,13 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "clean": "rm -rf dist",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "test": "yarn build && node --test dist/tests",
+    "clean": "rm -rf dist tsconfig.tsbuildinfo"
   },
   "dependencies": {
-    "@bch/tx-builder": "workspace:^",
-    "@bch/utils": "workspace:^"
+    "@bch-stealth/tx-builder": "workspace:^",
+    "@bch-stealth/utils": "workspace:^",
+    "@bitauth/libauth": "3.1.0-next.8"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

@@ -1,48 +1,64 @@
+// packages/rpa-scan/src/types.ts
+
 export type Hex = string;
+
+export type RpaContext = {
+  senderPub33Hex: string;
+  prevoutTxidHex: string;
+  prevoutHashHex: string;
+  prevoutN: number;
+  index: number;
+  sharedSecretHex?: string; // optional
+};
+
+export type MatchedInput = {
+  vin: number;
+  prevoutTxidHex: string;
+  prevoutHashHex: string;
+  prevoutN: number;
+  senderPub33Hex: string;
+};
 
 export type RpaMatch = {
   txid: Hex;
   vout: number;
-  valueSats?: bigint;
-  lockingBytecodeHex: Hex;
 
-  // the derived address the scanner believes this is for
-  hash160Hex: Hex;
+  // keep both names if your callers use either (safe)
+  valueSats: string;
+  value?: string;
 
-  // optional extra metadata you may want to persist
+  lockingBytecodeHex?: string;
+  hash160Hex: string;
+
   roleIndex?: number;
-  note?: string;
+
+  rpaContext: RpaContext;
+  matchedInput: MatchedInput;
 };
 
 export type ScanRawTxForRpaOutputsParams = {
   rawTxHex: Hex;
-
   scanPrivBytes: Uint8Array;
   spendPrivBytes: Uint8Array;
 
   /**
-   * How far to scan role/index space (kept small in Phase 2).
-   * You can widen later as you add checkpoints.
+   * Treated as a RANGE LENGTH. Indices scanned are [0 .. maxRoleIndex-1]
+   * (off-by-one fix vs older <= behavior).
    */
-  maxRoleIndex: number;
+  maxRoleIndex?: number;
 
-  /**
-   * Optional: cap on candidates per tx so we never blow up.
-   */
+  parsedTx?: any;
+
+  // NEW
+  indexHints?: number[] | null;
+  stopOnFirstMatch?: boolean;
+
+  // Optional: cap number of matches returned from this tx
   maxMatches?: number;
 };
 
 export type ScanChainWindowParams = {
-  /**
-   * Your electrum helper (so this package stays pure/portable).
-   * Implement this in your repo using your existing electrum.js.
-   */
   fetchRawTxHex: (txid: Hex) => Promise<Hex>;
-
-  /**
-   * Return txids in the window. Again implemented in your repo.
-   * You might back this by: scripthash history, block ranges, or mempool.
-   */
   listTxidsInWindow: (opts: { startHeight: number; endHeight: number }) => Promise<Hex[]>;
 
   startHeight: number;
@@ -51,4 +67,8 @@ export type ScanChainWindowParams = {
   scanPrivBytes: Uint8Array;
   spendPrivBytes: Uint8Array;
   maxRoleIndex: number;
+
+  // NEW pass-through
+  indexHints?: number[] | null;
+  stopOnFirstMatch?: boolean;
 };

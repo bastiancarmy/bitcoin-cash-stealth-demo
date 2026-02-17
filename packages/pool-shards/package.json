@@ -1,7 +1,5 @@
 {
-  "name": "@bch/pool-shards",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@bch-stealth/pool-shards",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,26 +7,19 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
-    },
-    "./types": {
-      "types": "./dist/types.d.ts",
-      "default": "./dist/types.js"
     }
   },
-  "files": [
-    "dist"
-  ],
+  "files": ["dist"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "clean": "rm -rf dist",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "clean": "rm -rf dist tsconfig.tsbuildinfo",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "yarn build && node --test ./dist/tests"
   },
   "dependencies": {
-    "@bch/electrum": "workspace:^",
-    "@bch/pool-hash-fold": "workspace:^",
-    "@bch/rpa": "workspace:^",
-    "@bch/tx-builder": "workspace:^",
-    "@bch/utils": "workspace:^",
-    "typescript": "^5.9.3"
+    "@bch-stealth/tx-builder": "workspace:^",
+    "@bch-stealth/pool-hash-fold": "workspace:^",
+    "@bch-stealth/utils": "workspace:^",
+    "@bch-stealth/crypto": "workspace:^"
   }
 }

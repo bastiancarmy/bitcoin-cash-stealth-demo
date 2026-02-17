@@ -1,5 +1,5 @@
 {
-  "name": "@bch/rpa-derive",
+  "name": "@bch-stealth/rpa-derive",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -20,8 +20,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@bch/utils": "workspace:^",
-    "@noble/curves": "^1.0.0",
+    "@bch-stealth/utils": "workspace:^",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1",
     "aes-js": "^3.1.2"
   },
   "devDependencies": {
