@@ -18,6 +18,10 @@ import { deriveSelfStealthChange, recordDerivedChangeUtxo } from '../stealth/cha
 import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { deriveSpendPriv32FromScanPriv32 } from '@bch-stealth/rpa-derive';
 
+import type { Network } from '@bch-stealth/electrum';
+import { connectElectrum } from '@bch-stealth/electrum';
+import { outpointIsUnspentViaVerboseTx } from '../pool/electrum-unspent.js';
+
 function normalizeMode(mode: unknown): string | null {
   if (mode == null) return null;
   const s = String(mode).trim();
@@ -84,8 +88,36 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
       const shard = st.shards?.[shardIndex];
       if (!shard) throw new Error(`Unknown shard index ${shardIndex}`);
 
-      // fetch shard prevout from chain
+      // fetch shard prevout from chain (chainIO is authoritative for value/script)
       const shardPrev = await ctx.chainIO.getPrevOutput(shard.txid, shard.vout);
+
+      debugHeader('WITHDRAW CHECK: SHARD OUTPOINT UNPENT (ELECTRUM)');
+      {
+        // ctx.network is a string; connectElectrum expects Network
+        const c = await connectElectrum(ctx.network as unknown as Network);
+        try {
+          const res = await outpointIsUnspentViaVerboseTx({
+            c,
+            txid: shard.txid,
+            vout: shard.vout,
+          });
+          
+          console.log(
+            `[shard ${shardIndex}] ${shard.txid}:${shard.vout} -> ${res.ok ? '✅ unspent' : '❌ spent'}`
+          );
+          if (!res.ok && res.spentByTxid) console.log(`  spentBy=${res.spentByTxid}`);
+          if (res.spkHex) console.log(`  locking/full spk prefix: ${res.spkHex.slice(0, 16)}…`);
+          
+          if (!res.ok) {
+            throw new Error(
+              `withdraw-check: shard outpoint is spent per history scan: ${shard.txid}:${shard.vout}` +
+                (res.spentByTxid ? ` (spentBy=${res.spentByTxid})` : '')
+            );
+          }
+        } finally {
+          await c.disconnect().catch(() => {});
+        }
+      }
 
       // fee utxo (wallet-first)
       const feeUtxo = await selectFundingUtxo({
@@ -209,8 +241,7 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
 
       debugHeader('WITHDRAW CHECK: COVENANT UNLOCK SCRIPT SHAPE');
       {
-        const scriptSig: Uint8Array =
-          built.tx?.inputs?.[0]?.scriptSig ?? built.tx?.inputs?.[0]?.unlockingBytecode;
+        const scriptSig: Uint8Array = built.tx?.inputs?.[0]?.scriptSig ?? built.tx?.inputs?.[0]?.unlockingBytecode;
         if (!(scriptSig instanceof Uint8Array)) throw new Error('missing covenant scriptSig bytes');
 
         validatePoolHashFoldV11UnlockScriptSig(scriptSig, {

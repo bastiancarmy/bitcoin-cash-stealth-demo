@@ -47,13 +47,13 @@ function shortHex(x: any, n = 10): string {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
-async function isOutpointUnspentByLockingScript(args: {
+async function isOutpointUnspentByFullScriptPubKeyHex(args: {
   network: Network;
   txid: string;
   vout: number;
-  lockingBytecodeHex: string;
+  fullScriptPubKeyHex: string; // FULL scriptPubKey hex (tokenPrefix + locking, if any)
 }): Promise<boolean> {
-  const script = hexToBytes(args.lockingBytecodeHex);
+  const script = hexToBytes(args.fullScriptPubKeyHex);
   const scripthash = bytesToHex(reverseBytes(sha256(script)));
 
   const c = await connectElectrum(args.network);
@@ -70,6 +70,21 @@ async function isOutpointUnspentByLockingScript(args: {
   } finally {
     await c.disconnect().catch(() => {});
   }
+}
+
+async function isOutpointUnspentByLockingScript(args: {
+  network: Network;
+  txid: string;
+  vout: number;
+  lockingBytecodeHex: string;
+}): Promise<boolean> {
+  // For plain P2PKH (non-token), lockingBytecodeHex is the full scriptPubKey.
+  return isOutpointUnspentByFullScriptPubKeyHex({
+    network: args.network,
+    txid: args.txid,
+    vout: args.vout,
+    fullScriptPubKeyHex: args.lockingBytecodeHex,
+  });
 }
 
 export function registerPoolCommands(
@@ -177,65 +192,65 @@ export function registerPoolCommands(
       console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
     });
 
-  // pool import
-  pool
-    .command('import')
-    .description('Import a deposit UTXO into the pool.')
-    .argument('[outpoint]', 'deposit outpoint as txid:vout (optional if using --txid or --latest)')
-    .option('--txid <txid>', 'deposit txid (optional; pairs with --vout or defaults vout=0)', '')
-    .option('--vout <n>', 'deposit vout (default 0 if used with --txid)', '0')
-    .option('--latest', 'use the most recently-saved stealthUtxo from state file', false)
-    .option('--shard <i>', 'shard index (default: derived)', '')
-    .option('--fresh', 'force a new import even if already marked imported', false)
-    .option(
-      '--allow-base',
-      'ALLOW importing a non-RPA base P2PKH deposit (requires BCH_STEALTH_ALLOW_BASE_IMPORT=1).',
-      false
-    )
-    .option('--deposit-wif <wif>', 'WIF for base P2PKH deposit key (optional).', '')
-    .option('--deposit-privhex <hex>', 'Hex private key for base P2PKH deposit key (optional).', '')
-    .action(async (outpointArg, opts) => {
-      deps.assertChipnet();
+// pool import
+pool
+  .command('import')
+  .description('Import a deposit UTXO into the pool.')
+  .argument('[outpoint]', 'deposit outpoint as txid:vout (optional if using --txid or --latest)')
+  .option('--txid <txid>', 'deposit txid (optional; pairs with --vout or defaults vout=0)', '')
+  .option('--vout <n>', 'deposit vout (default 0 if used with --txid)', '0')
+  .option('--latest', 'use the most recently-saved stealthUtxo from state file', false)
+  .option('--shard <i>', 'shard index (default: derived)', '')
+  .option('--fresh', 'force a new import even if already marked imported', false)
+  .option(
+    '--allow-base',
+    'ALLOW importing a non-RPA base P2PKH deposit (requires BCH_STEALTH_ALLOW_BASE_IMPORT=1).',
+    false
+  )
+  .option('--deposit-wif <wif>', 'WIF for base P2PKH deposit key (optional).', '')
+  .option('--deposit-privhex <hex>', 'Hex private key for base P2PKH deposit key (optional).', '')
+  .action(async (outpointArg, opts) => {
+    deps.assertChipnet();
 
-      const { stateFile } = deps.getActivePaths();
+    const { stateFile } = deps.getActivePaths();
 
-      let depositTxid = '';
-      let depositVout = 0;
+    let depositTxid = '';
+    let depositVout = 0;
 
-      if (outpointArg) {
-        const p = parseOutpointOrThrow(String(outpointArg));
-        depositTxid = p.txid;
-        depositVout = p.vout;
-      } else if (opts.txid && String(opts.txid).trim()) {
-        // Strict parsing for user-provided input (do not "continue" here)
-        const txid = String(opts.txid).trim().toLowerCase();
-        if (!/^[0-9a-f]{64}$/.test(txid)) {
-          throw new Error(`invalid --txid (expected 64-hex): ${String(opts.txid)}`);
+    if (outpointArg) {
+      const p = parseOutpointOrThrow(String(outpointArg));
+      depositTxid = p.txid;
+      depositVout = p.vout;
+    } else if (opts.txid && String(opts.txid).trim()) {
+      // Strict parsing for user-provided input (do not "continue" here)
+      const txid = String(opts.txid).trim().toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(txid)) {
+        throw new Error(`invalid --txid (expected 64-hex): ${String(opts.txid)}`);
+      }
+
+      const vout = Number(String(opts.vout ?? '0').trim());
+      if (!Number.isFinite(vout) || vout < 0) {
+        throw new Error(`invalid --vout: ${String(opts.vout)}`);
+      }
+
+      depositTxid = txid;
+      depositVout = vout;
+    } else if (opts.latest) {
+      // ✅ single source of truth: load via store helpers
+      const store = new FileBackedPoolStateStore({ filename: stateFile });
+      const st0 = await loadStateOrEmpty({ store, networkDefault: String(NETWORK) });
+      const st = ensurePoolStateDefaults(st0, String(NETWORK));
+
+      // 1) Prefer: latest unimported deposit (canonical intent)
+      const latestDep = getLatestUnimportedDeposit(st, null);
+      if (latestDep && /^[0-9a-fA-F]{64}$/.test(String(latestDep.txid ?? ''))) {
+        depositTxid = String(latestDep.txid).toLowerCase();
+        depositVout = Number(latestDep.vout ?? 0);
+        if (!Number.isFinite(depositVout) || depositVout < 0) {
+          throw new Error(`pool import --latest: malformed vout in latest deposit record`);
         }
-
-        const vout = Number(String(opts.vout ?? '0').trim());
-        if (!Number.isFinite(vout) || vout < 0) {
-          throw new Error(`invalid --vout: ${String(opts.vout)}`);
-        }
-
-        depositTxid = txid;
-        depositVout = vout;
-      } else if (opts.latest) {
-        // ✅ single source of truth: load via store helpers
-        const store = new FileBackedPoolStateStore({ filename: stateFile });
-        const st0 = await loadStateOrEmpty({ store, networkDefault: String(NETWORK) });
-        const st = ensurePoolStateDefaults(st0, String(NETWORK));
-
-        // 1) Prefer: latest unimported deposit (canonical intent)
-        const latestDep = getLatestUnimportedDeposit(st, null);
-        if (latestDep && /^[0-9a-fA-F]{64}$/.test(String(latestDep.txid ?? ''))) {
-          depositTxid = String(latestDep.txid).toLowerCase();
-          depositVout = Number(latestDep.vout ?? 0);
-          if (!Number.isFinite(depositVout) || depositVout < 0) {
-            throw new Error(`pool import --latest: malformed vout in latest deposit record`);
-          }
-          console.log(`ℹ using latest unimported deposit: ${depositTxid}:${depositVout}`);
-        } else {
+        console.log(`ℹ using latest unimported deposit: ${depositTxid}:${depositVout}`);
+      } else {
         // 2) Fallback: latest stealthUtxo that is NOT change AND is unspent
         const utxos = Array.isArray(st.stealthUtxos) ? st.stealthUtxos : [];
 
@@ -263,8 +278,9 @@ export function registerPoolCommands(
           if (!Number.isFinite(vout) || vout < 0) continue;
           if (!lockingBytecodeHex) continue;
 
+          // ✅ FIX: pass a proper Network (not string) to satisfy TS
           const unspent = await isOutpointUnspentByLockingScript({
-            network: String(st.network ?? NETWORK ?? 'chipnet'),
+            network: NETWORK, // <-- this is typed as Network in your CLI config
             txid,
             vout,
             lockingBytecodeHex,
@@ -280,10 +296,10 @@ export function registerPoolCommands(
           break;
         }
 
-        if (!chosen) {
-          // Persist any "spent" markings we made while filtering
-          await saveState({ store, state: st, networkDefault: String(st.network ?? NETWORK ?? 'chipnet') });
+        // Persist any "spent" markings we made while filtering (even if we fail to choose)
+        await saveState({ store, state: st, networkDefault: String(NETWORK) });
 
+        if (!chosen) {
           throw new Error(
             `pool import --latest: no deposit candidates found.\n` +
               `Tip: --latest prefers state.deposits; fallback excludes *change* stealthUtxos and requires unspent.\n` +
@@ -291,46 +307,43 @@ export function registerPoolCommands(
           );
         }
 
-        // Persist any "spent" markings we made while filtering (and keep state tidy)
-        await saveState({ store, state: st, networkDefault: String(st.network ?? NETWORK ?? 'chipnet') });
-
         depositTxid = chosen.txid;
         depositVout = chosen.vout;
         console.log(`ℹ using latest deposit-candidate stealthUtxo: ${depositTxid}:${depositVout}`);
-        }
-      } else {
-        throw new Error('pool import: provide <outpoint> or --txid (optionally --vout) or --latest');
       }
+    } else {
+      throw new Error('pool import: provide <outpoint> or --txid (optionally --vout) or --latest');
+    }
 
-      const shardIndexOpt: number | null = opts.shard === '' ? null : Number(opts.shard);
-      if (opts.shard !== '' && !Number.isFinite(shardIndexOpt)) {
-        throw new Error(`invalid --shard: ${String(opts.shard)}`);
-      }
+    const shardIndexOpt: number | null = opts.shard === '' ? null : Number(opts.shard);
+    if (opts.shard !== '' && !Number.isFinite(shardIndexOpt)) {
+      throw new Error(`invalid --shard: ${String(opts.shard)}`);
+    }
 
-      const ctx = await deps.makePoolCtx();
+    const ctx = await deps.makePoolCtx();
 
-      const res = await runImport(ctx, {
-        shardIndex: shardIndexOpt,
-        fresh: !!opts.fresh,
-        allowBase: !!opts.allowBase,
-        depositWif: typeof opts.depositWif === 'string' && opts.depositWif.trim() ? String(opts.depositWif).trim() : null,
-        depositPrivHex:
-          typeof opts.depositPrivhex === 'string' && opts.depositPrivhex.trim()
-            ? String(opts.depositPrivhex).trim()
-            : null,
-        depositTxid,
-        depositVout,
-      });
-
-      if (!res) {
-        console.log('ℹ no import performed (no matching deposit found / already imported).');
-        return;
-      }
-
-      console.log(`import txid: ${res.txid}`);
-      console.log(`shard: ${res.shardIndex}`);
-      console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
+    const res = await runImport(ctx, {
+      shardIndex: shardIndexOpt,
+      fresh: !!opts.fresh,
+      allowBase: !!opts.allowBase,
+      depositWif: typeof opts.depositWif === 'string' && opts.depositWif.trim() ? String(opts.depositWif).trim() : null,
+      depositPrivHex:
+        typeof opts.depositPrivhex === 'string' && opts.depositPrivhex.trim()
+          ? String(opts.depositPrivhex).trim()
+          : null,
+      depositTxid,
+      depositVout,
     });
+
+    if (!res) {
+      console.log('ℹ no import performed (no matching deposit found / already imported).');
+      return;
+    }
+
+    console.log(`import txid: ${res.txid}`);
+    console.log(`shard: ${res.shardIndex}`);
+    console.log(`state saved: ${stateFile} (${POOL_STATE_STORE_KEY})`);
+  });
 
   // pool withdraw
   pool
