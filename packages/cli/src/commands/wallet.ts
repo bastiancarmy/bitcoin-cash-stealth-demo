@@ -18,6 +18,12 @@ import type { Network } from '@bch-stealth/electrum';
 import { connectElectrum } from '@bch-stealth/electrum';
 import { outpointIsUnspentViaVerboseTx } from '../pool/electrum-unspent.js';
 
+function normalizeNetwork(n: unknown): Network {
+  const s = String(n ?? '').trim().toLowerCase();
+  if (s === 'mainnet' || s === 'testnet' || s === 'chipnet') return s as Network;
+  return 'chipnet';
+}
+
 function getOrCreateSubcommand(program: Command, name: string, description: string): Command {
   const existing = (program.commands ?? []).find((c) => c.name() === name);
   if (existing) return existing;
@@ -38,9 +44,15 @@ function hasToken(u: any): boolean {
   return !!(u?.tokenData ?? u?.token_data);
 }
 
+// missing file is normal on first run
 function readJsonFile(filename: string): any {
-  const raw = fs.readFileSync(filename, 'utf8');
-  return JSON.parse(raw);
+  try {
+    const raw = fs.readFileSync(filename, 'utf8');
+    return JSON.parse(raw);
+  } catch (err: any) {
+    if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) return null;
+    throw err;
+  }
 }
 
 function safeLower(s: unknown): string {
@@ -49,46 +61,59 @@ function safeLower(s: unknown): string {
 
 /**
  * Extract stealth/RPA utxos from state.json across schema evolutions.
- *
- * Known shapes seen in your pasted files:
- * - state.data.pool.state.stealthUtxos  (bob)
- * - state.data.pool.state.data.pool.state.stealthUtxos (some nested legacy/migration artifacts)
- * - state.pool.state.stealthUtxos (older)
- * - state.stealthUtxos (very old)
  */
 function extractStealthUtxosFromState(st: any): any[] {
-  const candidates: any[] = [
-    st?.data?.pool?.state?.stealthUtxos,
-    st?.data?.pool?.state?.data?.pool?.state?.stealthUtxos,
-    st?.pool?.state?.stealthUtxos,
-    st?.stealthUtxos,
-  ];
+  if (!st || typeof st !== 'object') return [];
 
-  for (const c of candidates) {
-    if (Array.isArray(c)) return c;
+  const candidates: any[] = [];
+
+  if (Array.isArray((st as any)?.poolState?.utxos)) candidates.push((st as any).poolState.utxos);
+  if (Array.isArray((st as any)?.state?.poolState?.utxos)) candidates.push((st as any).state.poolState.utxos);
+
+  if (Array.isArray((st as any)?.utxos)) candidates.push((st as any).utxos);
+  if (Array.isArray((st as any)?.pool?.utxos)) candidates.push((st as any).pool.utxos);
+
+  if (Array.isArray((st as any)?.data?.pool?.state?.stealthUtxos))
+    candidates.push((st as any).data.pool.state.stealthUtxos);
+
+  if (Array.isArray((st as any)?.data?.pool?.state?.data?.pool?.state?.stealthUtxos))
+    candidates.push((st as any).data.pool.state.data.pool.state.stealthUtxos);
+
+  const flat = candidates.flat().filter(Boolean);
+
+  const seen = new Set<string>();
+  const out: any[] = [];
+
+  for (const u of flat) {
+    const txid = String(u?.txid ?? u?.outpointTxid ?? '').trim();
+    const vout = Number(u?.vout ?? u?.outpointVout ?? u?.n ?? -1);
+    const k = txid && Number.isFinite(vout) ? `${txid}:${vout}` : '';
+    if (k) {
+      if (seen.has(k)) continue;
+      seen.add(k);
+    }
+    out.push(u);
   }
-  return [];
+
+  return out;
 }
 
-export function registerWalletCommands(
-  program: Command,
-  deps: { getActivePaths: GetActivePaths; network?: string }
-) {
+export function registerWalletCommands(program: Command, deps: { getActivePaths: GetActivePaths; network?: string }) {
   const wallet = getOrCreateSubcommand(program, 'wallet', 'Wallet commands (single-user)');
 
-  // Existing: wallet init
+  // wallet init
   registerWalletInit(wallet, { getActivePaths: deps.getActivePaths, Electrum });
 
   // wallet utxos (base address)
   wallet
     .command('utxos')
-    .description('List base wallet UTXOs for the active profile.')
-    .option('--include-unconfirmed', 'include mempool UTXOs', false)
+    .description('List base wallet UTXOs (electrum).')
     .option('--json', 'print raw JSON', false)
     .option('--sum', 'only print total sats', false)
-    .action(async (opts: { includeUnconfirmed?: boolean; json?: boolean; sum?: boolean }) => {
+    .option('--include-unconfirmed', 'include mempool UTXOs', false)
+    .action(async (opts: { json?: boolean; sum?: boolean; includeUnconfirmed?: boolean }) => {
       const { profile, configFile } = deps.getActivePaths();
-      const network = String(deps.network ?? '').trim() || 'chipnet';
+      const network = normalizeNetwork(deps.network);
 
       const me = getWalletFromConfig({ configFile, profile });
       if (!me) {
@@ -98,12 +123,9 @@ export function registerWalletCommands(
       }
 
       const includeUnconfirmed = !!opts.includeUnconfirmed;
-
-      const { getUtxos } = Electrum as any;
-      if (typeof getUtxos !== 'function') throw new Error('[wallet utxos] Electrum.getUtxos is not available');
-
       const address = (me as any).address;
-      const utxos = await getUtxos(address, network, includeUnconfirmed);
+
+      const utxos = await Electrum.getUtxos(address, network, includeUnconfirmed);
 
       if (opts.json) {
         process.stdout.write(
@@ -127,9 +149,7 @@ export function registerWalletCommands(
         const sats = toBigIntSats(u);
         total += sats;
 
-        let conf = 0;
-        if (typeof u?.confirmations === 'number') conf = u.confirmations;
-        else if (typeof u?.height === 'number' && u.height > 0) conf = 1;
+        const conf = typeof u?.confirmations === 'number' ? u.confirmations : 0;
 
         return {
           outpoint: `${u.txid}:${u.vout}`,
@@ -178,7 +198,7 @@ export function registerWalletCommands(
       }) => {
         const ap: any = deps.getActivePaths() as any;
         const { profile } = ap;
-        const network = String(deps.network ?? '').trim() || 'chipnet';
+        const network = normalizeNetwork(deps.network);
 
         const stateFile = String(ap.stateFile ?? '').trim();
         if (!stateFile) {
@@ -188,21 +208,19 @@ export function registerWalletCommands(
           );
         }
 
-        const st = readJsonFile(stateFile);
+        const st0 = readJsonFile(stateFile);
+        const stateMissing = st0 == null;
+        const st = st0 ?? {};
 
-        // ✅ FIX: correct extraction from nested pool state
         const stealthUtxos: any[] = extractStealthUtxosFromState(st);
 
-        // normalize "spent" heuristics (support multiple legacy shapes)
         const rows0 = stealthUtxos.map((u) => {
           const txid = String(u?.txid ?? u?.outpointTxid ?? '').trim();
           const vout = Number(u?.vout ?? u?.outpointVout ?? u?.n ?? -1);
           const valueSats = toBigIntSats(u);
 
-          // support: spentByTxid / spentInTxid / spentAt (your bob file uses spentInTxid + spentAt)
           const spentBy =
-            String(u?.spentByTxid ?? u?.spentInTxid ?? u?.spentBy ?? '').trim() ||
-            (u?.spentAt ? '1' : '');
+            String(u?.spentByTxid ?? u?.spentInTxid ?? u?.spentBy ?? '').trim() || (u?.spentAt ? '1' : '');
           const isSpent = !!spentBy || !!u?.spentAt;
 
           const owner = String(u?.owner ?? u?.ownerTag ?? '').trim();
@@ -223,21 +241,14 @@ export function registerWalletCommands(
           };
         });
 
-        // keep only valid outpoints
         const rows1 = rows0.filter((r) => r.txid && r.vout >= 0);
-
-        // default: filter to current profile owner, because state may contain mixed records in dev
-        const rowsOwned = opts.allOwners
-          ? rows1
-          : rows1.filter((r) => safeLower(r.owner) === safeLower(profile));
-
+        const rowsOwned = opts.allOwners ? rows1 : rows1.filter((r) => safeLower(r.owner) === safeLower(profile));
         const rows2 = opts.includeSpent ? rowsOwned : rowsOwned.filter((r) => !r.isSpent);
 
-        // optional chain check by outpoint
         let chainChecks: Record<string, any> | null = null;
         if (opts.checkChain) {
           chainChecks = {};
-          const c = await connectElectrum(network as unknown as Network);
+          const c = await connectElectrum(network);
           try {
             for (const r of rows2) {
               const res = await outpointIsUnspentViaVerboseTx({
@@ -261,6 +272,7 @@ export function registerWalletCommands(
                 network,
                 profile,
                 stateFile,
+                stateMissing,
                 tracked: stealthUtxos.length,
                 shown: rows2.length,
                 totalSats: total.toString(),
@@ -290,8 +302,11 @@ export function registerWalletCommands(
         console.log(`network: ${network}`);
         console.log(`profile: ${profile}`);
         console.log(`state: ${stateFile}`);
+        if (stateMissing) console.log('stateMissing: true (state.json not found)');
         console.log(`stealthUtxos(tracked): ${stealthUtxos.length}`);
-        console.log(`shown: ${rows2.length}${opts.includeSpent ? ' (including spent)' : ''}${opts.allOwners ? ' (all owners)' : ''}`);
+        console.log(
+          `shown: ${rows2.length}${opts.includeSpent ? ' (including spent)' : ''}${opts.allOwners ? ' (all owners)' : ''}`
+        );
         if (opts.checkChain) console.log(`checkChain: true`);
 
         for (const r of rows2) {
@@ -302,22 +317,22 @@ export function registerWalletCommands(
                 : ' ❌spent'
               : '';
           const spentTag = r.isSpent ? ` spentBy=${r.spentByTxid ?? '1'}` : '';
-          console.log(`- ${r.outpoint} sats=${r.valueSats.toString()} owner=${r.owner || '-'} kind=${r.kind || '-'}${spentTag}${chainOk}`);
+          console.log(
+            `- ${r.outpoint} sats=${r.valueSats.toString()} owner=${r.owner || '-'} kind=${r.kind || '-'}${spentTag}${chainOk}`
+          );
         }
 
         console.log(`totalSats: ${total.toString()}`);
       }
     );
 
-  // Existing: wallet show
+  // wallet show
   wallet
     .command('show')
-    .description(
-      'Show active profile wallet identifiers (address + paycode). Use --all for full key material identifiers.'
-    )
-    .option('--all', 'include all derived identifiers (pubkeys/hash160). Never prints private keys.', false)
-    .option('--json', 'print as JSON (machine-friendly)', false)
-    .action(async (opts: { all?: boolean; json?: boolean }) => {
+    .description('Show wallet info for this profile')
+    .option('--all', 'include derived identifiers', false)
+    .option('--json', 'print as JSON', false)
+    .action((opts: { all?: boolean; json?: boolean }) => {
       const { profile, configFile } = deps.getActivePaths();
 
       const me = getWalletFromConfig({ configFile, profile });
@@ -327,80 +342,52 @@ export function registerWalletCommands(
         );
       }
 
-      const scanPriv = (me as any).scanPrivBytes;
-      if (!scanPriv) {
-        throw new Error(
-          `[wallet] scanPrivHex is required to generate a paycode.\n` +
-            `Your config appears to be missing scanPrivHex for this profile.\n` +
-            `Fix: run "bchctl --profile ${profile} wallet init" again (or migrate the profile to include scanPrivHex).`
-        );
-      }
-      const paycode = generatePaycode(scanPriv);
+      const address = (me as any).address;
 
-      const scanPriv32: Uint8Array | undefined = (me as any).scanPrivBytes;
-      const spendPriv32: Uint8Array | undefined =
-        (me as any).spendPrivBytes ?? (scanPriv32 ? deriveSpendPriv32FromScanPriv32(scanPriv32) : undefined);
+      const paycodeKey = (me as any).scanPrivBytes ?? (me as any).privBytes;
+      const paycode = generatePaycode(paycodeKey);
 
-      const scanPub33 = safePub33FromPriv32(scanPriv32);
-      const spendPub33 = safePub33FromPriv32(spendPriv32);
+      const basePub33 = safePub33FromPriv32((me as any).privBytes);
+      const scanPub33 = safePub33FromPriv32((me as any).scanPrivBytes);
 
-      let paycodePub33Hex: string | null = null;
-      if (opts.all) {
-        try {
-          const decoded = decodePaycode(paycode);
-          paycodePub33Hex = bytesToHex(decoded.pubkey33);
-        } catch {
-          paycodePub33Hex = null;
-        }
-      }
-
-      const baseOut = {
+      const obj: any = {
         profile,
-        address: (me as any).address,
+        address,
         paycode,
       };
 
-      const allOut = !opts.all
-        ? null
-        : {
-            base: {
-              pub33Hex: bytesToHex((me as any).pubBytes),
-              hash160Hex: bytesToHex((me as any).hash160),
-            },
-            paycode: paycodePub33Hex ? { pub33Hex: paycodePub33Hex } : null,
-            scan: scanPub33 ? { pub33Hex: bytesToHex(scanPub33) } : null,
-            spend: spendPub33 ? { pub33Hex: bytesToHex(spendPub33) } : null,
-          };
+      if (opts.all) {
+        obj.basePub33Hex = basePub33 ? bytesToHex(basePub33) : null;
+        obj.scanPub33Hex = scanPub33 ? bytesToHex(scanPub33) : null;
+
+        const scanPriv32 = (me as any).scanPrivBytes as Uint8Array | undefined;
+        if (scanPriv32 && scanPriv32.length === 32) {
+          const spendPriv32 = deriveSpendPriv32FromScanPriv32(scanPriv32);
+          const spendPub33 = safePub33FromPriv32(spendPriv32);
+          obj.derivedSpendPub33Hex = spendPub33 ? bytesToHex(spendPub33) : null;
+        }
+      }
 
       if (opts.json) {
-        const out = allOut ? { ...baseOut, ...allOut } : baseOut;
-        process.stdout.write(JSON.stringify(out, null, 2) + '\n');
+        process.stdout.write(JSON.stringify(obj, null, 2) + '\n');
         return;
       }
 
-      console.log(`profile: ${baseOut.profile}`);
-      console.log(`address: ${baseOut.address}`);
-      console.log(`paycode: ${baseOut.paycode}`);
+      console.log(`profile: ${profile}`);
+      console.log(`address: ${address}`);
+      console.log(`paycode: ${paycode}`);
 
-      if (allOut) {
-        console.log(`base.pub33Hex:     ${allOut.base.pub33Hex}`);
-        console.log(`base.hash160:      ${allOut.base.hash160Hex}`);
-        if (allOut.paycode) console.log(`paycode.pub33Hex:  ${allOut.paycode.pub33Hex}`);
-        if (allOut.scan) console.log(`scan.pub33Hex:     ${allOut.scan.pub33Hex}`);
-        if (allOut.spend) console.log(`spend.pub33Hex:    ${allOut.spend.pub33Hex}`);
-
-        if (allOut.paycode?.pub33Hex && allOut.scan?.pub33Hex && allOut.paycode.pub33Hex !== allOut.scan.pub33Hex) {
-          console.log('');
-          console.log('⚠️  warning: paycode.pub33Hex != scan.pub33Hex');
-          console.log('   This means the paycode is not being derived from the scan key you are using to scan.');
-        }
+      if (opts.all) {
+        console.log(`basePub33: ${obj.basePub33Hex ?? '-'}`);
+        console.log(`scanPub33: ${obj.scanPub33Hex ?? '-'}`);
+        console.log(`derivedSpendPub33(from scan): ${obj.derivedSpendPub33Hex ?? '-'}`);
       }
     });
 
-  // Existing: wallet paycode
+  // wallet paycode
   wallet
     .command('paycode')
-    .description('Print the active profile paycode (single line; safe for scripts).')
+    .description('Print static paycode for this profile')
     .action(() => {
       const { profile, configFile } = deps.getActivePaths();
 
@@ -416,6 +403,9 @@ export function registerWalletCommands(
 
       process.stdout.write(paycode + '\n');
     });
+
+  // decodePaycode is intentionally left unused for now; keeping import avoids churn if you wire a subcommand later
+  void decodePaycode;
 
   return wallet;
 }
