@@ -21,6 +21,10 @@ export type LoadedWallet = {
   hash160: Uint8Array;
   scanPrivBytes?: Uint8Array;
   spendPrivBytes?: Uint8Array;
+
+  // ✅ carry scan metadata so scan.ts can default correctly
+  network?: string;
+  birthdayHeight?: number;
 };
 
 export type WalletFileV1 = {
@@ -142,17 +146,17 @@ function toPrivBytes(x: any, label: string): Uint8Array {
   throw new Error(`[wallets] ${label} must be Uint8Array or 32-byte hex`);
 }
 
-function cashaddrPrefixFromNetwork(): 'bitcoincash' | 'bchtest' {
-  const n = String(NETWORK ?? '').toLowerCase();
+function cashaddrPrefixFromNetwork(networkMaybe?: string): 'bitcoincash' | 'bchtest' {
+  const n = String(networkMaybe ?? NETWORK ?? '').toLowerCase();
   // chipnet/testnet/regtest all use bchtest prefix in most tooling
   return n === 'mainnet' ? 'bitcoincash' : 'bchtest';
 }
 
-function deriveAddressFromH160(h160: Uint8Array): string {
-  return encodeCashAddr(cashaddrPrefixFromNetwork(), 'P2PKH', h160);
+function deriveAddressFromH160(h160: Uint8Array, networkMaybe?: string): string {
+  return encodeCashAddr(cashaddrPrefixFromNetwork(networkMaybe), 'P2PKH', h160);
 }
 
-function normalizeWallet(raw: any, label: string): LoadedWallet {
+function normalizeWallet(raw: any, label: string, meta?: { network?: string; birthdayHeight?: number }): LoadedWallet {
   if (raw == null) throw new Error(`[wallets] missing wallet: ${label}`);
 
   // allow shorthand: "<privhex>"
@@ -180,9 +184,17 @@ function normalizeWallet(raw: any, label: string): LoadedWallet {
 
   const h160 = obj.hash160 instanceof Uint8Array ? obj.hash160 : hash160(pubBytes);
 
+  // network + birthdayHeight (wallet.json may contain these; config attaches them too)
+  const network = String(obj.network ?? meta?.network ?? '').trim() || undefined;
+  const birthdayHeightRaw = obj.birthdayHeight ?? meta?.birthdayHeight;
+  const birthdayHeight =
+    Number.isInteger(Number(birthdayHeightRaw)) && Number(birthdayHeightRaw) >= 0
+      ? Number(birthdayHeightRaw)
+      : undefined;
+
   // address optional; derive if missing
   const addressRaw = String(obj.address ?? obj.cashaddr ?? obj.cashAddress ?? '').trim();
-  const address = addressRaw || deriveAddressFromH160(h160);
+  const address = addressRaw || deriveAddressFromH160(h160, network);
 
   const scanPrivBytes = obj.scanPrivHex
     ? ensureEvenYPriv(toPrivBytes(obj.scanPrivHex, `${label}.scanPrivHex`))
@@ -192,7 +204,7 @@ function normalizeWallet(raw: any, label: string): LoadedWallet {
     ? ensureEvenYPriv(toPrivBytes(obj.spendPrivHex, `${label}.spendPrivHex`))
     : undefined;
 
-  return { address, privBytes, pubBytes, hash160: h160, scanPrivBytes, spendPrivBytes };
+  return { address, privBytes, pubBytes, hash160: h160, scanPrivBytes, spendPrivBytes, network, birthdayHeight };
 }
 
 export function resolveDefaultWalletPath(): string {
@@ -223,11 +235,22 @@ export function getWalletFromConfig(args: { configFile: string; profile: string 
   const rawWallet = entry.wallet ?? null;
   if (!rawWallet) return null;
 
-  return normalizeWallet(rawWallet, `config.profiles.${prof}.wallet`);
+  // Attach profile-level scanning metadata
+  const meta = {
+    network: String(entry.network ?? NETWORK ?? '').trim() || undefined,
+    birthdayHeight:
+      Number.isInteger(Number(entry.birthdayHeight)) && Number(entry.birthdayHeight) >= 0
+        ? Number(entry.birthdayHeight)
+        : undefined,
+  };
+
+  return normalizeWallet(rawWallet, `config.profiles.${prof}.wallet`, meta);
 }
 
 export async function getWallet(opts?: { walletFile?: string }): Promise<LoadedWallet> {
   const walletFile = path.resolve(opts?.walletFile ?? resolveDefaultWalletPath());
   const j = readJson(walletFile);
+
+  // wallet.json (WalletFileV1) contains network + birthdayHeight; keep them
   return normalizeWallet(j, 'wallet');
 }

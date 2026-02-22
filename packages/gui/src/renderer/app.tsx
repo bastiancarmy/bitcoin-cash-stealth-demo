@@ -1,6 +1,6 @@
 // packages/gui/src/renderer/app.tsx
 import React, { useEffect, useMemo, useState } from 'react';
-import { useBchctl, type ProfileId } from './hooks/useBchctl';
+import { useBchctl, type ProfileId, type RunResult } from './hooks/useBchctl';
 import type { AppInfo, ConfigJsonV1, PoolShardsJson, WalletRpaUtxosJson, WalletShowJson, WalletUtxosJson } from './types';
 import { tryParseJson } from './types';
 
@@ -8,6 +8,10 @@ import { Gauges, type ProfileState } from './components/Gauges';
 import { LogPane } from './components/LogPane';
 
 import { TransparentSendTab } from './tabs/TransparentSend';
+import { RpaSendTab } from './tabs/RpaSend';
+import { RpaScanTab } from './tabs/RpaScan';
+import { PoolInitTab } from './tabs/PoolInit';
+import { PoolImportTab } from './tabs/PoolImport';
 
 type TabKey = 'transparent' | 'rpa_send' | 'rpa_scan' | 'pool_init' | 'pool_import' | 'pool_withdraw';
 
@@ -38,86 +42,118 @@ export default function App() {
     pool: null,
   });
 
-  // bootstrap (app info + config)
-  useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      const info = (await window.bchStealth.appInfo()) as AppInfo;
-      if (cancelled) return;
-      setAppInfo(info);
-
-      const cfgRes = await window.bchStealth.getConfig();
-      if (cancelled) return;
-
-      if (cfgRes?.ok && cfgRes.config) {
-        setConfig(cfgRes.config);
-        const keys = Object.keys(cfgRes.config.profiles ?? {}).sort();
-        setProfiles(keys.length ? keys : ['default']);
-
-        const initial = String(info.activeProfile ?? cfgRes.config.currentProfile ?? 'default').trim() || 'default';
-        setActiveProfile(initial);
-      } else {
-        setProfiles(['default']);
-        setActiveProfile(String(info.activeProfile ?? 'default'));
-      }
-    })().catch(() => {
-      // ignore bootstrap errors; UI remains usable for manual actions
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const tabs = useMemo(
-    () =>
-      [
-        ['transparent', 'Transparent send'] as const,
-        ['rpa_send', 'RPA send'] as const,
-        ['rpa_scan', 'RPA scan'] as const,
-        ['pool_init', 'Pool init'] as const,
-        ['pool_import', 'Pool import'] as const,
-        ['pool_withdraw', 'Pool withdraw'] as const,
-      ] satisfies Array<readonly [TabKey, string]>,
+  const tabs: Array<[TabKey, string]> = useMemo(
+    () => [
+      ['transparent', 'Transparent send'],
+      ['rpa_send', 'RPA send'],
+      ['rpa_scan', 'RPA scan'],
+      ['pool_init', 'Pool init'],
+      ['pool_import', 'Pool import'],
+      ['pool_withdraw', 'Pool withdraw'],
+    ],
     []
   );
 
-  const refreshActive = async (who: ProfileId) => {
+  const reloadConfig = async () => {
+    try {
+      const cfgRes = await window.bchStealth.getConfig();
+      if (cfgRes?.ok && cfgRes.config) {
+        setConfig(cfgRes.config);
+        return cfgRes.config;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  };
+
+  const reloadProfilesFromDisk = async () => {
+    try {
+      const list = await window.bchStealth.listProfiles();
+      const uniq = Array.from(new Set((list ?? []).map((s) => String(s ?? '').trim()).filter(Boolean))).sort();
+      setProfiles(uniq);
+      return uniq;
+    } catch {
+      setProfiles([]);
+      return [];
+    }
+  };
+
+  useEffect(() => {
+    const run = async () => {
+      const info = (await window.bchStealth.appInfo()) as AppInfo;
+      setAppInfo(info);
+
+      const cfg = await reloadConfig();
+      const profs = await reloadProfilesFromDisk();
+
+      const fallback =
+        String(info?.activeProfile ?? cfg?.currentProfile ?? '').trim() ||
+        (profs.length ? profs[0] : '') ||
+        'default';
+
+      setActiveProfile(fallback);
+    };
+
+    void run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const refreshActive = async (who: string) => {
+    if (!who) return;
+
     // wallet show
     {
-      const { json } = await bch.runJson<WalletShowJson>({
-        profile: who,
-        label: 'wallet:show',
-        argv: ['wallet', 'show', '--json'],
-      });
-      setState((cur) => ({ ...cur, show: json }));
+      try {
+        const result = await bch.runText({
+          profile: who,
+          label: 'wallet:show',
+          argv: ['wallet', 'show', '--json'],
+          timeoutMs: 45_000,
+        });
+
+        const stdout = result?.stdout ?? '';
+        const json = (tryParseJson<WalletShowJson>(stdout) ?? null) as WalletShowJson | null;
+        setState((cur) => ({ ...cur, show: json }));
+      } catch {
+        setState((cur) => ({ ...cur, show: null }));
+      }
     }
 
-    // wallet utxos
+    // base utxos
     {
-      const result = await bch.runText({
-        profile: who,
-        label: 'wallet:utxos',
-        argv: ['wallet', 'utxos', '--json', '--include-unconfirmed'],
-      });
+      try {
+        const result = await bch.runText({
+          profile: who,
+          label: 'wallet:utxos',
+          argv: ['wallet', 'utxos', '--json', '--include-unconfirmed'],
+          timeoutMs: 45_000,
+        });
 
-      const stdout = result?.stdout ?? '';
-      const json = (tryParseJson<WalletUtxosJson>(stdout) ?? null) as WalletUtxosJson | null;
-      setState((cur) => ({ ...cur, base: json }));
+        const stdout = result?.stdout ?? '';
+        const json = (tryParseJson<WalletUtxosJson>(stdout) ?? null) as WalletUtxosJson | null;
+        setState((cur) => ({ ...cur, base: json }));
+      } catch {
+        setState((cur) => ({ ...cur, base: null }));
+      }
     }
 
-    // wallet rpa-utxos
+    // stealth utxos (rpa-utxos)
     {
-      const result = await bch.runText({
-        profile: who,
-        label: 'wallet:rpa-utxos',
-        argv: ['wallet', 'rpa-utxos', '--json'],
-      });
+      try {
+        const result = await bch.runText({
+          profile: who,
+          label: 'wallet:rpa-utxos',
+          argv: ['wallet', 'rpa-utxos', '--json'],
+          timeoutMs: 45_000,
+        });
 
-      const stdout = result?.stdout ?? '';
-      const json = (tryParseJson<WalletRpaUtxosJson>(stdout) ?? null) as WalletRpaUtxosJson | null;
-      setState((cur) => ({ ...cur, stealth: json }));
+        const stdout = result?.stdout ?? '';
+        const json = (tryParseJson<WalletRpaUtxosJson>(stdout) ?? null) as WalletRpaUtxosJson | null;
+        setState((cur) => ({ ...cur, stealth: json }));
+      } catch {
+        setState((cur) => ({ ...cur, stealth: null }));
+      }
     }
 
     // pool shards (must not hard-fail refresh)
@@ -140,55 +176,62 @@ export default function App() {
   };
 
   const refresh = async () => {
+    await reloadProfilesFromDisk();
+    await reloadConfig();
     await refreshActive(activeProfile);
   };
 
   const initWallet = async () => {
     await bch.runText({ profile: activeProfile, label: 'wallet:init', argv: ['wallet', 'init'] });
+    await reloadProfilesFromDisk();
+    await reloadConfig();
     await refreshActive(activeProfile);
   };
 
-  const run = async (args: { label: string; argv: string[] }) => {
-    await bch.runText({ profile: activeProfile, label: args.label, argv: args.argv });
+  const run = async (args: { label: string; argv: string[] }): Promise<RunResult> => {
+    const res = await bch.runText({ profile: activeProfile, label: args.label, argv: args.argv });
+    await reloadProfilesFromDisk();
+    await reloadConfig();
     await refreshActive(activeProfile);
+    return res;
   };
 
-  // auto refresh gauges on first load or profile change
   useEffect(() => {
     if (!activeProfile) return;
     void refreshActive(activeProfile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProfile]);
 
-  const onSelectProfile = async (p: string) => {
-    const next = String(p ?? '').trim();
+  const setActiveAndPersist = async (nextProfile: string) => {
+    const next = String(nextProfile ?? '').trim();
     if (!next || next === activeProfile) return;
 
     setActiveProfile(next);
 
-    // Persist currentProfile (best-effort; do not block UX)
     try {
       const res = await window.bchStealth.setCurrentProfile(next);
       if (res?.ok) {
-        const cfgRes = await window.bchStealth.getConfig();
-        if (cfgRes?.ok && cfgRes.config) {
-          setConfig(cfgRes.config);
-          setProfiles(Object.keys(cfgRes.config.profiles ?? {}).sort());
-        }
+        await reloadConfig();
       }
     } catch {
       // ignore
     }
   };
 
+  const onSelectProfile = async (p: string) => {
+    const next = String(p ?? '').trim();
+    if (!next) return;
+    await setActiveAndPersist(next);
+  };
+
   const renderTab = () => {
     const disableAll = bch.isRunning;
 
     if (tab === 'transparent') return <TransparentSendTab run={run} disableAll={disableAll} />;
-    if (tab === 'rpa_send') return <PlaceholderTab title="RPA send (paycode)" />;
-    if (tab === 'rpa_scan') return <PlaceholderTab title="RPA scan + update state" />;
-    if (tab === 'pool_init') return <PlaceholderTab title="Pool init (shards)" />;
-    if (tab === 'pool_import') return <PlaceholderTab title="Pool import" />;
+    if (tab === 'rpa_send') return <RpaSendTab run={run} disableAll={disableAll} />;
+    if (tab === 'rpa_scan') return <RpaScanTab run={run} disableAll={disableAll} />;
+    if (tab === 'pool_init') return <PoolInitTab run={run} disableAll={disableAll} />;
+    if (tab === 'pool_import') return <PoolImportTab run={run} disableAll={disableAll} />;
     if (tab === 'pool_withdraw') return <PlaceholderTab title="Pool withdraw" />;
 
     return null;
@@ -198,7 +241,6 @@ export default function App() {
 
   return (
     <div style={{ padding: 16, color: '#eee', background: '#050505', height: '100vh', boxSizing: 'border-box' }}>
-      {/* Top bar */}
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
         <div style={{ fontWeight: 900, fontSize: 20 }}>bch-stealth</div>
 
@@ -236,12 +278,10 @@ export default function App() {
         </div>
       </div>
 
-      {/* Gauges */}
       <div style={{ marginTop: 12 }}>
         <Gauges profile={activeProfile} state={state} onRefresh={refresh} onInitWallet={initWallet} disableAll={disableAll} />
       </div>
 
-      {/* Tabs + log */}
       <div style={{ marginTop: 14, display: 'flex', gap: 12, height: 'calc(100vh - 190px)' }}>
         <div style={{ flex: 1.1, display: 'flex', flexDirection: 'column', gap: 10 }}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
@@ -273,7 +313,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* Minimal footer diagnostics (optional) */}
       <div style={{ marginTop: 10, opacity: 0.6, fontSize: 11 }}>
         {appInfo?.dotDir ? (
           <span>
@@ -284,6 +323,12 @@ export default function App() {
           <span>
             {' '}
             | currentProfile in config: <code>{config.currentProfile}</code>
+          </span>
+        ) : null}
+        {profiles?.length ? (
+          <span>
+            {' '}
+            | profiles on disk: <code>{profiles.length}</code>
           </span>
         ) : null}
       </div>

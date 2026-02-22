@@ -10,6 +10,8 @@ declare global {
       getConfig: () => Promise<{ ok: boolean; config?: ConfigJsonV1; path?: string; error?: string }>;
       setCurrentProfile: (profile: string) => Promise<{ ok: boolean; error?: string }>;
       listProfiles: () => Promise<string[]>;
+      createProfile: (name: string) => Promise<{ ok: boolean; profile?: string; error?: string }>;
+      renameProfile: (oldName: string, newName: string) => Promise<{ ok: boolean; profile?: string; error?: string }>;
 
       runBchctl: (args: { profile: string; argv: string[]; env?: Record<string, string> }) => Promise<{ opId: string }>;
       getBchctlResult: (args: { opId: string }) => Promise<{ ok: boolean; stdout?: string; stderr?: string; error?: string }>;
@@ -48,6 +50,22 @@ export type RunResult = {
   stderr: string;
 };
 
+function isExpectedNoWalletText(s: string): boolean {
+  const t = String(s ?? '');
+  // Matches current CLI message:
+  // ❌ Error: [wallet] no wallet found for profile "default"
+  return t.includes('[wallet] no wallet found for profile');
+}
+
+function shouldSuppressChunk(meta: OpMeta, m: BchctlChunk): boolean {
+  if (m.stream !== 'stderr') return false;
+
+  // Only suppress for the wallet gauges where "no wallet found" is expected.
+  if (meta.label !== 'wallet:show' && meta.label !== 'wallet:utxos') return false;
+
+  return isExpectedNoWalletText(m.chunk);
+}
+
 export function useBchctl() {
   const [lines, setLines] = useState<ConsoleLine[]>([]);
   const [runningOps, setRunningOps] = useState<Record<string, OpMeta>>({});
@@ -68,6 +86,9 @@ export function useBchctl() {
     const offChunk = window.bchStealth.onBchctlChunk((m) => {
       const meta = runningRef.current[m.opId];
       if (!meta) return;
+
+      if (shouldSuppressChunk(meta, m)) return;
+
       pushLine({
         ts: Date.now(),
         opId: m.opId,
@@ -92,11 +113,7 @@ export function useBchctl() {
         runningRef.current[m.opId] = { ...meta, exitCode: m.code };
       }
 
-      setRunningOps((cur) => {
-        const next = { ...cur };
-        delete next[m.opId];
-        return next;
-      });
+      setRunningOps({ ...runningRef.current });
     });
 
     return () => {
@@ -105,70 +122,88 @@ export function useBchctl() {
     };
   }, []);
 
-  const isRunning = useMemo(() => Object.keys(runningOps).length > 0, [runningOps]);
+  const isRunning = useMemo(() => Object.values(runningOps).some((o) => o.exitCode === null), [runningOps]);
 
-  const waitForExit = (opId: string): Promise<number> => {
-    const already = exitSeenRef.current[opId];
-    if (typeof already === 'number') return Promise.resolve(already);
+  const clearLog = () => setLines([]);
 
-    return new Promise<number>((resolve) => {
-      const list = exitWaitersRef.current[opId] ?? [];
-      list.push(resolve);
-      exitWaitersRef.current[opId] = list;
-    });
-  };
-
-  async function runText(args: {
-    profile: ProfileId;
+  const runText = async (args: {
+    profile: string;
     label: string;
     argv: string[];
     env?: Record<string, string>;
     timeoutMs?: number;
-  }): Promise<RunResult> {
-    const { profile, label, argv, env } = args;
+  }) => {
+    const profile = String(args.profile ?? '').trim() || 'default';
+    const label = String(args.label ?? '').trim() || 'cmd';
 
-    const { opId } = await window.bchStealth.runBchctl({ profile, argv, env });
+    const { opId } = await window.bchStealth.runBchctl({ profile, argv: args.argv, env: args.env });
 
-    const meta: OpMeta = { opId, profile, label, argv, startedAt: Date.now(), exitCode: null };
+    const meta: OpMeta = {
+      opId,
+      profile,
+      label,
+      argv: args.argv,
+      startedAt: Date.now(),
+      exitCode: null,
+    };
+
     runningRef.current[opId] = meta;
-    setRunningOps((cur) => ({ ...cur, [opId]: meta }));
+    setRunningOps({ ...runningRef.current });
 
-    const timeout = Math.max(5_000, args.timeoutMs ?? 60_000);
+    const waitForExit = async (): Promise<number> => {
+      const seen = exitSeenRef.current[opId];
+      if (typeof seen === 'number') return seen;
 
-    const code = await Promise.race([
-      waitForExit(opId),
-      new Promise<number>((resolve) => setTimeout(() => resolve(124), timeout)),
+      return new Promise((resolve) => {
+        exitWaitersRef.current[opId] = exitWaitersRef.current[opId] ?? [];
+        exitWaitersRef.current[opId].push(resolve);
+      });
+    };
+
+    const timeoutMs = args.timeoutMs ?? 60_000;
+
+    const code = await Promise.race<number>([
+      waitForExit(),
+      new Promise<number>((_resolve, reject) => setTimeout(() => reject(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs)),
     ]);
 
     const res = await window.bchStealth.getBchctlResult({ opId });
+
     const stdout = String(res?.stdout ?? '');
     const stderr = String(res?.stderr ?? '');
 
-    return { opId, code, stdout, stderr };
-  }
+    // keep a trailing line for parity/debug
+    pushLine({
+      ts: Date.now(),
+      opId,
+      profile,
+      label,
+      stream: 'stdout',
+      text: `\n(exit ${code})\n`,
+    });
 
-  async function runJson<T = unknown>(args: {
-    profile: ProfileId;
+    // cleanup runningRef
+    delete runningRef.current[opId];
+    setRunningOps({ ...runningRef.current });
+
+    if (!res?.ok) {
+      throw new Error(res?.error ?? 'command failed');
+    }
+
+    return { opId, code, stdout, stderr };
+  };
+
+  const runJson = async <T,>(args: {
+    profile: string;
     label: string;
     argv: string[];
     env?: Record<string, string>;
     timeoutMs?: number;
-  }): Promise<{ result: RunResult; json: T | null }> {
+  }) => {
     const result = await runText(args);
-    const json = (tryParseJson<T>(result.stdout) ?? tryParseJson<T>(result.stderr)) as T | null;
+    const json = tryParseJson<T>(result.stdout) ?? null;
     return { result, json };
-  }
-
-  function clearLog() {
-    setLines([]);
-  }
-
-  return {
-    lines,
-    clearLog,
-    runningOps,
-    isRunning,
-    runText,
-    runJson,
   };
+
+  return { lines, clearLog, isRunning, runText, runJson };
 }

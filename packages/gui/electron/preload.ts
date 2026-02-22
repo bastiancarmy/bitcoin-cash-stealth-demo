@@ -10,6 +10,8 @@ contextBridge.exposeInMainWorld('bchStealth', {
   getConfig: () => ipcRenderer.invoke('getConfig'),
   setCurrentProfile: (profile: string) => ipcRenderer.invoke('setCurrentProfile', { profile }),
   listProfiles: () => ipcRenderer.invoke('listProfiles'),
+  createProfile: (name: string) => ipcRenderer.invoke('createProfile', { name }),
+  renameProfile: (oldName: string, newName: string) => ipcRenderer.invoke('renameProfile', { oldName, newName }),
 
   runBchctl: (args: { profile: string; argv: string[]; env?: Record<string, string> }) =>
     ipcRenderer.invoke('runBchctl', args),

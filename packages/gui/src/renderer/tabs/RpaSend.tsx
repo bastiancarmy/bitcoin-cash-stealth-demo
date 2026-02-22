@@ -1,42 +1,71 @@
 // packages/gui/src/renderer/tabs/RpaSend.tsx
-import React, { useState } from 'react';
-import type { Actor } from '../hooks/useBchctl';
+import React, { useMemo, useState } from 'react';
+import type { RunResult } from '../hooks/useBchctl';
+import { MostRecentResult } from '../components/MostRecentResult';
 
 export function RpaSendTab(props: {
-  run: (args: { profile: Actor; label: string; argv: string[] }) => Promise<void>;
+  run: (args: { label: string; argv: string[] }) => Promise<RunResult>;
   disableAll: boolean;
 }) {
   const { run, disableAll } = props;
-  const [from, setFrom] = useState<Actor>('alice');
-  const [toProfile, setToProfile] = useState<Actor>('bob');
+
+  const [paycode, setPaycode] = useState<string>('');
   const [sats, setSats] = useState<string>('2000');
   const [dryRun, setDryRun] = useState<boolean>(false);
 
+  const [last, setLast] = useState<{
+    ts: number;
+    argv: string[];
+    code: number;
+    stdout: string;
+    stderr: string;
+  } | null>(null);
+
+  const [busy, setBusy] = useState(false);
+
+  const canSend = useMemo(() => {
+    if (disableAll || busy) return false;
+    if (!paycode.trim()) return false;
+    if (!sats.trim()) return false;
+    return true;
+  }, [disableAll, busy, paycode, sats]);
+
   const submit = async () => {
-    const argv = ['send', '--to-profile', toProfile, sats.trim()];
+    const pc = paycode.trim();
+    const a = sats.trim();
+    if (!pc || !a) return;
+
+    const argv = ['send', pc, a];
     if (dryRun) argv.push('--dry-run');
-    await run({ profile: from, label: 'send:paycode', argv });
+
+    setBusy(true);
+    try {
+      const res = await run({ label: 'send:paycode', argv });
+      setLast({
+        ts: Date.now(),
+        argv,
+        code: res.code,
+        stdout: res.stdout ?? '',
+        stderr: res.stderr ?? '',
+      });
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%' }}>
       <div style={{ fontWeight: 800, fontSize: 16 }}>RPA send (paycode)</div>
 
       <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-        <label>
-          From:{' '}
-          <select value={from} onChange={(e) => setFrom(e.target.value as Actor)}>
-            <option value="alice">alice</option>
-            <option value="bob">bob</option>
-          </select>
-        </label>
-
-        <label>
-          To profile:{' '}
-          <select value={toProfile} onChange={(e) => setToProfile(e.target.value as Actor)}>
-            <option value="alice">alice</option>
-            <option value="bob">bob</option>
-          </select>
+        <label style={{ flex: 1, minWidth: 420 }}>
+          Paycode:{' '}
+          <input
+            style={{ width: '100%' }}
+            value={paycode}
+            onChange={(e) => setPaycode(e.target.value)}
+            placeholder="PM8T..."
+          />
         </label>
 
         <label>
@@ -49,14 +78,22 @@ export function RpaSendTab(props: {
           dry-run
         </label>
 
-        <button disabled={disableAll || from === toProfile} onClick={submit}>
-          Send via paycode
+        <button disabled={!canSend} onClick={submit}>
+          {busy ? 'Sending…' : 'Send via paycode'}
         </button>
       </div>
 
       <div style={{ opacity: 0.85, fontSize: 13 }}>
-        Uses: <code>send --to-profile &lt;name&gt; &lt;sats&gt;</code>
+        Uses: <code>send &lt;paycode&gt; &lt;sats&gt;</code>
       </div>
+
+      <MostRecentResult
+        title="Last result"
+        result={last}
+        onClear={() => setLast(null)}
+        disableClear={disableAll || busy}
+        emptyText="Run a paycode send to see the most recent CLI output here."
+      />
     </div>
   );
 }

@@ -5,15 +5,6 @@ import fs from 'fs';
 import { spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 
-type BchctlChunk = { opId: string; stream: 'stdout' | 'stderr'; chunk: string };
-type BchctlExit = { opId: string; code: number };
-
-type RunningOp = {
-  child: ReturnType<typeof spawn>;
-  stdout: string;
-  stderr: string;
-};
-
 type ConfigJsonV1 = {
   version: 1;
   createdAt: string;
@@ -21,17 +12,24 @@ type ConfigJsonV1 = {
   profiles: Record<string, any>;
 };
 
-let mainWindow: BrowserWindow | null = null;
-const running = new Map<string, RunningOp>();
+type BchctlChunk = { opId: string; stream: 'stdout' | 'stderr'; chunk: string };
 
+let mainWindow: BrowserWindow | null = null;
+
+function isDev(): boolean {
+  return !app.isPackaged;
+}
+
+// Emojis allowed only in console logs.
 function log(...args: any[]) {
-  // emojis allowed only in console logs
-  console.log('🙂 [gui]', ...args);
+  // eslint-disable-next-line no-console
+  console.log('🧪', ...args);
 }
 
 function exists(p: string): boolean {
   try {
-    return fs.existsSync(p);
+    fs.accessSync(p);
+    return true;
   } catch {
     return false;
   }
@@ -49,29 +47,21 @@ function readText(p: string): string | null {
   }
 }
 
-function writeTextAtomic(p: string, text: string) {
-  mkdirp(path.dirname(p));
-  const tmp = p + '.tmp';
-  fs.writeFileSync(tmp, text, 'utf8');
+function writeTextAtomic(p: string, content: string) {
+  const dir = path.dirname(p);
+  mkdirp(dir);
+  const tmp = `${p}.tmp.${randomUUID()}`;
+  fs.writeFileSync(tmp, content, 'utf8');
   fs.renameSync(tmp, p);
 }
 
-function isDev(): boolean {
-  return !app.isPackaged;
-}
-
-// --- repo root is ONLY for locating CLI dist in dev ---
-function resolveCliDistEntry(repoRoot: string): string {
-  return path.join(repoRoot, 'packages', 'cli', 'dist', 'index.js');
-}
-
 function hasRepoMarker(dir: string): boolean {
-  return exists(path.join(dir, 'packages', 'cli', 'package.json'));
+  return exists(path.join(dir, 'package.json')) && exists(path.join(dir, 'packages'));
 }
 
 function walkUpFindRepoRoot(startDir: string): string | null {
   let cur = path.resolve(startDir);
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 30; i++) {
     if (hasRepoMarker(cur)) return cur;
     const parent = path.dirname(cur);
     if (parent === cur) break;
@@ -85,13 +75,23 @@ function guessRepoRoot(): string {
     walkUpFindRepoRoot(process.cwd()) ??
     walkUpFindRepoRoot(__dirname) ??
     walkUpFindRepoRoot(app.getAppPath()) ??
-    app.getPath('userData')
+    process.cwd()
   );
 }
 
-// --- storage root (deterministic) ---
+function resolveCliDistEntry(repoRoot: string): string {
+  return path.join(repoRoot, 'packages', 'cli', 'dist', 'index.js');
+}
+
+/**
+ * Storage root policy:
+ * - Dev: repo root (so GUI uses <repo>/.bch-stealth/* by default)
+ * - Packaged: userData/bch-stealth (app-owned state)
+ *
+ * Note: BCH_STEALTH_HOME is the "parent" dir that contains ".bch-stealth/".
+ */
 function getStorageRoot(): string {
-  // packaged + dev both use userData, not repo root
+  if (isDev()) return guessRepoRoot();
   return path.join(app.getPath('userData'), 'bch-stealth');
 }
 
@@ -103,8 +103,12 @@ function getConfigPath(storageRoot: string): string {
   return path.join(getDotDir(storageRoot), 'config.json');
 }
 
+function getProfilesRoot(storageRoot: string): string {
+  return path.join(getDotDir(storageRoot), 'profiles');
+}
+
 function listProfileDirs(storageRoot: string): string[] {
-  const profilesDir = path.join(getDotDir(storageRoot), 'profiles');
+  const profilesDir = getProfilesRoot(storageRoot);
   if (!exists(profilesDir)) return [];
   const entries = fs.readdirSync(profilesDir, { withFileTypes: true });
   return entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
@@ -116,6 +120,10 @@ function parseLaunchProfileArg(argv: string[]): string | null {
     return argv[idx + 1].trim();
   }
   return null;
+}
+
+function ensureProfileInConfig(cfg: ConfigJsonV1, profile: string) {
+  cfg.profiles[profile] = cfg.profiles[profile] ?? { network: 'chipnet' };
 }
 
 function loadOrInitConfig(storageRoot: string): ConfigJsonV1 {
@@ -136,16 +144,15 @@ function loadOrInitConfig(storageRoot: string): ConfigJsonV1 {
         return parsed as ConfigJsonV1;
       }
     } catch {
-      // fall through to init
+      // fallthrough to init
     }
   }
 
-  // Init a minimal config. If profile dirs exist, seed from them (placeholders).
+  // Seed from any existing profile dirs (dev case: repo already has .bch-stealth/profiles/*)
   const seededProfiles: Record<string, any> = {};
   for (const p of listProfileDirs(storageRoot)) {
     seededProfiles[p] = seededProfiles[p] ?? { network: 'chipnet' };
   }
-
   const first = Object.keys(seededProfiles).sort()[0] ?? 'default';
 
   const fresh: ConfigJsonV1 = {
@@ -160,34 +167,67 @@ function loadOrInitConfig(storageRoot: string): ConfigJsonV1 {
 }
 
 function saveConfig(storageRoot: string, cfg: ConfigJsonV1) {
-  const configPath = getConfigPath(storageRoot);
-  writeTextAtomic(configPath, JSON.stringify(cfg, null, 2) + '\n');
+  writeTextAtomic(getConfigPath(storageRoot), JSON.stringify(cfg, null, 2) + '\n');
 }
 
-function ensureProfileInConfig(cfg: ConfigJsonV1, profile: string) {
-  cfg.profiles[profile] = cfg.profiles[profile] ?? { network: 'chipnet' };
+/**
+ * Reconcile config <-> filesystem WITHOUT creating state.json.
+ * - ensure each config profile has a directory
+ * - ensure each directory has a config placeholder entry
+ * - ensure currentProfile is valid
+ */
+function reconcileProfiles(storageRoot: string, cfg: ConfigJsonV1): { changed: boolean } {
+  let changed = false;
+
+  const profilesRoot = getProfilesRoot(storageRoot);
+  mkdirp(profilesRoot);
+
+  // Ensure dirs exist for config entries
+  const cfgNames = Object.keys(cfg.profiles ?? {});
+  for (const name of cfgNames) {
+    const dir = path.join(profilesRoot, name);
+    if (!exists(dir)) mkdirp(dir);
+  }
+
+  // Ensure config entries exist for dirs
+  const dirNames = listProfileDirs(storageRoot);
+  for (const name of dirNames) {
+    if (!cfg.profiles?.[name]) {
+      ensureProfileInConfig(cfg, name);
+      changed = true;
+    }
+  }
+
+  // Ensure currentProfile points somewhere real
+  const cur = String(cfg.currentProfile ?? '').trim();
+  const haveCur = cur && (cfg.profiles?.[cur] || dirNames.includes(cur));
+  if (!haveCur) {
+    const next = dirNames[0] ?? cfgNames.sort()[0] ?? 'default';
+    cfg.currentProfile = next;
+    ensureProfileInConfig(cfg, next);
+    changed = true;
+  }
+
+  return { changed };
 }
 
 function resolveActiveProfile(storageRoot: string): { launchProfile: string | null; activeProfile: string } {
   const launchProfile = parseLaunchProfileArg(process.argv) ?? null;
 
   const cfg = loadOrInitConfig(storageRoot);
+  const { changed } = reconcileProfiles(storageRoot, cfg);
+  if (changed) saveConfig(storageRoot, cfg);
 
   if (launchProfile) {
     ensureProfileInConfig(cfg, launchProfile);
     cfg.currentProfile = launchProfile;
+    mkdirp(path.join(getProfilesRoot(storageRoot), launchProfile));
     saveConfig(storageRoot, cfg);
     return { launchProfile, activeProfile: launchProfile };
   }
 
-  const current = String(cfg.currentProfile ?? '').trim();
-  if (current) return { launchProfile: null, activeProfile: current };
-
-  const first = Object.keys(cfg.profiles).sort()[0] ?? 'default';
-  cfg.currentProfile = first;
-  ensureProfileInConfig(cfg, first);
-  saveConfig(storageRoot, cfg);
-  return { launchProfile: null, activeProfile: first };
+  const activeProfile = String(cfg.currentProfile ?? '').trim() || 'default';
+  return { launchProfile: null, activeProfile };
 }
 
 function createMainWindow() {
@@ -220,28 +260,30 @@ function sendChunk(msg: BchctlChunk) {
   mainWindow.webContents.send('bchctl:chunk', msg);
 }
 
-function sendExit(msg: BchctlExit) {
+function sendExit(msg: { opId: string; code: number }) {
   if (!mainWindow) return;
   mainWindow.webContents.send('bchctl:exit', msg);
 }
 
-// ---- Single instance lock (important for macOS dock icon behavior) ----
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-} else {
-  app.on('second-instance', () => {
-    if (!mainWindow) return;
-    if (mainWindow.isMinimized()) mainWindow.restore();
-    mainWindow.focus();
-  });
+type RunningOp = {
+  opId: string;
+  child: ReturnType<typeof spawn>;
+  stdout: string;
+  stderr: string;
+  code: number | null;
+};
 
-  app.whenReady().then(() => {
-    // Ensure storage exists on startup
+const running: Record<string, RunningOp> = {};
+
+function bootstrap() {
+  app.on('ready', () => {
     const storageRoot = getStorageRoot();
     mkdirp(storageRoot);
     mkdirp(getDotDir(storageRoot));
-    loadOrInitConfig(storageRoot);
+
+    const cfg = loadOrInitConfig(storageRoot);
+    const { changed } = reconcileProfiles(storageRoot, cfg);
+    if (changed) saveConfig(storageRoot, cfg);
 
     createMainWindow();
   });
@@ -254,6 +296,8 @@ if (!gotLock) {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
 }
+
+bootstrap();
 
 // ---------------- IPC ----------------
 
@@ -272,16 +316,13 @@ ipcMain.handle('appInfo', async () => {
     platform: process.platform,
     arch: process.arch,
 
-    // dev-only-ish diagnostics
     repoRoot,
     cliDist,
 
-    // new canonical storage
     userDataDir: app.getPath('userData'),
     storageRoot,
     dotDir,
 
-    // profile bootstrap
     launchProfile,
     activeProfile,
   };
@@ -300,6 +341,8 @@ ipcMain.handle('openPath', async (_evt, absPath: string) => {
 ipcMain.handle('getConfig', async () => {
   const storageRoot = getStorageRoot();
   const cfg = loadOrInitConfig(storageRoot);
+  const { changed } = reconcileProfiles(storageRoot, cfg);
+  if (changed) saveConfig(storageRoot, cfg);
   return { ok: true, config: cfg, path: getConfigPath(storageRoot) };
 });
 
@@ -309,16 +352,27 @@ ipcMain.handle('setCurrentProfile', async (_evt, args: { profile: string }) => {
   if (!prof) return { ok: false, error: 'profile is required' };
 
   const cfg = loadOrInitConfig(storageRoot);
+  reconcileProfiles(storageRoot, cfg);
+
   ensureProfileInConfig(cfg, prof);
   cfg.currentProfile = prof;
+
+  mkdirp(path.join(getProfilesRoot(storageRoot), prof));
   saveConfig(storageRoot, cfg);
+
   return { ok: true };
 });
 
+/**
+ * List profiles from directories (source of truth for dropdown).
+ * Also ensures config has placeholder entries for any directories.
+ */
 ipcMain.handle('listProfiles', async () => {
   const storageRoot = getStorageRoot();
   const cfg = loadOrInitConfig(storageRoot);
-  return Object.keys(cfg.profiles ?? {}).sort();
+  const { changed } = reconcileProfiles(storageRoot, cfg);
+  if (changed) saveConfig(storageRoot, cfg);
+  return listProfileDirs(storageRoot);
 });
 
 ipcMain.handle(
@@ -337,18 +391,14 @@ ipcMain.handle(
 
     const opId = randomUUID();
 
-    // Always pass --profile. Always force deterministic storage.
     const profile = String(args.profile ?? '').trim() || 'default';
     const fullArgv = [cliEntry, '--profile', profile, ...(args.argv ?? [])];
 
-    // NOTE: In Electron, process.execPath is the Electron binary.
-    // Set ELECTRON_RUN_AS_NODE=1 so it behaves like "node".
     log('spawn', process.execPath, ...fullArgv, '(ELECTRON_RUN_AS_NODE=1)', '(BCH_STEALTH_HOME)', storageRoot);
 
     const child = spawn(process.execPath, fullArgv, {
-      // A) cwd sets where .bch-stealth is created (even if CLI ignored env)
+      // Ensure deterministic home behavior even if CLI uses cwd
       cwd: storageRoot,
-      // B) env is the preferred explicit path override
       env: {
         ...process.env,
         ...(args.env ?? {}),
@@ -358,32 +408,24 @@ ipcMain.handle(
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    const op: RunningOp = { child, stdout: '', stderr: '' };
-    running.set(opId, op);
+    const op: RunningOp = { opId, child, stdout: '', stderr: '', code: null };
+    running[opId] = op;
 
-    child.stdout?.on('data', (buf) => {
-      const chunk = buf.toString('utf8');
+    child.stdout?.on('data', (b) => {
+      const chunk = String(b ?? '');
       op.stdout += chunk;
       sendChunk({ opId, stream: 'stdout', chunk });
     });
 
-    child.stderr?.on('data', (buf) => {
-      const chunk = buf.toString('utf8');
+    child.stderr?.on('data', (b) => {
+      const chunk = String(b ?? '');
       op.stderr += chunk;
       sendChunk({ opId, stream: 'stderr', chunk });
     });
 
     child.on('close', (code) => {
-      sendExit({ opId, code: Number(code ?? 1) });
-      setTimeout(() => running.delete(opId), 60_000);
-    });
-
-    child.on('error', (err) => {
-      const msg = String((err as any)?.message ?? err);
-      op.stderr += msg + '\n';
-      sendChunk({ opId, stream: 'stderr', chunk: msg + '\n' });
-      sendExit({ opId, code: 1 });
-      setTimeout(() => running.delete(opId), 60_000);
+      op.code = typeof code === 'number' ? code : 0;
+      sendExit({ opId, code: op.code });
     });
 
     return { opId };
@@ -391,16 +433,26 @@ ipcMain.handle(
 );
 
 ipcMain.handle('getBchctlResult', async (_evt, args: { opId: string }) => {
-  const op = running.get(args.opId);
-  if (!op) return { ok: false, error: 'unknown opId (expired)' };
-  return { ok: true, stdout: op.stdout, stderr: op.stderr };
+  const opId = String(args?.opId ?? '').trim();
+  const op = running[opId];
+  if (!op) return { ok: false, error: `op not found: ${opId}` };
+
+  if (op.code === null) {
+    return { ok: false, error: 'still running' };
+  }
+
+  const res = { ok: true, stdout: op.stdout, stderr: op.stderr, code: op.code };
+  delete running[opId];
+  return res;
 });
 
 ipcMain.handle('killBchctl', async (_evt, args: { opId: string }) => {
-  const op = running.get(args.opId);
-  if (!op) return { ok: false, error: 'unknown opId' };
+  const opId = String(args?.opId ?? '').trim();
+  const op = running[opId];
+  if (!op) return { ok: false, error: `op not found: ${opId}` };
+
   try {
-    op.child.kill('SIGTERM');
+    op.child.kill('SIGKILL');
     return { ok: true };
   } catch (e: any) {
     return { ok: false, error: String(e?.message ?? e) };

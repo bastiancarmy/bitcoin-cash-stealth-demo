@@ -297,6 +297,26 @@ export function ckdPrivFromSecret(parentPriv: Uint8Array, chainCode: Uint8Array,
 
 // -------------------- sender/receiver derivations --------------------
 
+/**
+ * Fulcrum RPA "grind prefix" derived from receiver scan pubkey Q.
+ * Returns 16-bit prefix (2 bytes => 4 hex chars) for Fulcrum prefix_bits=16.
+ */
+export function deriveFulcrumRpaPrefix16FromScanPub33(scanPub33: Uint8Array): string {
+  if (!(scanPub33 instanceof Uint8Array) || scanPub33.length !== 33) {
+    throw new Error('deriveFulcrumRpaPrefix16FromScanPub33: scanPub33 must be 33 bytes');
+  }
+  const tag = new TextEncoder().encode('bch-stealth:rpa:grind:');
+  const h = sha256(concat(tag, scanPub33));
+  return bytesToHex(h.slice(0, 2)).toLowerCase();
+}
+
+/** Convenience for legacy servers / min prefix_bits=8. */
+export function prefix8FromPrefix16(prefix16: string): string {
+  const p = String(prefix16 ?? '').trim().toLowerCase();
+  if (!/^[0-9a-f]{4}$/.test(p)) throw new Error('prefix8FromPrefix16: expected 4 hex chars');
+  return p.slice(0, 2);
+}
+
 export function deriveRpaOneTimeAddressSender(
   senderPrivBytes: Uint8Array,
   scanPub33: Uint8Array,

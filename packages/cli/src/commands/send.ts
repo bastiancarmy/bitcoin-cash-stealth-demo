@@ -21,7 +21,7 @@ import { makeChainIO } from '../pool/io.js';
 import { loadStateOrEmpty, saveState } from '../pool/state.js';
 
 import type { LoadedWallet } from '../wallets.js';
-import { runSend } from '../ops/send.js';
+import { runSend, RUNSEND_BUILD_ID } from '../ops/send.js';
 
 import { readConfig, ensureConfigDefaults } from '../config_store.js';
 import { getWalletFromConfig } from '../wallets.js';
@@ -49,6 +49,18 @@ function parseOptionalHexByte(raw: unknown): number | null {
     throw new Error(`send: --grind-prefix must be exactly 1 byte hex (e.g. "56"), got "${String(raw)}"`);
   }
   return Number.parseInt(x, 16);
+}
+
+// add alongside parseOptionalHexByte
+function parseOptionalHex16(raw: unknown): string | null {
+  if (raw == null) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (!s) return null;
+  const x = s.startsWith('0x') ? s.slice(2) : s;
+  if (!/^[0-9a-f]{4}$/.test(x)) {
+    throw new Error(`send: --grind-prefix16 must be exactly 2 bytes hex (e.g. "c272"), got "${String(raw)}"`);
+  }
+  return x;
 }
 
 function parseNonNegativeInt(raw: unknown, label: string): number | null {
@@ -84,7 +96,7 @@ export function registerSendCommand(
     .option('--all', 'Also print hex internals (hash160, raw tx hex).', false)
     .option('--no-grind', 'Disable paycode grinding (forces index=0 derivation).')
     .option('--grind-max <N>', 'Max grind attempts for paycode sends (default 256). 0 disables grinding.', (v) => Number(v))
-    .option('--grind-prefix <HH>', 'Override grind prefix byte (1 byte hex like "56"). Optional.', (v) => String(v))
+    .option('--grind-prefix16 <HHHH>', 'Override grind prefix (2 bytes hex like "c272"). Preferred on Fulcrum prefix_bits=16.', (v) => String(v))
     .option('--self-paycode <pm>', 'Override: your own paycode (for stealth change).', '')
     .action(
       async (
@@ -148,7 +160,8 @@ export function registerSendCommand(
         const grindEnabled = opts.grind !== false;
         const grindMaxUser = parseNonNegativeInt(opts.grindMax, '--grind-max') ?? 256;
         const grindMax = grindEnabled ? grindMaxUser : 0;
-        const grindPrefixByte = parseOptionalHexByte(opts.grindPrefix);
+        const grindPrefix16Override = parseOptionalHex16((opts as any).grindPrefix16);
+        const grindPrefixByte = parseOptionalHexByte(opts.grindPrefix); // keep legacy 1 byte
 
         // --- Load state (even without pool) ---
         const filename = path.resolve(stateFile);
@@ -180,6 +193,10 @@ export function registerSendCommand(
         ctx.me = ctx.me ?? {};
         ctx.me.selfPaycode = selfPaycode;
 
+        if (String(process.env.BCH_STEALTH_DEBUG_SEND ?? '') === '1') {
+          console.log(`[send:debug] command sees RUNSEND_BUILD_ID=${RUNSEND_BUILD_ID}`);
+        }
+
         const res = await runSend(
           ctx,
           {
@@ -190,6 +207,7 @@ export function registerSendCommand(
               enabled: grindMax > 0,
               maxAttempts: grindMax,
               prefixByteOverride: grindPrefixByte,
+              prefixHex16Override: grindPrefix16Override,
             },
           } as any
         );
@@ -221,6 +239,9 @@ export function registerSendCommand(
               `change:      vout=${res.change.vout} sats=${res.change.valueSats} h160=${res.change.hash160Hex} idx=${res.change.index}`
             );
           }
+        }
+        if (all && res?.grind) {
+          console.log(`grind:       ${JSON.stringify(res.grind)}`);
         }
       }
     );
