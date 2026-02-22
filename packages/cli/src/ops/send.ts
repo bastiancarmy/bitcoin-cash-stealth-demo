@@ -377,36 +377,52 @@ export async function runSend(
 
   if (paycodeCand) {
     destType = 'paycode';
-
+  
     const receiverScanPub33 = decodePaycodeToScanPub33OrThrow(paycodeCand);
     const receiverSpendPub33 = deriveSpendPub33FromScanPub33(receiverScanPub33);
-
+  
     const senderPrivBytes = funding.signPrivBytes;
     if (!(senderPrivBytes instanceof Uint8Array) || senderPrivBytes.length !== 32) {
       throw new Error('send: funding.signPrivBytes must be 32 bytes');
     }
-
+  
     const enabled = args.grind?.enabled !== false;
     const maxAttempts = Math.max(1, Math.floor(Number(args.grind?.maxAttempts ?? 256)));
-
+  
+    // ----- prefix selection -----
+    //
+    // Phase 2 default: 8-bit targeting (fast).
+    // - Default: target derived8 (receiverScanPub33[1]) as a byte.
+    // - If prefixByteOverride is provided: use that byte.
+    // - If prefixHex16Override is provided: switch to 16-bit mode and target that 2-byte hex.
+    //
+    // NOTE: derived16 is still computed/logged for visibility, but not used unless explicit16 override.
+  
     const prefixHex16OverrideRaw = args.grind?.prefixHex16Override ?? null;
     const prefixByteOverrideRaw = args.grind?.prefixByteOverride ?? null;
-
-    const derived16 = deriveReceiverGrindPrefix16FromScanPub33(receiverScanPub33);
-    const derived8 = deriveReceiverGrindByteFromScanPub33(receiverScanPub33);
-
-    wantPrefix16 =
-      prefixHex16OverrideRaw != null ? cleanPrefix16OrThrow(prefixHex16OverrideRaw) : derived16;
-
+  
+    const derived16 = deriveReceiverGrindPrefix16FromScanPub33(receiverScanPub33); // e.g. "8999"
+    const derived8 = deriveReceiverGrindByteFromScanPub33(receiverScanPub33); // e.g. 0x89 (number)
+  
+    const explicit16 = prefixHex16OverrideRaw != null;
+  
+    // In 16-bit mode, the target is a 4-hex string.
+    wantPrefix16 = explicit16 ? cleanPrefix16OrThrow(prefixHex16OverrideRaw) : derived16;
+  
+    // In 8-bit mode, the target is a byte (0-255).
     wantPrefixByte =
+      !explicit16 &&
       prefixByteOverrideRaw != null &&
       typeof prefixByteOverrideRaw === 'number' &&
       Number.isFinite(prefixByteOverrideRaw)
         ? (prefixByteOverrideRaw & 0xff)
-        : null;
-
-    use16 = wantPrefix16 != null && wantPrefixByte == null;
-
+        : !explicit16
+          ? derived8
+          : null;
+  
+    // Mode switch: only use16 if user explicitly provided a 16-bit override.
+    use16 = explicit16;
+  
     // Keep role index fixed at 0 for now (receiver scanning cost stays low).
     // The grind happens on the first input serialization (sequence/signature).
     paycodeIntent = deriveRpaLockIntent({
@@ -419,40 +435,43 @@ export async function runSend(
       index: 0,
     });
     usedRoleIndex = 0;
-
+  
     destHash160 = paycodeIntent.childHash160;
     destAddress = encodeP2pkhCashaddr(String(ctx.network), destHash160);
-
+  
     const destHash160Hex = bytesToHex(destHash160).toLowerCase();
     const spk0 = getP2PKHScript(destHash160);
     const sh0 = scriptToScripthashHex(spk0);
-
+  
     grindMeta = {
       used: enabled && maxAttempts > 0,
       // "found" below will mean: we successfully ground the tx so that
       // its first-input hash prefix matches the desired prefix.
       found: false,
-
+  
       // role index used inside deriveRpaLockIntent (not the grind nonce)
       roleIndex: usedRoleIndex,
-
+  
       // grind attempts for tx input prefix
       maxAttempts,
       mode: use16 ? 'prefix16' : 'prefix8',
       wantPrefix16: use16 ? wantPrefix16 : null,
-      wantPrefix8: !use16 ? (wantPrefixByte ?? derived8) : null,
-
+      wantPrefix8: !use16 ? wantPrefixByte : null,
+  
       derivedPrefix16: derived16,
       derivedPrefix8: derived8,
-
+  
       override16: prefixHex16OverrideRaw != null ? cleanPrefix16OrThrow(prefixHex16OverrideRaw) : null,
-      override8: prefixByteOverrideRaw != null ? (Number(prefixByteOverrideRaw) & 0xff) : null,
-
+      override8:
+        !explicit16 && prefixByteOverrideRaw != null && typeof prefixByteOverrideRaw === 'number' && Number.isFinite(prefixByteOverrideRaw)
+          ? (Number(prefixByteOverrideRaw) & 0xff)
+          : null,
+  
       gotHash160Prefix16: destHash160Hex.slice(0, 4),
       gotHash160Prefix8: destHash160Hex.slice(0, 2),
       gotScripthashPrefix16: sh0.slice(0, 4),
       gotScripthashPrefix8: sh0.slice(0, 2),
-
+  
       // filled in after we grind/sign
       gotInputPrefix16: null as string | null,
       grindNonce: null as number | null,

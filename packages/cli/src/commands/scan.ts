@@ -500,7 +500,8 @@ export function registerScanCommand(
           // (2) Optional brute8 sweep MERGED with fast results (not fallback-only)
           // -------------------------------------------------------------------
 
-          const prefixesToTry = [derived16, derived8];
+          // Phase 2 default: 8-bit only for performance and to match send default.
+          const prefixesToTry = [derived8];
 
           const out: string[] = [];
           for (const p of prefixesToTry) {
@@ -528,7 +529,7 @@ export function registerScanCommand(
           }
 
           const uniqFast = Array.from(new Set(out));
-          if (debugScan) console.log(`[scan:debug] fast candidates=${uniqFast.length} (prefixes=${derived16},${derived8})`);
+          if (debugScan) console.log(`[scan:debug] fast candidates=${uniqFast.length} (prefixes=${derived8})`);
 
           // MERGE brute8 results if enabled
           if (!brute8Enabled) return uniqFast;
@@ -636,7 +637,7 @@ export function registerScanCommand(
         console.log(`startHeight:    ${startHeight}`);
         console.log(`endHeight:      ${endHeight}`);
         if (opts.rpaPrefix) console.log(`rpaPrefixHex:   ${normalizeRpaPrefixHexOrThrow(opts)}`);
-        else console.log(`rpaPrefixHex:   ${derived16} (also tried ${derived8}${brute8Enabled ? ', brute8' : ''})`);
+        else console.log(`rpaPrefixHex:   ${derived8} (phase2 default${brute8Enabled ? ', brute8' : ''})`);
         if (singleTxid) console.log(`txid:           ${singleTxid}`);
         console.log(`candidates:     ${candidateTxids.length}`);
         console.log(`updateState:    ${opts.updateState ? 'yes' : 'no'}`);

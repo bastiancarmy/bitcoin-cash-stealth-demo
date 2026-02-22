@@ -1,7 +1,9 @@
 // packages/cli/src/commands/send.ts
 //
-// Drop-in replacement: TKT-B4H2 Option A (send loads + persists profile state).
-// Fixes incorrect import of resolveProfilePaths (use ../paths.js).
+// Phase 2 defaults locked:
+// - Default grind mode is 8-bit (handled in ops/send.ts).
+// - Default grind-max is 2048 for paycode sends (high success probability).
+// - 16-bit grind is opt-in via --grind-prefix16.
 //
 // Behavior:
 // - Always resolves config/state paths via resolveProfilePaths({ cwd, profile, ... }).
@@ -27,7 +29,6 @@ import { readConfig, ensureConfigDefaults } from '../config_store.js';
 import { getWalletFromConfig } from '../wallets.js';
 import { generatePaycode } from '../paycodes.js';
 
-// ✅ correct import
 import { resolveProfilePaths } from '../paths.js';
 
 function stripAnsi(s: string): string {
@@ -51,7 +52,6 @@ function parseOptionalHexByte(raw: unknown): number | null {
   return Number.parseInt(x, 16);
 }
 
-// add alongside parseOptionalHexByte
 function parseOptionalHex16(raw: unknown): string | null {
   if (raw == null) return null;
   const s = String(raw).trim().toLowerCase();
@@ -94,9 +94,22 @@ export function registerSendCommand(
     .option('--dry-run', 'Build and sign the transaction but do not broadcast.')
     .option('--no-paycode', 'Reject paycode destinations (require cashaddr).')
     .option('--all', 'Also print hex internals (hash160, raw tx hex).', false)
-    .option('--no-grind', 'Disable paycode grinding (forces index=0 derivation).')
-    .option('--grind-max <N>', 'Max grind attempts for paycode sends (default 256). 0 disables grinding.', (v) => Number(v))
-    .option('--grind-prefix16 <HHHH>', 'Override grind prefix (2 bytes hex like "c272"). Preferred on Fulcrum prefix_bits=16.', (v) => String(v))
+    .option('--no-grind', 'Disable paycode grinding (forces non-targeted send).')
+    .option(
+      '--grind-max <N>',
+      'Max grind attempts for paycode sends (Phase 2 default 2048 for 8-bit). 0 disables grinding.',
+      (v) => Number(v)
+    )
+    .option(
+      '--grind-prefix <HH>',
+      'Override grind prefix (1 byte hex like "89"). Legacy / Phase 2 fast mode.',
+      (v) => String(v)
+    )
+    .option(
+      '--grind-prefix16 <HHHH>',
+      'Override grind prefix (2 bytes hex like "8999"). Enables 16-bit mode (slow).',
+      (v) => String(v)
+    )
     .option('--self-paycode <pm>', 'Override: your own paycode (for stealth change).', '')
     .action(
       async (
@@ -110,6 +123,7 @@ export function registerSendCommand(
           grind?: boolean; // commander sets --no-grind => grind=false
           grindMax?: number;
           grindPrefix?: string;
+          grindPrefix16?: string;
           selfPaycode?: string;
         }
       ) => {
@@ -119,7 +133,6 @@ export function registerSendCommand(
         const profile = String(active0.profile ?? '').trim() || 'default';
         const all = !!opts?.all;
 
-        // ✅ canonical path resolution (no non-existent profile_paths module)
         const p = resolveProfilePaths({
           cwd: process.cwd(),
           profile,
@@ -134,7 +147,6 @@ export function registerSendCommand(
 
         let destStr = stripAnsi(String(destMaybe ?? '').trim());
 
-        // If --to-profile is provided, resolve paycode from config and ignore dest argument
         if (opts.toProfile) {
           const cfg0 = ensureConfigDefaults(readConfig({ configFile }) ?? null);
           void cfg0;
@@ -158,19 +170,20 @@ export function registerSendCommand(
         const chainIO = makeChainIO({ network: NETWORK, electrum: Electrum as any });
 
         const grindEnabled = opts.grind !== false;
-        const grindMaxUser = parseNonNegativeInt(opts.grindMax, '--grind-max') ?? 256;
+
+        // Phase 2 default: 2048 (8-bit)
+        const grindMaxUser = parseNonNegativeInt(opts.grindMax, '--grind-max') ?? 2048;
         const grindMax = grindEnabled ? grindMaxUser : 0;
-        const grindPrefix16Override = parseOptionalHex16((opts as any).grindPrefix16);
-        const grindPrefixByte = parseOptionalHexByte(opts.grindPrefix); // keep legacy 1 byte
 
-        // --- Load state (even without pool) ---
+        const grindPrefix16Override = parseOptionalHex16(opts.grindPrefix16);
+        const grindPrefixByte = parseOptionalHexByte(opts.grindPrefix);
+
         const filename = path.resolve(stateFile);
-
         ensureDirForFile(filename);
+
         const store = new FileBackedPoolStateStore({ filename });
         const state = await loadStateOrEmpty({ store, networkDefault: String(NETWORK) });
 
-        // --- Compute self paycode (prefer derived from wallet keys), allow override ---
         const defaultSelfPaycode = generatePaycode(((me as any).scanPrivBytes ?? (me as any).privBytes) as Uint8Array);
         const selfPaycodeOverride = String(opts.selfPaycode ?? '').trim();
         const selfPaycode = selfPaycodeOverride || defaultSelfPaycode;
@@ -212,7 +225,6 @@ export function registerSendCommand(
           } as any
         );
 
-        // Persist state if we broadcasted (this is where stealth change gets recorded)
         if (!opts?.dryRun) {
           await saveState({ store, state: ctx.state, networkDefault: String(NETWORK) });
         }
