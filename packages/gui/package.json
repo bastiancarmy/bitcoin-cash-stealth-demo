@@ -1,0 +1,70 @@
+{
+  "name": "@bch-stealth/gui",
+  "version": "0.1.0",
+  "description": "Electron GUI wrapper for bchctl",
+  "author": "bch-stealth",
+  "private": true,
+  "type": "commonjs",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "clean": "rm -rf dist dist-electron dist-builder .vite node_modules/.cache",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "build:electron": "tsc -p electron/tsconfig.json",
+    "build:renderer": "vite build",
+    "build": "yarn build:electron && yarn build:renderer",
+    "dev": "concurrently -n RENDERER,ELECTRON -c auto \"vite --port 5173\" \"yarn electron:dev\"",
+    "electron:dev": "cross-env NODE_ENV=development VITE_DEV_SERVER_URL=http://localhost:5173 yarn build:electron && electron ./dist-electron/main.js",
+    "pack": "yarn build && electron-builder --dir",
+    "dist": "yarn build && electron-builder"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.1",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "cross-env": "^7.0.3",
+    "electron": "31.4.0",
+    "electron-builder": "^24.13.3",
+    "electron-builder-squirrel-windows": "^26.8.1",
+    "typescript": "^5.7.3",
+    "vite": "^6.4.1"
+  },
+  "build": {
+    "electronVersion": "31.4.0",
+    "appId": "cash.bchstealth.gui",
+    "productName": "bchctl-gui",
+    "directories": {
+      "output": "dist-builder"
+    },
+    "files": [
+      "dist/**",
+      "dist-electron/**"
+    ],
+    "mac": {
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "notarize": false,
+      "target": [
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "portable",
+        "zip"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "zip"
+      ]
+    }
+  }
+}

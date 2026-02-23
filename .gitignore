@@ -22,6 +22,52 @@ dist/
 build/
 out/
 coverage/
+*.map
+
+# Vite / bundler caches
+.vite/
+.vite-cache/
+.esbuild/
+.turbo/
+.cache/
+.parcel-cache/
+
+# Electron / packaging
+release/
+releases/
+app-builds/
+installer/
+installers/
+*.dmg
+*.pkg
+*.exe
+*.msi
+*.AppImage
+*.snap
+*.deb
+*.rpm
+*.zip
+*.7z
+*.blockmap
+
+# Electron Builder / Forge / Squirrel
+electron-builder.yml
+electron-builder.yaml
+dist-electron/
+out-electron/
+.squirrel-temp/
+*.nupkg
+RELEASES
+Update.exe
+
+# GUI workspace build artifacts
+packages/gui/dist-builder/
+packages/gui/dist-electron/
+packages/gui/dis-electron/
+
+# native modules build artifacts
+build/Release/
+*.node
 
 # env
 .env*
@@ -29,18 +75,51 @@ coverage/
 
 # logs
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+debug.log*
+logs/
+log/
+*.pid
+*.seed
+*.pid.lock
 
-# misc
+# Electron crash / diagnostics
+crashpad/
+Crashpad/
+*.dmp
+*.stackdump
+
+# macOS
 .DS_Store
+
+# editors
 .vscode/
 .idea/
+
+# misc / repo-specific
 .envrc
 wallets.local.json
 repomix-output*
 doc/
 packages/cli/wallets.local.json
+
+# BCH stealth local storage (keep out of repo)
 .bch-stealth/
+# defensive: if anyone runs Electron with cwd storage, ignore these too
+bch-stealth/
+electron-data/
+userdata/
+userData/
+
 # TypeScript incremental build cache
 tsconfig.tsbuildinfo
 *.tsbuildinfo
+
+# temp
 /tmp/
+tmp/
+temp/

@@ -44,6 +44,21 @@ export function findConfigRoot(startCwd: string): string {
   return path.resolve(startCwd);
 }
 
+/**
+ * If set, BCH_STEALTH_HOME forces the root directory used to locate `.bch-stealth/`.
+ * This allows GUIs (Electron) to make CLI storage deterministic without relying on cwd.
+ *
+ * Expected layout:
+ *   <BCH_STEALTH_HOME>/.bch-stealth/config.json
+ *   <BCH_STEALTH_HOME>/.bch-stealth/profiles/<profile>/state.json
+ */
+function getForcedHomeFromEnv(): string | null {
+  const raw = String(process.env.BCH_STEALTH_HOME ?? '').trim();
+  if (!raw) return null;
+  // resolve relative values against process.cwd to keep behavior deterministic
+  return path.resolve(process.cwd(), raw);
+}
+
 export function resolveProfilePaths(args: {
   cwd: string;
   profile: string;
@@ -54,19 +69,15 @@ export function resolveProfilePaths(args: {
 
   envWalletPath?: string | null;
 }): ProfilePaths {
-  const {
-    cwd,
-    profile,
-    walletOverride,
-    stateOverride,
-    logOverride,
-    envWalletPath,
-  } = args;
+  const { cwd, profile, walletOverride, stateOverride, logOverride, envWalletPath } = args;
 
   const prof = sanitizeProfileName(profile);
 
-  // Canonical store root: find-up from cwd
-  const root = findConfigRoot(cwd);
+  // Canonical store root:
+  // 1) BCH_STEALTH_HOME if set
+  // 2) else find-up from cwd
+  const forcedHome = getForcedHomeFromEnv();
+  const root = forcedHome ?? findConfigRoot(cwd);
 
   // Canonical store is shared across profiles (kubeconfig-style)
   const configFile = path.resolve(root, '.bch-stealth', 'config.json');
@@ -81,12 +92,10 @@ export function resolveProfilePaths(args: {
     path.resolve(baseDir, 'wallet.json');
 
   const stateFile =
-    (stateOverride && path.resolve(root, stateOverride)) ||
-    path.resolve(baseDir, 'state.json');
+    (stateOverride && path.resolve(root, stateOverride)) || path.resolve(baseDir, 'state.json');
 
   const logFile =
-    (logOverride && path.resolve(root, logOverride)) ||
-    path.resolve(baseDir, 'events.ndjson');
+    (logOverride && path.resolve(root, logOverride)) || path.resolve(baseDir, 'events.ndjson');
 
   return {
     profile: prof,

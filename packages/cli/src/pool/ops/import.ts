@@ -66,21 +66,75 @@ function parseBoolishEnv(name: string): boolean {
   return v === '1' || v === 'true' || v === 'yes' || v === 'y' || v === 'on';
 }
 
-function requireBaseImportUnlocks(args: { allowBaseFlag: boolean }) {
-  if (!args.allowBaseFlag) {
+function requireBaseImportUnlocks(args: {
+  // keep whatever you currently pass; these are the only ones we need:
+  outpoint: string;
+  deposit: any;
+
+  // these are best-effort for better errors (optional – pass if you have them handy)
+  prevoutScriptPubKeyHex?: string;
+  stateFile?: string;
+  profile?: string;
+  network?: string;
+  spendKeyNote?: string;
+
+  // existing base-import inputs:
+  allowBase?: boolean;
+  depositWif?: string | undefined;
+  depositPrivHex?: string | undefined;
+  allowBaseEnv?: boolean; // BCH_STEALTH_ALLOW_BASE_IMPORT=1 or similar
+}) {
+  const dep = args.deposit;
+
+  // ✅ KEY CHANGE:
+  // If the deposit was staged as RPA (stage-from produced it), do NOT treat it as “base”.
+  // Instead, allow the import flow to attempt the stealth unlock path.
+  if (isStagedRpaDeposit(dep)) {
+    // Optional: if prevout looks like P2PKH, sanity-check hash160 matches the staged value.
+    // If it doesn't match, fail with an actionable derivation mismatch.
+    const expected = String(dep.receiverRpaHash160Hex).trim().toLowerCase();
+    const actual = args.prevoutScriptPubKeyHex
+      ? extractP2pkhHash160HexFromScriptPubKeyHex(args.prevoutScriptPubKeyHex)
+      : null;
+
+    if (actual && actual !== expected) {
+      throw rpaDerivationMismatchError({
+        outpoint: args.outpoint,
+        expectedHash160Hex: expected,
+        actualHash160Hex: actual,
+        stateFile: args.stateFile,
+        profile: args.profile,
+        network: args.network,
+        spendKeyNote: args.spendKeyNote,
+      });
+    }
+
+    // Treat as RPA and let the stealth path continue.
+    return;
+  }
+
+  // -------------------------
+  // Existing base-import gate
+  // -------------------------
+  const allowBase = Boolean(args.allowBase);
+  const allowBaseEnv = Boolean(args.allowBaseEnv);
+
+  if (!allowBase || !allowBaseEnv) {
     throw new Error(
       `Refusing to import a NON-RPA (base P2PKH) deposit without --allow-base.\n` +
-        `This deposit is not stealth. If you intended to import fused coins, re-run with:\n` +
+        `This deposit is not staged as RPA. If you intended to import fused coins, re-run with:\n` +
         `  bchctl  pool import --allow-base --deposit-wif <WIF>\n` +
         `And also set:\n` +
         `  BCH_STEALTH_ALLOW_BASE_IMPORT=1`
     );
   }
-  if (!parseBoolishEnv('BCH_STEALTH_ALLOW_BASE_IMPORT')) {
+
+  if (!String(args.depositWif ?? '').trim() && !String(args.depositPrivHex ?? '').trim()) {
     throw new Error(
-      `Refusing base import: missing hard env unlock.\n` +
-        `Set BCH_STEALTH_ALLOW_BASE_IMPORT=1 and re-run.\n` +
-        `This guard exists to prevent accidental non-stealth imports.`
+      `Base import requires unlock material.\n` +
+        `Provide one of:\n` +
+        `  --deposit-wif <WIF>\n` +
+        `  --deposit-privhex <hex>\n`
     );
   }
 }
@@ -95,6 +149,62 @@ function loudBaseImportWarning(args: { dep: DepositRecord; expectedH160Hex: stri
       `  You are responsible for ensuring your coins are adequately mixed BEFORE deposit/import.\n`
   );
 }
+
+// --- BEGIN: staged-RPA classification helpers ------------------------------
+
+function isValidHash160Hex(s: string): boolean {
+  return /^[0-9a-f]{40}$/i.test(String(s ?? '').trim());
+}
+
+function isStagedRpaDeposit(dep: any): boolean {
+  // Strict: staged via stage-from should have all 3
+  if (!dep) return false;
+  if (String(dep.depositKind ?? '').toLowerCase() !== 'rpa') return false;
+
+  const h = String(dep.receiverRpaHash160Hex ?? '').trim().toLowerCase();
+  if (!isValidHash160Hex(h)) return false;
+
+  // rpaContext is what import uses to re-derive intent / validate sender + prevout linkage
+  if (!dep.rpaContext) return false;
+
+  return true;
+}
+
+// If prevout is a standard P2PKH, extract its hash160 (20 bytes)
+function extractP2pkhHash160HexFromScriptPubKeyHex(scriptHex: string): string | null {
+  const s = String(scriptHex ?? '').trim().toLowerCase();
+  // P2PKH: 76 a9 14 <20-byte> 88 ac
+  if (!s.startsWith('76a914') || !s.endsWith('88ac')) return null;
+  if (s.length !== '76a914'.length + 40 + '88ac'.length) return null;
+  return s.slice('76a914'.length, '76a914'.length + 40);
+}
+
+function rpaDerivationMismatchError(args: {
+  outpoint: string;
+  expectedHash160Hex: string;
+  actualHash160Hex: string | null;
+  stateFile?: string;
+  profile?: string;
+  network?: string;
+  spendKeyNote?: string;
+}): Error {
+  const lines: string[] = [];
+  lines.push(`RPA deposit unlock derivation failed for ${args.outpoint}`);
+  lines.push(`expected receiverRpaHash160Hex: ${args.expectedHash160Hex}`);
+  lines.push(`actual prevout P2PKH hash160:    ${args.actualHash160Hex ?? '(non-P2PKH or unknown)'}`);
+
+  if (args.spendKeyNote) lines.push(`spendKey: ${args.spendKeyNote}`);
+
+  if (args.profile || args.network) {
+    lines.push(`context: profile=${args.profile ?? '(unknown)'} network=${args.network ?? '(unknown)'}`);
+  }
+  if (args.stateFile) lines.push(`stateFile: ${args.stateFile}`);
+
+  lines.push(`Tip: this usually means key-source mismatch (config vs derived) or wrong outpoint/vout.`);
+  return new Error(lines.join('\n'));
+}
+
+// --- END: staged-RPA classification helpers --------------------------------
 
 // --------------------------
 // Stealth record bridge helpers
@@ -190,26 +300,37 @@ async function importDepositToShardOnce(args: {
   if (!expectedH160) throw new Error('deposit prevout is not P2PKH');
   const expectedH160Hex = bytesToHex(expectedH160);
 
+  const outpointStr = `${depositOutpoint.txid}:${depositOutpoint.vout}`;
+
   let depositKind: 'rpa' | 'base_p2pkh' = 'rpa';
   let depositSignPrivBytes: Uint8Array;
   let depositH160Hex: string;
 
-  const rpaCtx = (depositOutpoint as any).rpaContext;
+  const depAny = depositOutpoint as any;
+  const rpaCtx = depAny?.rpaContext ?? null;
 
-  // ✅ Fix C: accept prevoutTxidHex OR prevoutHashHex for known stealth deposits
+  // If stage-from created this deposit, it should look like an RPA deposit.
+  const looksStagedRpa =
+    String(depAny?.depositKind ?? '').toLowerCase() === 'rpa' &&
+    typeof depAny?.receiverRpaHash160Hex === 'string' &&
+    /^[0-9a-f]{40}$/i.test(depAny.receiverRpaHash160Hex) &&
+    !!rpaCtx;
+
+  // Accept either prevoutHashHex or prevoutTxidHex (we've seen both in the wild)
   const hasRpa =
-    !!(rpaCtx?.senderPub33Hex && (rpaCtx?.prevoutHashHex || rpaCtx?.prevoutTxidHex) && rpaCtx?.prevoutN != null && rpaCtx?.index != null);
+    !!(rpaCtx?.senderPub33Hex &&
+      (rpaCtx?.prevoutHashHex || rpaCtx?.prevoutTxidHex) &&
+      rpaCtx?.prevoutN != null &&
+      rpaCtx?.index != null);
 
   if (hasRpa) {
     const senderPaycodePub33 = hexToBytes(String(rpaCtx.senderPub33Hex));
 
-    const receiverWallet = ctx.me.wallet;
-
-    const nk = normalizeWalletKeys(receiverWallet);
+    const nk = normalizeWalletKeys(ctx.me.wallet);
     debugPrintKeyFlags('pool-import', nk.flags);
 
     const prevoutHashHex = String((rpaCtx.prevoutHashHex ?? rpaCtx.prevoutTxidHex) as string);
-    
+
     const { oneTimePriv } = deriveRpaOneTimePrivReceiver(
       nk.scanPriv32,
       nk.spendPriv32,
@@ -223,18 +344,32 @@ async function importDepositToShardOnce(args: {
     depositH160Hex = bytesToHex(h160);
 
     if (depositH160Hex.toLowerCase() !== expectedH160Hex.toLowerCase()) {
-      throw new Error(`deposit spend derivation mismatch. expected=${expectedH160Hex} derived=${depositH160Hex}`);
+      throw new Error(
+        `RPA deposit unlock derivation failed for ${outpointStr}\n` +
+          `expected hash160: ${expectedH160Hex}\n` +
+          `derived  hash160: ${depositH160Hex}\n` +
+          `note: if spendKey was overridden, ensure both sender/receiver are using the same derived spend key source`
+      );
     }
 
     depositSignPrivBytes = oneTimePriv;
     depositKind = 'rpa';
   } else {
-    depositKind = 'base_p2pkh';
-    requireBaseImportUnlocks({ allowBaseFlag });
+    // Important: staged deposits that claim to be RPA should never fall back to base
+    if (looksStagedRpa) {
+      throw new Error(
+        `Staged RPA deposit is missing required rpaContext fields for ${outpointStr}\n` +
+          `Required: senderPub33Hex, (prevoutHashHex|prevoutTxidHex), prevoutN, index.\n` +
+          `Tip: re-run scan --include-mempool --update-state then re-stage-from this outpoint.`
+      );
+    }
 
+    // Base import path
+    depositKind = 'base_p2pkh';
+
+    // Determine baseDepositPrivBytes: explicit arg or auto-select my base key if output matches my base hash160
     let baseDepositPrivBytes = args.baseDepositPrivBytes ?? null;
 
-    // If the deposit output is to MY base P2PKH, auto-use MY base key.
     const meH160Hex = bytesToHex(ctx.me.wallet.hash160).toLowerCase();
     if (!baseDepositPrivBytes && expectedH160Hex.toLowerCase() === meH160Hex) {
       baseDepositPrivBytes = ctx.me.wallet.privBytes;
@@ -242,6 +377,28 @@ async function importDepositToShardOnce(args: {
         console.log(`[import:debug] base import: using my base key (hash160 matched deposit output)`);
       }
     }
+
+    // Gate: require --allow-base + env
+    // Your updated requireBaseImportUnlocks currently checks for depositWif/depositPrivHex strings.
+    // We may have bytes (baseDepositPrivBytes) without those strings, so pass a sentinel depositPrivHex
+    // only when bytes exist to avoid a false "requires unlock material" rejection.
+    requireBaseImportUnlocks({
+      outpoint: outpointStr,
+      deposit: depositOutpoint,
+      prevoutScriptPubKeyHex: bytesToHex(depositPrev.scriptPubKey),
+
+      // best-effort context (safe if undefined)
+      stateFile: (ctx as any)?.stateFile,
+      profile: (ctx as any)?.profile,
+      network: (ctx as any)?.network ?? (ctx as any)?.net ?? undefined,
+      spendKeyNote: (ctx as any)?.spendKeyNote,
+
+      allowBase: Boolean(allowBaseFlag),
+      allowBaseEnv: process.env.BCH_STEALTH_ALLOW_BASE_IMPORT === '1',
+
+      depositWif: undefined,
+      depositPrivHex: baseDepositPrivBytes ? 'provided-via-bytes' : undefined,
+    });
 
     if (!baseDepositPrivBytes) {
       throw new Error(
@@ -365,30 +522,49 @@ export async function runImport(
     const vout = Number(depositVout ?? 0);
     if (!/^[0-9a-f]{64}$/i.test(txid)) throw new Error(`invalid --deposit-txid: ${depositTxid}`);
     if (!Number.isFinite(vout) || vout < 0) throw new Error(`invalid --deposit-vout: ${depositVout}`);
-
-    const prev = await ctx.chainIO.getPrevOutput(txid, vout);
-    const h160 = parseP2pkhHash160(prev.scriptPubKey);
-    if (!h160) throw new Error(`override deposit outpoint is not P2PKH: ${txid}:${vout}`);
-
-    // ✅ non-null local, so TS is happy
-    const depOverride: DepositRecord = {
-      txid,
-      vout,
-      valueSats: String(prev.value),
-      value: String(prev.value),
-      receiverRpaHash160Hex: bytesToHex(h160),
-      createdAt: new Date().toISOString(),
-    } as any;
-
-    const attached = attachRpaContextFromStealthIfMissing({
-      stateAny: st0 as any,
-      dep: depOverride,
-    });
-
-    dep = attached.dep;
-
-    if (shouldDebug()) {
-      console.log(`[import:debug] override deposit: rpaContext source=${attached.source}`);
+  
+    // ✅ NEW: if this outpoint is already staged, use the staged record (keeps depositKind + rpaContext)
+    const staged = Array.isArray((st as any).deposits)
+      ? ((st as any).deposits as any[]).find((d) => String(d?.txid).toLowerCase() === txid && Number(d?.vout) === vout) ?? null
+      : null;
+  
+    if (staged) {
+      // Ensure rpaContext is attached (some older staged records might miss it)
+      const attached = attachRpaContextFromStealthIfMissing({
+        stateAny: st0 as any,
+        dep: staged as DepositRecord,
+      });
+      dep = attached.dep;
+  
+      if (shouldDebug()) {
+        console.log(`[import:debug] using staged deposit for ${txid}:${vout} (rpaContext source=${attached.source})`);
+        console.log(`[import:debug] staged depositKind=${String((dep as any)?.depositKind ?? '')}`);
+      }
+    } else {
+      // Fallback: treat as raw outpoint import (no staged metadata)
+      const prev = await ctx.chainIO.getPrevOutput(txid, vout);
+      const h160 = parseP2pkhHash160(prev.scriptPubKey);
+      if (!h160) throw new Error(`override deposit outpoint is not P2PKH: ${txid}:${vout}`);
+  
+      const depOverride: DepositRecord = {
+        txid,
+        vout,
+        valueSats: String(prev.value),
+        value: String(prev.value),
+        receiverRpaHash160Hex: bytesToHex(h160),
+        createdAt: new Date().toISOString(),
+      } as any;
+  
+      const attached = attachRpaContextFromStealthIfMissing({
+        stateAny: st0 as any,
+        dep: depOverride,
+      });
+  
+      dep = attached.dep;
+  
+      if (shouldDebug()) {
+        console.log(`[import:debug] override deposit: staged=NO rpaContext source=${attached.source}`);
+      }
     }
   } else {
     // ✅ make nullability explicit so TS knows we don't pass null into attachRpaContext...
