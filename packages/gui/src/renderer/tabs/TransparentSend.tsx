@@ -56,33 +56,40 @@ export function TransparentSendTab(props: {
   };
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%', minWidth: 0 }}>
       <div style={{ fontWeight: 800, fontSize: 16 }}>Transparent chain send (cashaddr)</div>
 
-      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-        <label style={{ flex: 1, minWidth: 420 }}>
-          To cashaddr:{' '}
+      {/* Form: destination stacked above sats */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, minWidth: 0 }}>
+        <label style={{ width: '100%', minWidth: 0 }}>
+          To cashaddr:
           <input
-            style={{ width: '100%' }}
+            style={{ width: '100%', marginTop: 6 }}
             value={dest}
             onChange={(e) => setDest(e.target.value)}
             placeholder="bitcoincash:... or bchtest:..."
           />
         </label>
 
-        <label>
-          Sats:{' '}
-          <input value={sats} onChange={(e) => setSats(e.target.value)} style={{ width: 120 }} />
-        </label>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', minWidth: 0 }}>
+          <label style={{ width: 220 }}>
+            Sats:
+            <input
+              value={sats}
+              onChange={(e) => setSats(e.target.value)}
+              style={{ width: '100%', marginTop: 6 }}
+            />
+          </label>
 
-        <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-          <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
-          dry-run
-        </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, opacity: 0.9 }}>
+            <input type="checkbox" checked={dryRun} onChange={(e) => setDryRun(e.target.checked)} />
+            dry-run
+          </label>
 
-        <button disabled={!canSend} onClick={submit}>
-          {busy ? 'Sending…' : 'Send'}
-        </button>
+          <button disabled={!canSend} onClick={submit}>
+            {busy ? 'Sending…' : 'Send'}
+          </button>
+        </div>
       </div>
 
       <div style={{ opacity: 0.85, fontSize: 13 }}>

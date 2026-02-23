@@ -28,6 +28,10 @@ const tabFilters: Record<string, (label: string) => boolean> = {
   rpa_send: (label) => label.startsWith('send') || label.startsWith('wallet:'),
 
   transparent: (label) => label.startsWith('send') || label.startsWith('wallet:'),
+
+  pool_withdraw: (label) =>
+    label.startsWith('pool:withdraw') ||
+    label.startsWith('pool:withdraw-check'),
 };
 
 export function LogPane(props: {

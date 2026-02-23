@@ -12,6 +12,7 @@ import { RpaSendTab } from './tabs/RpaSend';
 import { RpaScanTab } from './tabs/RpaScan';
 import { PoolInitTab } from './tabs/PoolInit';
 import { PoolImportTab } from './tabs/PoolImport';
+import { PoolWithdrawTab } from './tabs/PoolWithdraw';
 
 type TabKey = 'transparent' | 'rpa_send' | 'rpa_scan' | 'pool_init' | 'pool_import' | 'pool_withdraw';
 
@@ -266,7 +267,15 @@ export default function App() {
         />
       );
 
-    if (tab === 'pool_withdraw') return <PlaceholderTab title="Pool withdraw" />;
+    if (tab === 'pool_withdraw')
+      return (
+        <PoolWithdrawTab
+          profile={activeProfile}
+          runFast={runFast}
+          refreshNow={refreshNow}
+          disableAll={disableAll}
+        />
+      );
 
     return null;
   };
@@ -317,7 +326,7 @@ export default function App() {
       </div>
 
       <div style={{ marginTop: 14, display: 'flex', gap: 12, height: 'calc(100vh - 190px)' }}>
-        <div style={{ flex: 1.1, display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div style={{ flex: 1.1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 10 }}>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             {tabs.map(([k, label]) => (
               <button
