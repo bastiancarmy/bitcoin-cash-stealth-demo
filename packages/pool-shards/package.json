@@ -23,5 +23,9 @@
     "@bch-stealth/pool-hash-fold": "workspace:^",
     "@bch-stealth/tx-builder": "workspace:^",
     "@bch-stealth/utils": "workspace:^"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3"
   }
 }

@@ -30,6 +30,7 @@
     "cross-env": "^7.0.3",
     "electron": "31.4.0",
     "electron-builder": "^24.13.3",
+    "electron-builder-squirrel-windows": "^26.8.1",
     "typescript": "^5.7.3",
     "vite": "^6.4.1"
   },
@@ -49,13 +50,21 @@
       "hardenedRuntime": false,
       "gatekeeperAssess": false,
       "notarize": false,
-      "target": ["zip"]
+      "target": [
+        "zip"
+      ]
     },
     "win": {
-      "target": ["portable", "zip"]
+      "target": [
+        "portable",
+        "zip"
+      ]
     },
     "linux": {
-      "target": ["AppImage", "zip"]
+      "target": [
+        "AppImage",
+        "zip"
+      ]
     }
   }
 }

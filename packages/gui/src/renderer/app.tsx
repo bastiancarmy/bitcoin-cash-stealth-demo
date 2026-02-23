@@ -80,7 +80,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    const run = async () => {
+    const run0 = async () => {
       const info = (await window.bchStealth.appInfo()) as AppInfo;
       setAppInfo(info);
 
@@ -95,7 +95,7 @@ export default function App() {
       setActiveProfile(fallback);
     };
 
-    void run();
+    void run0();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -156,7 +156,7 @@ export default function App() {
       }
     }
 
-    // pool shards (must not hard-fail refresh)
+    // pool shards
     {
       try {
         const result = await bch.runText({
@@ -175,7 +175,7 @@ export default function App() {
     }
   };
 
-  const refresh = async () => {
+  const refreshNow = async () => {
     await reloadProfilesFromDisk();
     await reloadConfig();
     await refreshActive(activeProfile);
@@ -183,17 +183,29 @@ export default function App() {
 
   const initWallet = async () => {
     await bch.runText({ profile: activeProfile, label: 'wallet:init', argv: ['wallet', 'init'] });
-    await reloadProfilesFromDisk();
-    await reloadConfig();
-    await refreshActive(activeProfile);
+    await refreshNow();
   };
 
-  const run = async (args: { label: string; argv: string[] }): Promise<RunResult> => {
-    const res = await bch.runText({ profile: activeProfile, label: args.label, argv: args.argv });
-    await reloadProfilesFromDisk();
-    await reloadConfig();
-    await refreshActive(activeProfile);
+  // Existing "safe" runner: refreshes after each command
+  const run = async (args: { label: string; argv: string[]; timeoutMs?: number }): Promise<RunResult> => {
+    const res = await bch.runText({
+      profile: activeProfile,
+      label: args.label,
+      argv: args.argv,
+      timeoutMs: args.timeoutMs,
+    });
+    await refreshNow();
     return res;
+  };
+
+  // New "fast" runner for batch flows: no gauge refresh
+  const runFast = async (args: { label: string; argv: string[]; timeoutMs?: number }): Promise<RunResult> => {
+    return bch.runText({
+      profile: activeProfile,
+      label: args.label,
+      argv: args.argv,
+      timeoutMs: args.timeoutMs,
+    });
   };
 
   useEffect(() => {
@@ -229,9 +241,31 @@ export default function App() {
 
     if (tab === 'transparent') return <TransparentSendTab run={run} disableAll={disableAll} />;
     if (tab === 'rpa_send') return <RpaSendTab run={run} disableAll={disableAll} />;
-    if (tab === 'rpa_scan') return <RpaScanTab run={run} disableAll={disableAll} />;
-    if (tab === 'pool_init') return <PoolInitTab run={run} disableAll={disableAll} />;
-    if (tab === 'pool_import') return <PoolImportTab run={run} disableAll={disableAll} />;
+
+    // Updated tabs get fast/batched runner support
+    if (tab === 'rpa_scan')
+      return (
+        <RpaScanTab
+          run={run}
+          runFast={runFast}
+          refreshNow={refreshNow}
+          disableAll={disableAll}
+          profile={activeProfile}
+        />
+      );
+    if (tab === 'pool_init')
+      return <PoolInitTab profile={activeProfile} run={run} runFast={runFast} refreshNow={refreshNow} disableAll={disableAll} />;
+    if (tab === 'pool_import')
+      return (
+        <PoolImportTab
+          run={run}
+          runFast={runFast}
+          refreshNow={refreshNow}
+          disableAll={disableAll}
+          profile={activeProfile}
+        />
+      );
+
     if (tab === 'pool_withdraw') return <PlaceholderTab title="Pool withdraw" />;
 
     return null;
@@ -279,7 +313,7 @@ export default function App() {
       </div>
 
       <div style={{ marginTop: 12 }}>
-        <Gauges profile={activeProfile} state={state} onRefresh={refresh} onInitWallet={initWallet} disableAll={disableAll} />
+        <Gauges profile={activeProfile} state={state} onRefresh={refreshNow} onInitWallet={initWallet} disableAll={disableAll} />
       </div>
 
       <div style={{ marginTop: 14, display: 'flex', gap: 12, height: 'calc(100vh - 190px)' }}>
@@ -309,7 +343,7 @@ export default function App() {
         </div>
 
         <div style={{ flex: 1, minWidth: 520 }}>
-          <LogPane lines={bch.lines} onClear={bch.clearLog} />
+          <LogPane lines={bch.lines} onClear={bch.clearLog} activeTab={tab} />
         </div>
       </div>
 

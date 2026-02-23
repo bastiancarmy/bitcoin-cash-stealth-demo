@@ -22,27 +22,71 @@ function outpointKey(txid: string, vout: number): string {
   return `${String(txid).toLowerCase()}:${Number(vout)}`;
 }
 
+/**
+ * The state JSON has moved around during development. This helper tolerates a few known layouts.
+ */
 function readStealthUtxosFromAnyState(stateAny: any): StealthUtxoRecord[] {
-  const a = stateAny?.data?.stealthUtxos;
-  if (Array.isArray(a)) return a as StealthUtxoRecord[];
+  const pools: any[] = [];
 
-  const b = stateAny?.data?.pool?.state?.stealthUtxos;
-  if (Array.isArray(b)) return b as StealthUtxoRecord[];
+  const pushIfArray = (v: any) => {
+    if (Array.isArray(v)) pools.push(v);
+  };
 
-  const c = stateAny?.stealthUtxos;
-  if (Array.isArray(c)) return c as StealthUtxoRecord[];
+  // Most common shapes we've used:
+  pushIfArray(stateAny?.data?.stealthUtxos);
+  pushIfArray(stateAny?.data?.pool?.state?.stealthUtxos);
+  pushIfArray(stateAny?.stealthUtxos);
 
-  return [];
+  // (Optional) tolerate additional nesting if introduced later:
+  pushIfArray(stateAny?.data?.wallet?.stealthUtxos);
+  pushIfArray(stateAny?.data?.rpa?.stealthUtxos);
+  pushIfArray(stateAny?.wallet?.stealthUtxos);
+  pushIfArray(stateAny?.rpa?.stealthUtxos);
+  pushIfArray(stateAny?.pool?.stealthUtxos);
+
+  // flatten
+  return pools.flat() as StealthUtxoRecord[];
 }
 
+function computeOutpointFromStealthRecord(r: any): string | null {
+  // Case A: explicit outpoint string on the record
+  const op = typeof r?.outpoint === 'string' ? r.outpoint.trim().toLowerCase() : '';
+  if (op && /^[0-9a-f]{64}:\d+$/i.test(op)) return op;
+
+  // Case B: txid + vout/n
+  const txid = String(r?.txid ?? r?.txidHex ?? '').trim().toLowerCase();
+  const vout = Number(r?.vout ?? r?.n);
+
+  if (!/^[0-9a-f]{64}$/i.test(txid)) return null;
+  if (!Number.isFinite(vout) || vout < 0) return null;
+
+  return outpointKey(txid, vout);
+}
+
+/**
+ * Robust match:
+ * - supports record.outpoint = "txid:vout"
+ * - supports record.txid/txidHex + record.vout/n
+ */
 function findStealthRecord(stateAny: any, txid: string, vout: number): StealthUtxoRecord | null {
-  const k = outpointKey(txid, vout);
+  const want = outpointKey(txid, vout);
+
   for (const r of readStealthUtxosFromAnyState(stateAny)) {
-    const rt = (r as any)?.txid ?? (r as any)?.txidHex;
-    const rv = (r as any)?.vout ?? (r as any)?.n;
-    if (outpointKey(String(rt), Number(rv)) === k) return r as StealthUtxoRecord;
+    const got = computeOutpointFromStealthRecord(r);
+    if (got && got === want) return r as StealthUtxoRecord;
   }
+
   return null;
+}
+
+function sampleOutpoints(stateAny: any, limit = 12): string[] {
+  const out: string[] = [];
+  for (const r of readStealthUtxosFromAnyState(stateAny)) {
+    const op = computeOutpointFromStealthRecord(r);
+    if (op) out.push(op);
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 /**
@@ -68,11 +112,16 @@ export function registerPoolStageFrom(pool: Command, deps: { getActivePaths: () 
       const st0 = await loadStateOrEmpty({ store, networkDefault: String(NETWORK) });
       const st = ensurePoolStateDefaults(st0, String(NETWORK));
 
+      // ✅ robust lookup (supports record.outpoint or record.txid/vout)
       const rec = findStealthRecord(st0 as any, txid, vout);
       if (!rec) {
+        const examples = sampleOutpoints(st0 as any, 12);
+        const hint = examples.length ? `\nExamples in state:\n  - ${examples.join('\n  - ')}` : '';
+
         throw new Error(
           `stage-from: stealthUtxo not found for ${txid}:${vout}\n` +
-            `Tip: run scan (include mempool) and ensure it is recorded in state.stealthUtxos first.`
+            `Tip: run scan --include-mempool --update-state and ensure it is recorded in state.stealthUtxos first.\n` +
+            `stateFile: ${stateFile}${hint}`
         );
       }
 

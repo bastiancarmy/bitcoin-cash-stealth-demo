@@ -1,67 +1,167 @@
 // packages/gui/src/renderer/tabs/PoolImport.tsx
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { RunResult } from '../hooks/useBchctl';
-import { MostRecentResult } from '../components/MostRecentResult';
+import { OpStatusBar, type OpStatus } from '../components/OpStatusBar';
 import {
-  type LastRun,
   type DepositRow,
+  type RpaUtxoRow,
+  buildScanInboundArgv,
+  buildWalletRpaUtxosArgv,
+  parseWalletRpaUtxos,
   buildPoolDepositsArgv,
   parsePoolDeposits,
-  buildPoolStageArgv,
+  buildPoolStageFromArgv,
   buildPoolImportArgv,
-  toLastRun,
   chipnetTxUrl,
   shortHex,
   formatSats,
-  splitOutpoint,
+  parseScanProgressChunk,
 } from './poolImportModel';
 
-export function PoolImportTab(props: {
-  run: (args: { label: string; argv: string[] }) => Promise<RunResult>;
+type Props = {
+  profile: string;
+  run: (args: { label: string; argv: string[]; timeoutMs?: number }) => Promise<RunResult>;
+  runFast: (args: { label: string; argv: string[]; timeoutMs?: number }) => Promise<RunResult>;
+  refreshNow: () => Promise<void>;
   disableAll: boolean;
-}) {
-  const { run, disableAll } = props;
+};
+
+type TrailItem = {
+  ts: number;
+  label: string;
+  argv: string[];
+  code?: number;
+  note?: string;
+};
+
+function trailKey(profile: string): string {
+  const p = String(profile ?? '').trim() || 'default';
+  return `bchstealth.poolImportTrail.v1.${p}`;
+}
+
+function loadTrail(profile: string): TrailItem[] {
+  try {
+    const raw = sessionStorage.getItem(trailKey(profile));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as TrailItem[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveTrail(profile: string, items: TrailItem[]) {
+  try {
+    sessionStorage.setItem(trailKey(profile), JSON.stringify(items.slice(-50)));
+  } catch {
+    // ignore
+  }
+}
+
+function argvToString(argv: string[]): string {
+  // show as user would run it (minus yarn bchctl and profile)
+  return argv.map((a) => (a.includes(' ') ? JSON.stringify(a) : a)).join(' ');
+}
+
+function shortOutpoint(op: string): string {
+  const s = String(op ?? '');
+  const tx = s.slice(0, 8);
+  return tx ? `${tx}…` : s;
+}
+
+export function PoolImportTab(props: Props) {
+  const { profile, runFast, refreshNow, disableAll } = props;
 
   const [busy, setBusy] = useState(false);
 
-  // Stage panel state
-  const [stageSats, setStageSats] = useState('2000');
-  const [depositMode, setDepositMode] = useState<'rpa' | 'base'>('rpa');
-  const [changeMode, setChangeMode] = useState<'auto' | 'transparent' | 'stealth'>('auto');
-
-  // Deposit/ingest panel state
-  const [useLatest, setUseLatest] = useState(true);
-  const [outpoint, setOutpoint] = useState('');
-  const [shardIndex, setShardIndex] = useState('');
-  const [fresh, setFresh] = useState(false);
-
-  const [allowBase, setAllowBase] = useState(false);
-  const [depositWif, setDepositWif] = useState('');
-  const [depositPrivHex, setDepositPrivHex] = useState('');
-
-  // Staged deposits list state
+  // table filters
   const [checkChain, setCheckChain] = useState(true);
   const [unimportedOnly, setUnimportedOnly] = useState(true);
-  const [allowUnconfirmed, setAllowUnconfirmed] = useState(false);
+  const [allowUnknown, setAllowUnknown] = useState(false);
+
   const [rows, setRows] = useState<DepositRow[]>([]);
   const [selectedOutpoint, setSelectedOutpoint] = useState<string>('');
 
-  // Most recent outputs (tab-local)
-  const [lastStage, setLastStage] = useState<LastRun | null>(null);
-  const [lastDeposit, setLastDeposit] = useState<LastRun | null>(null);
-  const [lastList, setLastList] = useState<LastRun | null>(null);
+  const [depositsMeta, setDepositsMeta] = useState<{
+    stateFile?: string;
+    network?: string;
+    total?: number;
+    shown?: number;
+  } | null>(null);
 
-  const outpointParsed = useMemo(() => splitOutpoint(outpoint), [outpoint]);
-  const stageSatsOk = useMemo(() => /^\d+$/.test(stageSats.trim()) && Number(stageSats) > 0, [stageSats]);
+  const [status, setStatus] = useState<OpStatus>({
+    kind: 'idle',
+    title: 'Ready',
+    detail: 'Click “Scan inbound” to find new deposits.',
+    progress: null,
+  });
 
-  async function loadDeposits() {
+  // -----------------------------
+  // Command trail (per-profile)
+  // -----------------------------
+  const [trail, setTrail] = useState<TrailItem[]>(() => loadTrail(profile));
+
+  useEffect(() => {
+    setTrail(loadTrail(profile));
+  }, [profile]);
+
+  const pushTrail = (it: TrailItem) => {
+    setTrail((cur: TrailItem[]) => {
+      const next = [...cur, it].slice(-50);
+      saveTrail(profile, next);
+      return next;
+    });
+  };
+
+  const clearTrail = () => {
+    setTrail([]);
+    saveTrail(profile, []);
+  };
+
+  // track which opId is the active scan so we can parse its progress chunks
+  const scanOpIdRef = useRef<string | null>(null);
+
+  const runStep = async (args: { label: string; argv: string[]; timeoutMs?: number; note?: string }) => {
+    pushTrail({ ts: Date.now(), label: args.label, argv: args.argv, note: args.note });
+    const res = await runFast({ label: args.label, argv: args.argv, timeoutMs: args.timeoutMs });
+    pushTrail({ ts: Date.now(), label: args.label, argv: args.argv, code: res.code });
+    return res;
+  };
+
+  // -----------------------------
+  // Load staged deposits list
+  // -----------------------------
+  const loadDeposits = async () => {
     const argv = buildPoolDepositsArgv({ unimportedOnly, checkChain });
-    const res = await run({ label: 'pool:deposits', argv });
-    setLastList(toLastRun(argv, res));
-
+    const res = await runStep({ label: 'pool:deposits', argv, timeoutMs: 90_000, note: 'Load staged deposits list' });
     const parsed = parsePoolDeposits(res.stdout ?? '');
     setRows(parsed.deposits);
-  }
+    setDepositsMeta(parsed.meta ?? null);
+  };
+
+  useEffect(() => {
+    // reset view + reload when profile changes
+    setRows([]);
+    setSelectedOutpoint('');
+    setDepositsMeta(null);
+  
+    // also reset status so the user doesn't see stale "Depositing..." etc.
+    setStatus({
+      kind: 'idle',
+      title: 'Ready',
+      detail: 'Click “Scan inbound” to find new deposits.',
+      progress: null,
+    });
+  
+    // clear any in-flight scan tracking
+    scanOpIdRef.current = null;
+  
+    // (optional) clear busy if you want profile switch to “break out” of a long op visually
+    setBusy(false);
+  
+    void loadDeposits();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile]);
 
   useEffect(() => {
     void loadDeposits();
@@ -69,270 +169,368 @@ export function PoolImportTab(props: {
   }, []);
 
   useEffect(() => {
+    // filter flips should re-read list (fast-ish), not do discovery
     void loadDeposits();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [checkChain, unimportedOnly]);
 
-  const canStage = useMemo(() => !disableAll && !busy && stageSatsOk, [disableAll, busy, stageSatsOk]);
+  // -----------------------------
+  // Live scan progress (stderr)
+  // -----------------------------
+  useEffect(() => {
+    const off = window.bchStealth.onBchctlChunk((m) => {
+      const scanOpId = scanOpIdRef.current;
+      if (!scanOpId) return;
+      if (m.opId !== scanOpId) return;
 
-  const canDeposit = useMemo(() => {
-    if (disableAll || busy) return false;
-    if (useLatest) return true;
-    if (!outpoint.trim()) return false;
-    return !!outpointParsed;
-  }, [disableAll, busy, useLatest, outpoint, outpointParsed]);
+      const evt = parseScanProgressChunk(m.chunk ?? '');
+      if (!evt) return;
 
-  const selectedRow = useMemo(
-    () => rows.find((r) => r.outpoint === selectedOutpoint) ?? null,
-    [rows, selectedOutpoint]
-  );
+      if (evt.kind === 'progress') {
+        setStatus((cur: OpStatus) => ({
+          ...cur,
+          kind: 'running',
+          title: cur.title || 'Scanning inbound…',
+          detail: `Fetching raw tx ${evt.cur}/${evt.total}…`,
+          progress: { cur: evt.cur, total: evt.total },
+        }));
+        return;
+      }
 
-  const onPickRow = (r: DepositRow) => {
-    setSelectedOutpoint(r.outpoint);
-    setUseLatest(false);
-    setOutpoint(r.outpoint);
-  };
+      if (evt.kind === 'done') {
+        setStatus((cur: OpStatus) => ({
+          ...cur,
+          kind: 'running',
+          title: cur.title || 'Scanning inbound…',
+          detail: 'Scan completed. Finalizing…',
+          progress: cur.progress ?? null,
+        }));
+        return;
+      }
 
-  const runStage = async () => {
-    const argv = buildPoolStageArgv({ sats: stageSats.trim(), depositMode, changeMode });
-    setBusy(true);
-    try {
-      const res = await run({ label: 'pool:stage', argv });
-      setLastStage(toLastRun(argv, res));
-      await loadDeposits();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const runDepositIntoPool = async (mode: 'latest' | 'row' | 'manual') => {
-    let outpointArg: string | null = null;
-    let latest = false;
-
-    if (mode === 'latest') {
-      latest = true;
-    } else if (mode === 'row') {
-      outpointArg = selectedRow?.outpoint ?? null;
-      if (!outpointArg) latest = true;
-    } else {
-      if (useLatest) latest = true;
-      else outpointArg = outpointParsed ? `${outpointParsed.txid}:${outpointParsed.vout}` : null;
-      if (!latest && !outpointArg) latest = true;
-    }
-
-    const argv = buildPoolImportArgv({
-      outpoint: outpointArg,
-      latest,
-      shard: shardIndex,
-      fresh,
-      allowBase,
-      depositWif,
-      depositPrivHex,
+      if (evt.kind === 'found') {
+        setStatus((cur: OpStatus) => ({
+          ...cur,
+          kind: 'running',
+          title: 'Scan complete',
+          detail: `Found ${evt.found} inbound candidates.`,
+          progress: null,
+        }));
+        return;
+      }
     });
 
+    return () => off();
+  }, []);
+
+  const canScan = useMemo(() => !disableAll && !busy, [disableAll, busy]);
+
+  const rowDisabledReason = (r: DepositRow): string | null => {
+    if (disableAll) return 'disabled';
+    if (busy) return 'busy';
+    if (r.importTxid) return 'already imported';
+    if (checkChain && r.chainOk === false) return 'spent on chain';
+    if (checkChain && r.chainOk == null && !allowUnknown) return 'unknown on chain';
+    return null;
+  };
+
+  // -----------------------------
+  // One-click flow:
+  // scan -> rpa-utxos -> stage-from new -> reload deposits -> refresh gauges
+  // -----------------------------
+  const runScanInboundAndPromote = async () => {
     setBusy(true);
+    setStatus({ kind: 'running', title: 'Scanning inbound…', detail: 'Starting scan…', progress: null });
+
+    // IMPORTANT: clear old scan opId *before* starting
+    scanOpIdRef.current = null;
+
     try {
-      const res = await run({ label: 'pool:import', argv });
-      setLastDeposit(toLastRun(argv, res));
+      // 0) kickoff scan and capture opId early so chunk listener can work
+      const scanArgv = buildScanInboundArgv({ includeMempool: true, updateState: true });
+
+      // We need opId from the run itself. runFast returns it.
+      pushTrail({
+        ts: Date.now(),
+        label: 'scan:auto',
+        argv: scanArgv,
+        note: 'Discover inbound deposits and write them to the state file (slow)',
+      });
+
+      const scanRes = await runFast({ label: 'scan:auto', argv: scanArgv, timeoutMs: 240_000 });
+
+      // ✅ set opId immediately so we can parse subsequent chunks (some may still arrive after await)
+      scanOpIdRef.current = scanRes.opId;
+
+      pushTrail({ ts: Date.now(), label: 'scan:auto', argv: scanArgv, code: scanRes.code });
+
+      // 1) wallet rpa-utxos --json
+      let inbound: RpaUtxoRow[] = [];
+      {
+        const argv = buildWalletRpaUtxosArgv();
+        const res = await runStep({
+          label: 'wallet:rpa-utxos',
+          argv,
+          timeoutMs: 90_000,
+          note: 'Read discovered inbound UTXOs from state',
+        });
+        inbound = parseWalletRpaUtxos(res.stdout ?? '').utxos;
+      }
+
+      // 2) pool deposits (all) to avoid restaging
+      let staged = new Set<string>();
+      {
+        const argv = buildPoolDepositsArgv({ unimportedOnly: false, checkChain: false });
+        const res = await runStep({
+          label: 'pool:deposits:all',
+          argv,
+          timeoutMs: 90_000,
+          note: 'Read all staged deposits (avoid re-staging)',
+        });
+        staged = new Set(parsePoolDeposits(res.stdout ?? '').deposits.map((d) => d.outpoint));
+      }
+
+      // 3) stage-from for new inbound outpoints (unspent & not already staged)
+      const candidates = inbound.filter((u) => u?.outpoint && !u.spent && !staged.has(u.outpoint) && u.kind !== 'wallet_change');
+
+      if (!candidates.length) {
+        // reload deposits anyway (chain check may have changed)
+        await loadDeposits();
+        await refreshNow();
+
+        // first-run friendly empty state
+        const nowRows = rows.length;
+        if (nowRows === 0) {
+          setStatus({
+            kind: 'idle',
+            title: 'No inbound deposits found',
+            detail: 'Ask someone to pay your paycode, then click “Scan inbound” again.',
+            progress: null,
+          });
+        } else {
+          setStatus({
+            kind: 'success',
+            title: 'No new deposits',
+            detail: 'Everything already looks staged. If you just received a payment, scan again in a moment.',
+            progress: null,
+          });
+        }
+        return;
+      }
+
+      setStatus({
+        kind: 'running',
+        title: 'Promoting inbound…',
+        detail: `Staging ${candidates.length} new deposits…`,
+        progress: { cur: 0, total: candidates.length },
+      });
+
+      let i = 0;
+      for (const u of candidates) {
+        i++;
+        setStatus({
+          kind: 'running',
+          title: 'Promoting inbound…',
+          detail: `Staging ${i}/${candidates.length} (${shortOutpoint(u.outpoint)})`,
+          progress: { cur: i, total: candidates.length },
+        });
+
+        const argv = buildPoolStageFromArgv({ outpoint: u.outpoint });
+        await runStep({
+          label: `pool:stage-from:${u.outpoint.slice(0, 8)}`,
+          argv,
+          timeoutMs: 120_000,
+          note: `Promote ${u.outpoint} into staged deposits`,
+        });
+      }
+
+      // 4) reload list + refresh gauges once
+      setStatus({ kind: 'running', title: 'Refreshing…', detail: 'Loading staged deposits…', progress: null });
       await loadDeposits();
+      await refreshNow();
+
+      setStatus({ kind: 'success', title: 'Ready', detail: 'Scan complete. Deposits list updated.', progress: null });
+    } catch (e: any) {
+      setStatus({ kind: 'error', title: 'Error', detail: String(e?.message ?? e ?? 'Unknown error'), progress: null });
+    } finally {
+      scanOpIdRef.current = null;
+      setBusy(false);
+    }
+  };
+
+  const depositOne = async (r: DepositRow) => {
+    const reason = rowDisabledReason(r);
+    if (reason) return;
+
+    setBusy(true);
+    setStatus({ kind: 'running', title: 'Depositing…', detail: `Importing ${shortOutpoint(r.outpoint)}…`, progress: null });
+
+    try {
+      const argv = buildPoolImportArgv({ outpoint: r.outpoint });
+      await runStep({
+        label: `pool:import:${r.outpoint.slice(0, 8)}`,
+        argv,
+        timeoutMs: 240_000,
+        note: `Import ${r.outpoint} into the pool shard`,
+      });
+
+      await refreshNow();
+      await loadDeposits();
+
+      setStatus({ kind: 'success', title: 'Deposited', detail: `Imported ${shortOutpoint(r.outpoint)}.`, progress: null });
+    } catch (e: any) {
+      setStatus({
+        kind: 'error',
+        title: 'Deposit failed',
+        detail: String(e?.message ?? e ?? 'Unknown error'),
+        progress: null,
+      });
     } finally {
       setBusy(false);
     }
   };
+
+  const depositAllVisible = async () => {
+    const candidates = rows.filter((r) => !rowDisabledReason(r));
+    if (!candidates.length) {
+      setStatus({ kind: 'idle', title: 'Nothing to deposit', detail: 'No eligible deposits are visible.', progress: null });
+      return;
+    }
+
+    setBusy(true);
+    setStatus({
+      kind: 'running',
+      title: 'Depositing…',
+      detail: `Importing 0/${candidates.length}…`,
+      progress: { cur: 0, total: candidates.length },
+    });
+
+    try {
+      let i = 0;
+      for (const r of candidates) {
+        i++;
+        setStatus({
+          kind: 'running',
+          title: 'Depositing…',
+          detail: `Importing ${i}/${candidates.length} (${shortOutpoint(r.outpoint)})`,
+          progress: { cur: i, total: candidates.length },
+        });
+
+        const argv = buildPoolImportArgv({ outpoint: r.outpoint });
+        await runStep({
+          label: `pool:import:${r.outpoint.slice(0, 8)}`,
+          argv,
+          timeoutMs: 240_000,
+          note: `Import ${r.outpoint}`,
+        });
+      }
+
+      await refreshNow();
+      await loadDeposits();
+
+      setStatus({ kind: 'success', title: 'Done', detail: `Imported ${candidates.length} deposits.`, progress: null });
+    } catch (e: any) {
+      setStatus({
+        kind: 'error',
+        title: 'Deposit-all failed',
+        detail: String(e?.message ?? e ?? 'Unknown error'),
+        progress: null,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const selectedRow = useMemo(() => rows.find((r) => r.outpoint === selectedOutpoint) ?? null, [rows, selectedOutpoint]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12, height: '100%' }}>
-      <div style={{ fontWeight: 800, fontSize: 16 }}>Pool deposit (stage → ingest)</div>
-
-      <div style={{ display: 'flex', gap: 12, alignItems: 'stretch', minHeight: 260 }}>
-        {/* Stage pane */}
-        <div style={{ flex: 1, minWidth: 520, border: '1px solid #222', borderRadius: 8, padding: 10 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{ fontWeight: 700 }}>Stage deposit</div>
-            <div style={{ opacity: 0.7, fontSize: 12 }}>
-              Uses: <code>pool stage</code> or <code>pool stage-from</code>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10 }}>
-            <label style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <span style={{ minWidth: 80 }}>amount:</span>
-              <input
-                value={stageSats}
-                onChange={(e) => setStageSats(e.target.value)}
-                style={{ width: 160 }}
-                placeholder="2000"
-              />
-              <span style={{ opacity: 0.75, fontSize: 12 }}>sats</span>
-            </label>
-
-            <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'center' }}>
-              <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <span>deposit mode:</span>
-                <select value={depositMode} onChange={(e) => setDepositMode(e.target.value as any)}>
-                  <option value="rpa">rpa (recommended)</option>
-                  <option value="base">base (not stealth)</option>
-                </select>
-              </label>
-
-              <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <span>change mode:</span>
-                <select value={changeMode} onChange={(e) => setChangeMode(e.target.value as any)}>
-                  <option value="auto">auto</option>
-                  <option value="transparent">transparent</option>
-                  <option value="stealth">stealth</option>
-                </select>
-              </label>
-            </div>
-
-            {depositMode === 'base' ? (
-              <div style={{ fontSize: 12, opacity: 0.8, border: '1px solid #333', borderRadius: 6, padding: 8 }}>
-                Base deposits are not stealth. Only use this if your coins are already mixed externally.
-              </div>
-            ) : null}
-
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <button disabled={!canStage} onClick={() => void runStage()}>
-                {busy ? 'Staging…' : 'Stage deposit'}
-              </button>
-
-              <button disabled={disableAll || busy} onClick={() => void loadDeposits()}>
-                Refresh staged deposits
-              </button>
-
-              <div style={{ opacity: 0.75, fontSize: 12 }}>
-                For inbound (including unconfirmed) RPA receives, use <code>pool stage-from txid:vout</code> to promote
-                the scanned UTXO into staged deposits.
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* Ingest pane */}
-        <div style={{ flex: 1, minWidth: 520, border: '1px solid #222', borderRadius: 8, padding: 10 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{ fontWeight: 700 }}>Deposit into pool</div>
-            <div style={{ opacity: 0.7, fontSize: 12 }}>
-              Uses: <code>pool import</code>
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginTop: 10 }}>
-            <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <input type="checkbox" checked={useLatest} onChange={(e) => setUseLatest(e.target.checked)} />
-              use <code>--latest</code> (prefers latest unimported staged deposit)
-            </label>
-
-            <label style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <span style={{ minWidth: 110 }}>deposit outpoint:</span>
-              <input
-                style={{ flex: 1, minWidth: 260 }}
-                value={outpoint}
-                onChange={(e) => setOutpoint(e.target.value)}
-                placeholder="txid:vout"
-                disabled={useLatest}
-              />
-              {outpointParsed ? (
-                <a href={chipnetTxUrl(outpointParsed.txid)} target="_blank" rel="noreferrer" style={{ fontSize: 12 }}>
-                  explorer
-                </a>
-              ) : null}
-            </label>
-
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <label style={{ minWidth: 220 }}>
-                shard index:
-                <input
-                  style={{ width: '100%' }}
-                  value={shardIndex}
-                  onChange={(e) => setShardIndex(e.target.value)}
-                  placeholder="(optional)"
-                />
-              </label>
-
-              <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <input type="checkbox" checked={fresh} onChange={(e) => setFresh(e.target.checked)} />
-                fresh
-              </label>
-            </div>
-
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <label style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <input type="checkbox" checked={allowBase} onChange={(e) => setAllowBase(e.target.checked)} />
-                allow base (advanced)
-              </label>
-            </div>
-
-            {allowBase ? (
-              <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-                <label style={{ flex: 1, minWidth: 320 }}>
-                  deposit wif:{' '}
-                  <input
-                    style={{ width: '100%' }}
-                    value={depositWif}
-                    onChange={(e) => setDepositWif(e.target.value)}
-                    placeholder="(optional)"
-                  />
-                </label>
-                <label style={{ flex: 1, minWidth: 320 }}>
-                  deposit privhex:{' '}
-                  <input
-                    style={{ width: '100%' }}
-                    value={depositPrivHex}
-                    onChange={(e) => setDepositPrivHex(e.target.value)}
-                    placeholder="(optional)"
-                  />
-                </label>
-              </div>
-            ) : null}
-
-            <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
-              <button disabled={!canDeposit} onClick={() => void runDepositIntoPool('manual')}>
-                {busy ? 'Depositing…' : 'Deposit into pool'}
-              </button>
-
-              <button disabled={disableAll || busy} onClick={() => void runDepositIntoPool('latest')}>
-                Deposit latest
-              </button>
-            </div>
-          </div>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+        <div style={{ fontWeight: 900, fontSize: 16 }}>Pool Import</div>
+        <div style={{ opacity: 0.75, fontSize: 12 }}>Scan inbound → promote → deposit</div>
+        <div style={{ marginLeft: 'auto', opacity: 0.6, fontSize: 12 }}>
+          profile: <code>{profile}</code>
         </div>
       </div>
 
-      {/* Staged deposits list */}
-      <div style={{ border: '1px solid #222', borderRadius: 8, padding: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+      <OpStatusBar
+        status={status}
+        onClear={
+          status.kind === 'error' || status.kind === 'success'
+            ? () =>
+                setStatus({
+                  kind: 'idle',
+                  title: 'Ready',
+                  detail: 'Click “Scan inbound” to find new deposits.',
+                  progress: null,
+                })
+            : undefined
+        }
+      />
+
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button disabled={!canScan} onClick={() => void runScanInboundAndPromote()}>
+          {busy ? 'Working…' : 'Scan inbound'}
+        </button>
+
+        <button disabled={disableAll || busy} onClick={() => void depositAllVisible()}>
+          Deposit all visible
+        </button>
+
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, opacity: 0.85 }}>
+            <input type="checkbox" checked={unimportedOnly} onChange={(e) => setUnimportedOnly(e.target.checked)} />
+            unimported only
+          </label>
+
+          <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, opacity: 0.85 }}>
+            <input type="checkbox" checked={checkChain} onChange={(e) => setCheckChain(e.target.checked)} />
+            check chain
+          </label>
+
+          <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, opacity: 0.85 }}>
+            <input
+              type="checkbox"
+              checked={allowUnknown}
+              onChange={(e) => setAllowUnknown(e.target.checked)}
+              disabled={!checkChain}
+            />
+            allow unknown
+          </label>
+        </div>
+      </div>
+
+      <div
+        style={{
+          border: '1px solid #222',
+          borderRadius: 10,
+          padding: 10,
+          background: '#070707',
+          flex: 1,
+          minHeight: 0,
+        }}
+      >
+        {/* header row with precise placement */}
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 10 }}>
           <div style={{ fontWeight: 700 }}>Staged deposits</div>
           <div style={{ opacity: 0.7, fontSize: 12 }}>
             Source: <code>pool deposits --json</code>
           </div>
 
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, opacity: 0.85 }}>
-            <input type="checkbox" checked={unimportedOnly} onChange={(e) => setUnimportedOnly(e.target.checked)} />
-            unimported only
-          </label>
+          <div style={{ marginLeft: 'auto', display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 2 }}>
+            <div style={{ opacity: 0.75, fontSize: 12 }}>
+              shown: <code>{rows.length}</code>
+            </div>
 
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, opacity: 0.85 }}>
-            <input type="checkbox" checked={checkChain} onChange={(e) => setCheckChain(e.target.checked)} />
-            check chain
-          </label>
-
-          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, opacity: 0.85 }}>
-            <input
-              type="checkbox"
-              checked={allowUnconfirmed}
-              onChange={(e) => setAllowUnconfirmed(e.target.checked)}
-              disabled={!checkChain}
-            />
-            allow unconfirmed/unknown
-          </label>
-
-          <button style={{ marginLeft: 'auto' }} disabled={disableAll || busy} onClick={() => void loadDeposits()}>
-            Refresh
-          </button>
+            {depositsMeta?.stateFile ? (
+              <div style={{ opacity: 0.7, fontSize: 12 }}>
+                state: <code>{depositsMeta.stateFile}</code>
+              </div>
+            ) : null}
+          </div>
         </div>
 
-        <div style={{ marginTop: 10, maxHeight: 220, overflow: 'auto' }}>
+        <div style={{ maxHeight: '100%', overflow: 'auto' }}>
           {rows.length ? (
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
               <thead>
@@ -341,39 +539,36 @@ export function PoolImportTab(props: {
                   <th style={{ padding: '6px 8px', borderBottom: '1px solid #222' }}>outpoint</th>
                   <th style={{ padding: '6px 8px', borderBottom: '1px solid #222' }}>kind</th>
                   <th style={{ padding: '6px 8px', borderBottom: '1px solid #222' }}>status</th>
-                  <th style={{ padding: '6px 8px', borderBottom: '1px solid #222' }} />
+                  <th style={{ padding: '6px 8px', borderBottom: '1px solid #222', textAlign: 'right' }}>action</th>
                 </tr>
               </thead>
               <tbody>
                 {rows.map((r) => {
                   const isSel = selectedOutpoint === r.outpoint;
                   const imported = !!r.importTxid;
+                  const disabledReason = rowDisabledReason(r);
+                  const disabled = !!disabledReason;
 
-                  // New behavior:
-                  // - spent (false) always blocks
-                  // - unknown (null) blocks only if allowUnconfirmed is OFF
-                  const chainBad =
-                    checkChain &&
-                    (r.chainOk === false || (r.chainOk == null && !allowUnconfirmed));
-
-                  const disabled = disableAll || busy || imported || chainBad;
-
-                  const status = imported
+                  const statusText = imported
                     ? 'imported'
                     : checkChain
-                      ? (r.chainOk === true ? 'unspent' : r.chainOk === false ? 'spent' : 'unknown')
+                      ? r.chainOk === true
+                        ? 'unspent'
+                        : r.chainOk === false
+                          ? 'spent'
+                          : 'unknown'
                       : 'unchecked';
 
                   return (
                     <tr
                       key={r.outpoint}
-                      onClick={() => onPickRow(r)}
+                      onClick={() => setSelectedOutpoint(r.outpoint)}
                       style={{
                         cursor: 'pointer',
                         background: isSel ? '#10161d' : undefined,
                         opacity: disabled ? 0.55 : 1,
                       }}
-                      title="Click to select"
+                      title={disabledReason ?? 'Click to select'}
                     >
                       <td style={{ padding: '6px 8px', borderBottom: '1px solid #111' }}>
                         {formatSats(r.valueSats)} sats
@@ -388,18 +583,14 @@ export function PoolImportTab(props: {
                         <code>{r.depositKind || 'rpa'}</code>
                       </td>
                       <td style={{ padding: '6px 8px', borderBottom: '1px solid #111', opacity: 0.85 }}>
-                        <code>{status}</code>
-                        {r.importedIntoShard != null ? (
-                          <span style={{ opacity: 0.8 }}> • shard={String(r.importedIntoShard)}</span>
-                        ) : null}
+                        <code>{statusText}</code>
                       </td>
                       <td style={{ padding: '6px 8px', borderBottom: '1px solid #111', textAlign: 'right' }}>
                         <button
                           disabled={disabled}
                           onClick={(e) => {
                             e.stopPropagation();
-                            onPickRow(r);
-                            void runDepositIntoPool('row');
+                            void depositOne(r);
                           }}
                         >
                           {imported ? 'Imported' : 'Deposit'}
@@ -412,45 +603,64 @@ export function PoolImportTab(props: {
             </table>
           ) : (
             <div style={{ opacity: 0.75, fontSize: 12 }}>
-              No staged deposits found. If you just received an RPA payment, promote it with{' '}
-              <code>pool stage-from txid:vout</code>, then refresh.
+              No staged deposits found. Click <b>Scan inbound</b> to discover deposits.
             </div>
           )}
         </div>
+
+        {/* command trail under the frame */}
+        <div style={{ marginTop: 12, borderTop: '1px solid #111', paddingTop: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ fontWeight: 700, fontSize: 12, opacity: 0.85 }}>Commands run (Pool Import • {profile})</div>
+            <button style={{ marginLeft: 'auto' }} disabled={disableAll || busy || !trail.length} onClick={clearTrail}>
+              Clear
+            </button>
+          </div>
+
+          <div style={{ marginTop: 8, maxHeight: 140, overflow: 'auto', fontSize: 12, opacity: 0.85 }}>
+            {trail.length ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {/* newest first */}
+                {trail
+                  .slice()
+                  .reverse()
+                  .map((t, i) => {
+                    const ts = new Date(t.ts).toLocaleTimeString();
+                    const code = typeof t.code === 'number' ? `exit ${t.code}` : '';
+                    return (
+                      <div
+                        key={`${t.ts}:${i}`}
+                        style={{ border: '1px solid #111', borderRadius: 8, padding: 8, background: '#050505' }}
+                      >
+                        <div style={{ display: 'flex', gap: 10, alignItems: 'baseline' }}>
+                          <div style={{ opacity: 0.65 }}>{ts}</div>
+                          <div style={{ fontWeight: 700 }}>{t.label}</div>
+                          <div style={{ marginLeft: 'auto', opacity: 0.7 }}>{code}</div>
+                        </div>
+                        {t.note ? <div style={{ opacity: 0.75, marginTop: 4 }}>{t.note}</div> : null}
+                        <div style={{ marginTop: 6 }}>
+                          <code>{argvToString(t.argv)}</code>
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+            ) : (
+              <div style={{ opacity: 0.7 }}>No commands yet. Click “Scan inbound”.</div>
+            )}
+          </div>
+        </div>
       </div>
 
-      {/* Most recent panes */}
-      <div style={{ display: 'flex', gap: 12, minHeight: 260, flex: 1 }}>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <MostRecentResult
-            title="Stage output"
-            result={lastStage}
-            onClear={() => setLastStage(null)}
-            disableClear={disableAll || busy}
-            emptyText="Run Stage deposit to see the most recent CLI output here."
-          />
+      {selectedRow ? (
+        <div style={{ opacity: 0.75, fontSize: 12 }}>
+          selected: <code>{selectedRow.outpoint}</code> • value: <code>{formatSats(selectedRow.valueSats)}</code> • kind:{' '}
+          <code>{selectedRow.depositKind || 'rpa'}</code> •{' '}
+          <a href={chipnetTxUrl(selectedRow.txid)} target="_blank" rel="noreferrer">
+            explorer
+          </a>
         </div>
-
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <MostRecentResult
-            title="Deposit output"
-            result={lastDeposit}
-            onClear={() => setLastDeposit(null)}
-            disableClear={disableAll || busy}
-            emptyText="Run Deposit into pool to see the most recent CLI output here."
-          />
-        </div>
-
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <MostRecentResult
-            title="Staged deposits fetch output"
-            result={lastList}
-            onClear={() => setLastList(null)}
-            disableClear={disableAll || busy}
-            emptyText="Click Refresh to fetch staged deposits (pool deposits --json)."
-          />
-        </div>
-      </div>
+      ) : null}
     </div>
   );
 }

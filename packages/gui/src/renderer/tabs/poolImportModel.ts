@@ -1,15 +1,4 @@
 // packages/gui/src/renderer/tabs/poolImportModel.ts
-import type { RunResult } from '../hooks/useBchctl';
-
-export type LastRun = {
-  ts: number;
-  argv: string[];
-  code: number;
-  stdout: string;
-  stderr: string;
-};
-
-export type ChainCheck = { ok: boolean | null };
 
 export type DepositRow = {
   txid: string;
@@ -25,100 +14,34 @@ export type DepositRow = {
   chainOk?: boolean | null;
 };
 
+export type RpaUtxoRow = {
+  outpoint: string;
+  valueSats: string;
+  spent: boolean;
+  hash160Hex?: string;
+  kind?: string;
+};
+
 type PoolDepositsJson = {
-  meta?: any;
+  meta?: {
+    stateFile?: string;
+    network?: string;
+    total?: number;
+    shown?: number;
+    unimportedOnly?: boolean;
+    chainChecked?: boolean;
+  };
   deposits?: any[];
-  chainChecks?: Record<string, ChainCheck>;
+  chainChecks?: Record<string, { ok: boolean | null }>;
 };
 
-type StageFromJson = {
-  meta?: any;
-  deposit?: any;
+type WalletRpaUtxosJson = {
+  utxos?: any[];
 };
 
-// ------------------------------------------
-// Robust JSON extraction helpers (mixed logs)
-// ------------------------------------------
-
-function extractJsonTail(s: string): string | null {
-  const text = String(s ?? '');
-  if (!text.trim()) return null;
-
-  // Collect candidate starts for JSON (objects or arrays).
-  // Important: stdout may contain bracketed timestamp lines like:
-  //   [2026-...] bchctl ...
-  // and funding logs like:
-  //   [funding] ...
-  // before the final JSON object.
-  const starts: number[] = [];
-  for (let i = 0; i < text.length; i++) {
-    const c = text.charCodeAt(i);
-    if (c === 0x7b /* { */ || c === 0x5b /* [ */) starts.push(i);
-  }
-  if (!starts.length) return null;
-
-  // Try parsing from each candidate start.
-  for (const start of starts) {
-    const tail = text.slice(start).trim();
-    if (!tail) continue;
-
-    // Fast path: try tail as-is
-    try {
-      JSON.parse(tail);
-      return tail;
-    } catch {
-      // Slow path: trim to last closer and try again
-      const endObj = tail.lastIndexOf('}');
-      const endArr = tail.lastIndexOf(']');
-      const end = Math.max(endObj, endArr);
-      if (end < 0) continue;
-
-      const chopped = tail.slice(0, end + 1).trim();
-      try {
-        JSON.parse(chopped);
-        return chopped;
-      } catch {
-        // keep trying next candidate start
-      }
-    }
-  }
-
-  return null;
-}
-
-function tryParseJson<T>(s: string): T | null {
-  // 1) Pure JSON
-  try {
-    return JSON.parse(s) as T;
-  } catch {
-    // 2) Mixed logs + JSON tail
-    const tail = extractJsonTail(s);
-    if (!tail) return null;
-    try {
-      return JSON.parse(tail) as T;
-    } catch {
-      return null;
-    }
-  }
-}
-
-// ------------------------------------------
-
-export function isHex64(s: string): boolean {
-  return /^[0-9a-fA-F]{64}$/.test(s);
-}
-
-export function splitOutpoint(outpoint: string): { txid: string; vout: number } | null {
-  const s = String(outpoint ?? '').trim();
-  const m = s.match(/^([0-9a-f]{64}):(\d+)$/i);
-  if (!m) return null;
-
-  const txid = m[1].toLowerCase();
-  const vout = Number(m[2]);
-
-  if (!Number.isFinite(vout) || vout < 0) return null;
-  return { txid, vout };
-}
+// ------------------------------------------------------
+// Small helpers
+// ------------------------------------------------------
 
 export function chipnetTxUrl(txid: string): string {
   return `https://chipnet.chaingraph.cash/tx/${txid}`;
@@ -132,26 +55,92 @@ export function shortHex(hex: string, chars: number): string {
 
 export function formatSats(satsStr: string): string {
   try {
-    const n = BigInt(String(satsStr ?? '0'));
-    return n.toString();
+    return BigInt(String(satsStr ?? '0')).toString();
   } catch {
     return String(satsStr ?? '0');
   }
 }
 
-export function toLastRun(argv: string[], res: RunResult): LastRun {
-  return {
-    ts: Date.now(),
-    argv,
-    code: res.code,
-    stdout: res.stdout ?? '',
-    stderr: res.stderr ?? '',
-  };
+function isHex64(s: string): boolean {
+  return /^[0-9a-fA-F]{64}$/.test(s);
 }
 
-// ------------------------------------------
-// pool deposits
-// ------------------------------------------
+// ------------------------------------------------------
+// Robust JSON extraction (mixed logs + JSON tail)
+// ------------------------------------------------------
+
+function extractJsonTail(s: string): string | null {
+  const text = String(s ?? '');
+  if (!text.trim()) return null;
+
+  const starts: number[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c === 0x7b /* { */ || c === 0x5b /* [ */) starts.push(i);
+  }
+  if (!starts.length) return null;
+
+  for (const start of starts) {
+    const tail = text.slice(start).trim();
+    if (!tail) continue;
+
+    try {
+      JSON.parse(tail);
+      return tail;
+    } catch {
+      const endObj = tail.lastIndexOf('}');
+      const endArr = tail.lastIndexOf(']');
+      const end = Math.max(endObj, endArr);
+      if (end < 0) continue;
+
+      const chopped = tail.slice(0, end + 1).trim();
+      try {
+        JSON.parse(chopped);
+        return chopped;
+      } catch {
+        // keep trying
+      }
+    }
+  }
+
+  return null;
+}
+
+function tryParseJson<T>(s: string): T | null {
+  try {
+    return JSON.parse(s) as T;
+  } catch {
+    const tail = extractJsonTail(s);
+    if (!tail) return null;
+    try {
+      return JSON.parse(tail) as T;
+    } catch {
+      return null;
+    }
+  }
+}
+
+// ------------------------------------------------------
+// Argv builders
+// ------------------------------------------------------
+
+export function buildScanInboundArgv(args: {
+  includeMempool: boolean;
+  updateState: boolean;
+  windowBlocks?: number;
+}): string[] {
+  const argv: string[] = ['scan'];
+  if (typeof args.windowBlocks === 'number' && Number.isFinite(args.windowBlocks) && args.windowBlocks > 0) {
+    argv.push('--window', String(Math.floor(args.windowBlocks)));
+  }
+  if (args.includeMempool) argv.push('--include-mempool');
+  if (args.updateState) argv.push('--update-state');
+  return argv;
+}
+
+export function buildWalletRpaUtxosArgv(): string[] {
+  return ['wallet', 'rpa-utxos', '--json'];
+}
 
 export function buildPoolDepositsArgv(args: { unimportedOnly: boolean; checkChain: boolean }): string[] {
   const argv = ['pool', 'deposits', '--json'];
@@ -160,20 +149,52 @@ export function buildPoolDepositsArgv(args: { unimportedOnly: boolean; checkChai
   return argv;
 }
 
+export function buildPoolStageFromArgv(args: { outpoint: string }): string[] {
+  return ['pool', 'stage-from', String(args.outpoint), '--json'];
+}
+
+export function buildPoolImportArgv(args: { outpoint: string }): string[] {
+  return ['pool', 'import', String(args.outpoint)];
+}
+
+// ------------------------------------------------------
+// Parsers
+// ------------------------------------------------------
+
+export function parseWalletRpaUtxos(stdout: string): { utxos: RpaUtxoRow[] } {
+  const json = tryParseJson<WalletRpaUtxosJson>(stdout ?? '');
+  const utxosAny = Array.isArray(json?.utxos) ? json!.utxos! : [];
+
+  const out: RpaUtxoRow[] = [];
+  for (const u of utxosAny) {
+    const outpoint = String(u?.outpoint ?? '').trim().toLowerCase();
+    if (!outpoint || !/^[0-9a-f]{64}:\d+$/i.test(outpoint)) continue;
+
+    out.push({
+      outpoint,
+      valueSats: String(u?.valueSats ?? u?.value ?? '0'),
+      spent: Boolean(u?.isSpent ?? false),
+      hash160Hex: typeof u?.hash160Hex === 'string' ? u.hash160Hex : undefined,
+      kind: typeof u?.kind === 'string' ? u.kind : undefined,
+    });
+  }
+
+  return { utxos: out };
+}
+
 export function parsePoolDeposits(stdout: string): {
   deposits: DepositRow[];
-  chainChecks?: Record<string, ChainCheck>;
+  meta: { stateFile?: string; network?: string; total?: number; shown?: number } | null;
 } {
   const json = tryParseJson<PoolDepositsJson>(stdout ?? '');
   const depositsAny = Array.isArray(json?.deposits) ? json!.deposits! : [];
-  const chainChecks = (json?.chainChecks ?? undefined) as Record<string, ChainCheck> | undefined;
+  const chainChecks = (json?.chainChecks ?? undefined) as Record<string, { ok: boolean | null }> | undefined;
 
   const rows: DepositRow[] = [];
 
   for (const d of depositsAny) {
     const txid = String(d?.txid ?? '').trim().toLowerCase();
     const vout = Number(d?.vout ?? 0);
-
     if (!isHex64(txid) || !Number.isFinite(vout) || vout < 0) continue;
 
     const outpoint = `${txid}:${vout}`;
@@ -197,75 +218,52 @@ export function parsePoolDeposits(stdout: string): {
     });
   }
 
-  // Most-recent first (createdAt if present)
   rows.sort((a, b) => {
     const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
     const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
     return tb - ta;
   });
 
-  return { deposits: rows, chainChecks };
+  const meta = json?.meta
+    ? {
+        stateFile: typeof json.meta.stateFile === 'string' ? json.meta.stateFile : undefined,
+        network: typeof json.meta.network === 'string' ? json.meta.network : undefined,
+        total: typeof json.meta.total === 'number' ? json.meta.total : undefined,
+        shown: typeof json.meta.shown === 'number' ? json.meta.shown : undefined,
+      }
+    : null;
+
+  return { deposits: rows, meta };
 }
 
-// ------------------------------------------
-// pool stage / import argv builders
-// ------------------------------------------
+// ------------------------------------------------------
+// Scan progress parser (from streamed chunks)
+// ------------------------------------------------------
 
-export function buildPoolStageArgv(args: {
-  sats: string;
-  depositMode: 'rpa' | 'base';
-  changeMode: 'auto' | 'transparent' | 'stealth';
-}): string[] {
-  return [
-    'pool',
-    'stage',
-    String(args.sats),
-    '--deposit-mode',
-    args.depositMode,
-    '--change-mode',
-    args.changeMode,
-    '--json',
-  ];
-}
+export type ScanProgressEvent =
+  | { kind: 'progress'; cur: number; total: number }
+  | { kind: 'done' }
+  | { kind: 'found'; found: number };
 
-export function buildPoolImportArgv(args: {
-  outpoint?: string | null;
-  latest?: boolean;
-  shard?: string;
-  fresh?: boolean;
-  allowBase?: boolean;
-  depositWif?: string;
-  depositPrivHex?: string;
-}): string[] {
-  const argv: string[] = ['pool', 'import'];
+export function parseScanProgressChunk(chunk: string): ScanProgressEvent | null {
+  const t = String(chunk ?? '').replace(/\r/g, '');
 
-  if (args.latest) argv.push('--latest');
-  else if (args.outpoint) argv.push(String(args.outpoint));
-  else argv.push('--latest');
+  const pm = t.match(/scan:\s+fetching raw tx\s+(\d+)\s*\/\s*(\d+)/i);
+  if (pm) {
+    const cur = Number(pm[1]);
+    const total = Number(pm[2]);
+    if (Number.isFinite(cur) && Number.isFinite(total) && total > 0) return { kind: 'progress', cur, total };
+  }
 
-  if (args.shard && String(args.shard).trim()) argv.push('--shard', String(args.shard).trim());
-  if (args.fresh) argv.push('--fresh');
+  if (t.toLowerCase().includes('scan: fetching raw tx') && t.toLowerCase().includes('done')) {
+    return { kind: 'done' };
+  }
 
-  if (args.allowBase) argv.push('--allow-base');
-  if (args.depositWif && String(args.depositWif).trim()) argv.push('--deposit-wif', String(args.depositWif).trim());
-  if (args.depositPrivHex && String(args.depositPrivHex).trim())
-    argv.push('--deposit-privhex', String(args.depositPrivHex).trim());
+  const fm = t.match(/found:\s+(\d+)/i);
+  if (fm) {
+    const found = Number(fm[1]);
+    if (Number.isFinite(found) && found >= 0) return { kind: 'found', found };
+  }
 
-  return argv;
-}
-
-// ------------------------------------------
-// Optional: pool stage-from parsing (nice-to-have)
-// ------------------------------------------
-//
-// This is not required for the staged deposits list; it just gives the UI
-// a clean JSON parse for the stage-from response when --json is used.
-//
-export function parsePoolStageFrom(stdout: string): { depositOutpoint?: string } {
-  const json = tryParseJson<StageFromJson>(stdout ?? '');
-  const d = json?.deposit;
-  const txid = String(d?.txid ?? '').trim().toLowerCase();
-  const vout = Number(d?.vout ?? 0);
-  if (!isHex64(txid) || !Number.isFinite(vout) || vout < 0) return {};
-  return { depositOutpoint: `${txid}:${vout}` };
+  return null;
 }
