@@ -168,12 +168,51 @@ function parsePoolShardsJson(stdout: string): {
   return { meta, shards };
 }
 
+function argvToString(argv: string[]): string {
+  return argv.map((a) => (a.includes(' ') ? JSON.stringify(a) : a)).join(' ');
+}
+
+function detectVout0Required(stderr: string): boolean {
+  const s = String(stderr ?? '');
+  return (
+    s.includes('CashTokens category genesis requires spending a UTXO at vout=0') ||
+    s.includes('requires spending a UTXO at vout=0') ||
+    s.includes('requires spending a UTXO at vout=0,')
+  );
+}
+
+function parsePaycodeFromStdout(stdout: string): string | null {
+  const t = String(stdout ?? '');
+  const lines = t
+    .split(/\r?\n/g)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  // Prefer last PM... line
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i];
+    if (l.startsWith('PM') && l.length > 20) return l;
+  }
+
+  // Fallback: any PM... token in text
+  const m = t.match(/\bPM[1-9A-HJ-NP-Za-km-z]{20,}\b/);
+  return m ? m[0] : null;
+}
+
+function toPositiveIntOrNull(x: unknown): number | null {
+  const n = Number(String(x ?? '').trim());
+  if (!Number.isFinite(n)) return null;
+  const i = Math.floor(n);
+  if (i <= 0) return null;
+  return i;
+}
+
 // -----------------------------
 // Per-profile command trail
 // -----------------------------
 function trailKey(profile: string): string {
   const p = String(profile ?? '').trim() || 'default';
-  return `bchstealth.poolInitTrail.v1.${p}`;
+  return `bchstealth.poolInitTrail.v2.${p}`;
 }
 
 function loadTrail(profile: string): TrailItem[] {
@@ -193,10 +232,6 @@ function saveTrail(profile: string, items: TrailItem[]) {
   } catch {
     // ignore
   }
-}
-
-function argvToString(argv: string[]): string {
-  return argv.map((a) => (a.includes(' ') ? JSON.stringify(a) : a)).join(' ');
 }
 
 // -----------------------------
@@ -305,6 +340,11 @@ export function PoolInitTab(props: Props) {
   const [shards, setShards] = useState<ShardRow[]>([]);
   const [selectedShardIndex, setSelectedShardIndex] = useState<number | null>(null);
 
+  // vout=0 bootstrap UI
+  const [needsVout0Fix, setNeedsVout0Fix] = useState(false);
+  const [vout0Amount, setVout0Amount] = useState<string>('900000');
+  const [autoRetryFreshInit, setAutoRetryFreshInit] = useState(true);
+
   // per-profile trail
   const [trail, setTrail] = useState<TrailItem[]>(() => loadTrail(profile));
   useEffect(() => {
@@ -366,6 +406,9 @@ export function PoolInitTab(props: Props) {
     setShardsMeta(null);
     setShards([]);
     setSelectedShardIndex(null);
+    setNeedsVout0Fix(false);
+    setVout0Amount('900000');
+    setAutoRetryFreshInit(true);
 
     void refreshShards().catch(() => {
       // ignore (pool may be uninitialized for this profile)
@@ -376,15 +419,15 @@ export function PoolInitTab(props: Props) {
 
   const canInit = useMemo(() => !disableAll && !busy, [disableAll, busy]);
 
-  const doInit = async () => {
+  const doInit = async (args?: { fresh?: boolean }) => {
     setBusy(true);
     try {
-      const argv = ['pool', 'init'];
+      const argv = args?.fresh ? ['pool', 'init', '--fresh'] : ['pool', 'init'];
       const res = await runStep({
-        label: 'pool:init',
+        label: args?.fresh ? 'pool:init(fresh)' : 'pool:init',
         argv,
         timeoutMs: 180_000,
-        note: 'Create shard UTXOs and initialize pool state',
+        note: args?.fresh ? 'Create new shard UTXOs (fresh)' : 'Create shard UTXOs and initialize pool state',
       });
 
       setLastInit({
@@ -395,10 +438,105 @@ export function PoolInitTab(props: Props) {
         stderr: res.stderr ?? '',
       });
 
+      const wantFix = res.code !== 0 && detectVout0Required(res.stderr ?? '');
+      setNeedsVout0Fix(wantFix);
+
       // Always refresh shards afterward (even if init failed, the logs will explain)
       await refreshShards();
 
       // Refresh gauges once (pool sats etc)
+      await refreshNow();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const runVout0FixFlow = async () => {
+    const amt = toPositiveIntOrNull(vout0Amount);
+    if (!amt) {
+      setLastInit((cur) => {
+        const prev = cur ?? { ts: Date.now(), argv: [], code: 1, stdout: '', stderr: '' };
+        return {
+          ...prev,
+          ts: Date.now(),
+          argv: prev.argv,
+          code: 1,
+          stdout: prev.stdout,
+          stderr: `${prev.stderr}\n[vout0-fix] invalid amount: "${String(vout0Amount)}"\n`,
+        };
+      });
+      return;
+    }
+
+    setBusy(true);
+    try {
+      // 1) paycode
+      const rPay = await runStep({
+        label: 'pool:init:fix:paycode',
+        argv: ['wallet', 'paycode'],
+        timeoutMs: 30_000,
+        note: 'Fetch self paycode (for vout=0 stealth self-send)',
+      });
+
+      const paycode = parsePaycodeFromStdout(rPay.stdout ?? '');
+      if (!paycode) {
+        setLastInit({
+          ts: Date.now(),
+          argv: ['wallet', 'paycode'],
+          code: rPay.code,
+          stdout: rPay.stdout ?? '',
+          stderr: (rPay.stderr ?? '') + '\n[vout0-fix] Could not parse paycode from stdout.\n',
+        });
+        setNeedsVout0Fix(true);
+        return;
+      }
+
+      // 2) self-send (creates vout=0 stealth output in that tx)
+      const rSend = await runStep({
+        label: 'pool:init:fix:self-send',
+        argv: ['send', paycode, String(amt), '--all'],
+        timeoutMs: 180_000,
+        note: `Self-send to paycode to create a fresh vout=0 stealth UTXO (amount=${amt} sats)`,
+      });
+
+      // 3) scan + update-state
+      await runStep({
+        label: 'pool:init:fix:scan',
+        argv: ['scan', '--include-mempool', '--update-state'],
+        timeoutMs: 180_000,
+        note: 'Scan inbound and record stealth UTXOs into state.json',
+      });
+
+      // 4) retry init (fresh recommended)
+      if (autoRetryFreshInit) {
+        const rInit = await runStep({
+          label: 'pool:init:fix:retry-init',
+          argv: ['pool', 'init', '--fresh'],
+          timeoutMs: 180_000,
+          note: 'Retry pool init using a vout=0 stealth funding candidate (fresh)',
+        });
+
+        setLastInit({
+          ts: Date.now(),
+          argv: ['pool', 'init', '--fresh'],
+          code: rInit.code,
+          stdout: rInit.stdout ?? '',
+          stderr: rInit.stderr ?? '',
+        });
+
+        setNeedsVout0Fix(rInit.code !== 0 && detectVout0Required(rInit.stderr ?? ''));
+      } else {
+        // If user disables auto retry, still set lastInit to send output
+        setLastInit({
+          ts: Date.now(),
+          argv: ['send', paycode, String(amt), '--all'],
+          code: rSend.code,
+          stdout: rSend.stdout ?? '',
+          stderr: rSend.stderr ?? '',
+        });
+      }
+
+      await refreshShards();
       await refreshNow();
     } finally {
       setBusy(false);
@@ -419,6 +557,10 @@ export function PoolInitTab(props: Props) {
           {busy ? 'Initializing…' : 'Init pool (8 shards)'}
         </button>
 
+        <button disabled={!canInit} onClick={() => void doInit({ fresh: true })} title="Force a fresh pool init">
+          {busy ? 'Initializing…' : 'Init pool (fresh)'}
+        </button>
+
         <button disabled={disableAll || busy} onClick={() => void refreshShards()}>
           Refresh shards
         </button>
@@ -427,6 +569,66 @@ export function PoolInitTab(props: Props) {
           Tip: In the <b>Log</b> pane, enable <b>this tab</b> to watch only <code>pool:init</code> + <code>pool:shards</code>.
         </div>
       </div>
+
+      {/* vout=0 recovery */}
+      {needsVout0Fix ? (
+        <div style={{ border: '1px solid #402', borderRadius: 10, padding: 12, background: '#120607' }}>
+          <div style={{ fontWeight: 800, marginBottom: 6 }}>
+            Fix required: create a vout=0 stealth funding UTXO
+          </div>
+          <div style={{ fontSize: 13, opacity: 0.9, lineHeight: 1.4 }}>
+            Pool init on Chipnet uses the funding <b>outpoint</b> as the CashTokens category genesis input. That requires
+            spending a UTXO at <code>vout=0</code>. If your newest stealth UTXO is at <code>vout=1</code> (change), init
+            will fail until you create a fresh <code>vout=0</code> stealth output and record it in state.
+          </div>
+
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
+            <label style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <span style={{ opacity: 0.85, fontSize: 12 }}>Self-send amount (sats)</span>
+              <input
+                value={vout0Amount}
+                onChange={(e) => setVout0Amount(e.target.value)}
+                style={{
+                  width: 140,
+                  background: '#0b0b0b',
+                  color: '#eee',
+                  border: '1px solid #333',
+                  borderRadius: 8,
+                  padding: '6px 8px',
+                }}
+                disabled={disableAll || busy}
+                inputMode="numeric"
+              />
+            </label>
+
+            <label style={{ display: 'flex', gap: 8, alignItems: 'center', fontSize: 12, opacity: 0.85 }}>
+              <input
+                type="checkbox"
+                checked={autoRetryFreshInit}
+                onChange={(e) => setAutoRetryFreshInit(e.target.checked)}
+                disabled={disableAll || busy}
+              />
+              Retry <code>pool init --fresh</code> automatically
+            </label>
+
+            <button disabled={disableAll || busy} onClick={() => void runVout0FixFlow()}>
+              {busy ? 'Working…' : 'Create vout=0 + Scan + Retry init'}
+            </button>
+
+            <button disabled={disableAll || busy} onClick={() => setNeedsVout0Fix(false)} title="Hide this panel">
+              Dismiss
+            </button>
+          </div>
+
+          <div style={{ marginTop: 10, fontSize: 12, opacity: 0.85 }}>
+            This runs:
+            <div style={{ marginTop: 6 }}>
+              <code>wallet paycode</code> → <code>send PM… {String(toPositiveIntOrNull(vout0Amount) ?? 900000)} --all</code> →{' '}
+              <code>scan --include-mempool --update-state</code> → <code>pool init --fresh</code>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {/* Pool summary */}
       <div style={{ border: '1px solid #222', borderRadius: 8, padding: 10 }}>

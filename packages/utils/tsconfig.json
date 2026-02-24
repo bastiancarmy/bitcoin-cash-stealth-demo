@@ -6,7 +6,8 @@
     "declaration": true,
     "emitDeclarationOnly": false,
     "allowJs": true,
-    "checkJs": false
+    "checkJs": false,
+    "types": ["node"]
   },
   "include": ["src/**/*"]
 }

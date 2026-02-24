@@ -24,13 +24,6 @@ function cleanHexLenMaybe(x: unknown, bytesLen: number): string | null {
   return h.length === bytesLen * 2 ? h : null;
 }
 
-// 20 bytes => 40 hex chars
-function cleanHex20Maybe(x: unknown): string | null {
-  const h = cleanHexMaybe(x);
-  if (!h) return null;
-  return h.length === 40 ? h : null;
-}
-
 // This is used by init to fetch the redeem script bytecode.
 async function getPoolHashFoldBytecode(poolVersion: any): Promise<Uint8Array> {
   const m: any = await import('@bch-stealth/pool-hash-fold');
@@ -51,7 +44,6 @@ async function getPoolHashFoldBytecode(poolVersion: any): Promise<Uint8Array> {
     return toBytes(r);
   };
 
-  // Preferred → legacy → common alternates
   return (
     (await tryCall('getPoolHashFoldBytecode')) ??
     (await tryCall('getRedeemScriptBytecode')) ??
@@ -68,14 +60,13 @@ async function getPoolHashFoldBytecode(poolVersion: any): Promise<Uint8Array> {
 
 export async function runInit(
   ctx: PoolOpContext,
-  opts: { shards: number; fresh?: boolean }
+  opts: { shards: number; fresh?: boolean; allowBaseFunding?: boolean }
 ): Promise<{ state: PoolState; txid?: string }> {
-  const { shards, fresh = false } = opts;
+  const { shards, fresh = false, allowBaseFunding = false } = opts;
 
   const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
   const st = ensurePoolStateDefaults(st0);
 
-  // covenant signer is always "me" in single-user mode
   const defaultSigner = {
     actorId: 'me',
     pubkeyHash160Hex: bytesToHex(ctx.me.wallet.hash160),
@@ -103,12 +94,15 @@ export async function runInit(
   const SHARD_VALUE = BigInt(ctx.config.SHARD_VALUE);
   const shardsTotal = SHARD_VALUE * BigInt(shardCount);
 
-  // single-user: signer is always me
-  const signer = { wallet: ctx.me.wallet, ownerTag: 'me' as const };
+  const signer = { wallet: ctx.me.wallet, ownerTag: (ctx as any)?.profile ?? 'me' };
+
+  // Privacy default: prefer stealth funding for pool init
+  const preferFunding = allowBaseFunding ? (['base', 'stealth'] as const) : (['stealth', 'base'] as const);
 
   const funding = await selectFundingUtxo({
     mode: 'pool-op',
-    // default prefer is ['base','stealth']
+    prefer: [...preferFunding],
+    requireVout0: true, // ✅ NEW: enforce category-genesis requirement at selection time
     state: st,
     wallet: signer.wallet,
     ownerTag: signer.ownerTag,
@@ -118,31 +112,30 @@ export async function runInit(
     network: ctx.network,
     dustSats: DUST,
   });
-  
+
+  // keep as defense-in-depth
   if (funding.vout !== 0) {
     throw new Error(
       `[init] CashTokens category genesis requires spending a UTXO at vout=0, but selected ${funding.txid}:${funding.vout}.\n` +
-      `Fix: send a fresh self-transfer that creates an unspent vout=0 to your base address, then re-run:\n` +
-      `  bchctl pool init --shards ${shardCount} --fresh\n`
+        `Fix: create an unspent vout=0 (self-transfer), then re-run:\n` +
+        `  bchctl pool init --shards ${shardCount} --fresh\n`
     );
   }
 
-  // ---- poolIdHex (MUST be 20 bytes / 40 hex) --------------------------------
   const statePoolIdHex = cleanHexLenMaybe((st as any)?.poolIdHex, 20);
 
   const fundingTxidHex = cleanHexLenMaybe(funding.txid, 32);
   if (!fundingTxidHex) {
     throw new Error(
       `[init] funding txid is not a 32-byte hex string: ${String(funding.txid)}\n` +
-      `This usually means your Electrum/getUtxos wiring is returning placeholder data.\n` +
-      `Fix electrum connectivity or getUtxos adapter before running init.`
+        `This usually means your Electrum/getUtxos wiring is returning placeholder data.\n` +
+        `Fix electrum connectivity or getUtxos adapter before running init.`
     );
   }
 
-  // Deterministic fallback: poolId = HASH160(fundingTxid)
   const fallbackPoolIdHex = bytesToHex(hash160(hexToBytes(fundingTxidHex)));
-
   const poolIdHex = statePoolIdHex ?? fallbackPoolIdHex;
+
   const cfg: PoolShards.PoolConfig = {
     network: ctx.network,
     poolIdHex,
@@ -183,11 +176,10 @@ export async function runInit(
     commitmentHex: s.commitmentHex,
   }));
 
-  // Preserve existing arrays if we’re re-initializing a partially populated file (unless you want to wipe them).
   const next: PoolState = ensurePoolStateDefaults({
     ...st,
     schemaVersion: 1,
-    covenantSigner: st.covenantSigner, // keep explicit signer
+    covenantSigner: st.covenantSigner,
     network: built.nextPoolState.network,
     poolIdHex: built.nextPoolState.poolIdHex,
     poolVersion: built.nextPoolState.poolVersion,

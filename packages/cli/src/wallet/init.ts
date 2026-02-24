@@ -82,6 +82,109 @@ function printWalletInitSummary(args: {
   if (note) console.log(note);
 }
 
+/**
+ * For brand-new wallets (no address history yet), estimating birthday from address returns 0.
+ * Instead, use the chain tip as a sane default scan start (rewound by safetyMargin).
+ */
+async function estimateBirthdayHeightFromTip(args: {
+  Electrum: any; // namespace import: * as Electrum from '@bch-stealth/electrum'
+  network: string;
+  safetyMargin?: number;
+}): Promise<number> {
+  const { Electrum, network } = args;
+  const safetyMargin = Math.max(0, Math.floor(Number(args.safetyMargin ?? 0)));
+
+  const clamp = (h: number) => Math.max(0, Math.floor(h));
+
+  const parseHeight = (r: any): number | null => {
+    if (r == null) return null;
+    if (typeof r === 'number' && Number.isFinite(r)) return r;
+
+    if (typeof r === 'object') {
+      if (r.height != null) {
+        const h = Number(r.height);
+        return Number.isFinite(h) ? h : null;
+      }
+      if (r.block_height != null) {
+        const h = Number(r.block_height);
+        return Number.isFinite(h) ? h : null;
+      }
+    }
+
+    if (Array.isArray(r) && r.length > 0) return parseHeight(r[0]);
+    return null;
+  };
+
+  let client: any = null;
+  try {
+    client = await Electrum.connectElectrum(network);
+
+    // Prefer Fulcrum method (0 params), fallback to subscribe
+    let tip: any = null;
+    try {
+      tip = await client.request('blockchain.headers.get_tip');
+    } catch {
+      // ignore
+    }
+
+    if (tip == null) {
+      try {
+        tip = await client.request('blockchain.headers.subscribe');
+      } catch {
+        // ignore
+      }
+    }
+
+    const h = parseHeight(tip);
+    if (h == null) return 0;
+
+    return clamp(h - safetyMargin);
+  } catch {
+    return 0;
+  } finally {
+    try {
+      if (client) await client.disconnect();
+    } catch {
+      // ignore
+    }
+  }
+}
+
+async function chooseBirthdayHeight(args: {
+  Electrum: any;
+  network: string;
+  address?: string | null;
+  explicitBirthday?: number | null;
+  existingBirthday?: number | null;
+  safetyMargin?: number;
+}): Promise<number> {
+  const { Electrum, network } = args;
+  const safetyMargin = Math.max(0, Math.floor(Number(args.safetyMargin ?? 0)));
+
+  // 1) CLI flag wins
+  if (typeof args.explicitBirthday === 'number' && Number.isFinite(args.explicitBirthday) && args.explicitBirthday >= 0) {
+    return Math.floor(args.explicitBirthday);
+  }
+
+  // 2) If config already has a nonzero birthday, keep it
+  if (typeof args.existingBirthday === 'number' && Number.isFinite(args.existingBirthday) && args.existingBirthday > 0) {
+    return Math.floor(args.existingBirthday);
+  }
+
+  // 3) Default: chain tip (rewind a little)
+  const tipBased = await estimateBirthdayHeightFromTip({ Electrum, network, safetyMargin });
+  if (tipBased > 0) return tipBased;
+
+  // 4) Fallback: address history (only useful after first funding/usage)
+  const addr = typeof args.address === 'string' ? args.address.trim() : '';
+  if (addr) {
+    const fromAddr = await estimateBirthdayHeightFromAddress({ Electrum, address: addr, network, safetyMargin });
+    if (fromAddr > 0) return fromAddr;
+  }
+
+  return 0;
+}
+
 export function registerWalletInit(
   wallet: Command,
   deps: { getActivePaths: GetActivePaths; Electrum: typeof ElectrumNS }
@@ -92,7 +195,7 @@ export function registerWalletInit(
     .command('init')
     .description('Create wallet material for the active profile (stored in .bch-stealth/config.json).')
     .option('--mnemonic <m>', 'provide a mnemonic (otherwise generate one)')
-    .option('--birthday-height <h>', 'wallet birthday height for scanning (omit to auto-estimate if possible)')
+    .option('--birthday-height <h>', 'wallet birthday height for scanning (omit to auto-estimate)')
     .option('--chipnet', 'set wallet network to chipnet', false)
     .option('--mainnet', 'set wallet network to mainnet', false)
     .option('--force', 'overwrite existing wallet in config', false)
@@ -153,30 +256,19 @@ export function registerWalletInit(
         const hasBirthdayInConfig =
           typeof prof0?.birthdayHeight === 'number' && Number.isFinite(prof0.birthdayHeight);
 
-        let finalBirthday: number;
+        const me0 = getWalletFromConfig({ configFile, profile });
+        const addr = me0?.address ?? null;
 
-        if (birthdayFlagProvided) {
-          finalBirthday = birthdayHeight;
-        } else if (!hasBirthdayInConfig || prof0.birthdayHeight === 0) {
-          try {
-            const me0 = getWalletFromConfig({ configFile, profile });
-            const addr = me0?.address;
-            finalBirthday = addr
-              ? await estimateBirthdayHeightFromAddress({
-                  Electrum,
-                  address: addr,
-                  network,
-                  safetyMargin: 12,
-                })
-              : 0;
-          } catch {
-            finalBirthday = 0;
-          }
-        } else {
-          finalBirthday = prof0.birthdayHeight as number;
-        }
+        const finalBirthday = await chooseBirthdayHeight({
+          Electrum,
+          network,
+          address: addr,
+          explicitBirthday: birthdayFlagProvided ? birthdayHeight : null,
+          existingBirthday: hasBirthdayInConfig ? (prof0!.birthdayHeight as number) : null,
+          safetyMargin: 12,
+        });
 
-        if (hasBirthdayInConfig && prof0.birthdayHeight === finalBirthday) {
+        if (hasBirthdayInConfig && prof0!.birthdayHeight === finalBirthday) {
           const me = getWalletFromConfig({ configFile, profile });
           if (!me) throw new Error(`[wallets] failed to load wallet from config (profile=${profile})`);
 
@@ -264,28 +356,18 @@ export function registerWalletInit(
           (typeof (existingWallet as any).spendPrivHex === 'string' && String((existingWallet as any).spendPrivHex).trim()) ||
           deriveTaggedPrivHex('spend', privHex);
 
-        let finalBirthday: number;
+        const me0 = getWalletFromConfig({ configFile, profile });
+        const addr = me0?.address ?? null;
 
-        if (birthdayFlagProvided) {
-          finalBirthday = birthdayHeight;
-        } else if (typeof prof0?.birthdayHeight === 'number' && Number.isFinite(prof0.birthdayHeight)) {
-          finalBirthday = prof0.birthdayHeight;
-        } else {
-          try {
-            const me0 = getWalletFromConfig({ configFile, profile });
-            const addr = me0?.address;
-            finalBirthday = addr
-              ? await estimateBirthdayHeightFromAddress({
-                  Electrum,
-                  address: addr,
-                  network,
-                  safetyMargin: 12,
-                })
-              : 0;
-          } catch {
-            finalBirthday = 0;
-          }
-        }
+        const finalBirthday = await chooseBirthdayHeight({
+          Electrum,
+          network,
+          address: addr,
+          explicitBirthday: birthdayFlagProvided ? birthdayHeight : null,
+          existingBirthday:
+            typeof prof0?.birthdayHeight === 'number' && Number.isFinite(prof0.birthdayHeight) ? prof0.birthdayHeight : null,
+          safetyMargin: 12,
+        });
 
         const cfg1 = upsertProfile(cfg0, profile, {
           network,
@@ -338,15 +420,27 @@ export function registerWalletInit(
       const mnemonicRaw = typeof opts.mnemonic === 'string' ? String(opts.mnemonic).trim() : '';
       const mnemonic = mnemonicRaw || generateMnemonicV1(12);
 
+      // For a brand-new wallet there is no address history yet, so address-based birthday
+      // estimation isn’t useful. Default to tip-based (rewound by safetyMargin) unless
+      // the user explicitly provides --birthday-height.
+      const finalBirthday = await chooseBirthdayHeight({
+        Electrum,
+        network,
+        address: null,
+        explicitBirthday: birthdayFlagProvided ? birthdayHeight : null,
+        existingBirthday: null,
+        safetyMargin: 12,
+      });
+
       const walletJson = walletJsonFromMnemonic({
         mnemonic,
         network,
-        birthdayHeight: birthdayFlagProvided ? birthdayHeight : 0,
+        birthdayHeight: finalBirthday,
       });
 
       const cfg1 = upsertProfile(cfg0, profile, {
         network,
-        birthdayHeight: birthdayFlagProvided ? birthdayHeight : 0,
+        birthdayHeight: finalBirthday,
         wallet: {
           kind: 'mnemonic',
           mnemonic,
@@ -375,7 +469,7 @@ export function registerWalletInit(
         stateFile,
         logFile,
         network,
-        birthdayHeight: birthdayFlagProvided ? birthdayHeight : 0,
+        birthdayHeight: finalBirthday,
         address: me.address,
         paycode,
         all,

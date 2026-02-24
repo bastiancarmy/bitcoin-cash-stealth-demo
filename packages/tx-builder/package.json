@@ -21,7 +21,9 @@
   },
   "dependencies": {
     "@bch-stealth/crypto": "workspace:^",
-    "@bch-stealth/utils": "workspace:^"
+    "@bch-stealth/utils": "workspace:^",
+    "@noble/curves": "^2.0.1",
+    "@noble/hashes": "^2.0.1"
   },
   "devDependencies": {
     "typescript": "^5.9.3"
