@@ -261,4 +261,4 @@ Approaches:
 ---
 
 ## License
-TBD (choose a license before publishing).
+MIT License
