@@ -9,11 +9,7 @@ node_modules/
 !.yarn/sdks/
 !.yarn/versions/
 
-.pnp.*
-.yarnrc.yml
-
 # lockfiles (pick ONE philosophy)
-yarn.lock
 package-lock.json
 pnpm-lock.yaml
 

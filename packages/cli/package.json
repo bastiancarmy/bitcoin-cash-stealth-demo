@@ -31,6 +31,7 @@
     "@bch-stealth/pool-shards": "workspace:^",
     "@bch-stealth/pool-state": "workspace:^",
     "@bch-stealth/rpa": "workspace:^",
+    "@bch-stealth/rpa-derive": "workspace:^",
     "@bch-stealth/rpa-scan": "workspace:^",
     "@bch-stealth/tx-builder": "workspace:^",
     "@bch-stealth/utils": "workspace:^",

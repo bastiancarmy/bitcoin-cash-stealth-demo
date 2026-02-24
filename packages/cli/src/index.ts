@@ -44,7 +44,10 @@ const { getUtxos } = Electrum as any;
 // -------------------------------------------------------------------------------------
 // Defaults
 // -------------------------------------------------------------------------------------
-const SHARD_VALUE = 2_000n;
+// Pool defaults (Phase 2 usability):
+// - Shards must be large enough to support fee-from-shard withdrawals.
+// - With DEFAULT_FEE=2000, SHARD_VALUE=100_000 allows practical demo withdrawals.
+const SHARD_VALUE = 100_000n;
 const DEFAULT_FEE = 2_000n;
 
 // -------------------------------------------------------------------------------------

@@ -19,19 +19,8 @@ import { normalizeWalletKeys, debugPrintKeyFlags } from '../wallet/normalizeKeys
 // Canonicalization helpers
 // -------------------------------------------------------------------------------------
 
-/**
- * Legacy store keys that may contain stealth utxos arrays.
- *
- * IMPORTANT:
- * - PoolState itself lives under `POOL_STATE_STORE_KEY` (== "pool.state")
- *   which maps to file.data.pool.state in FileBackedPoolStateStore.
- * - These legacy keys therefore refer to file.data.<keyPath>.
- */
 const LEGACY_STEALTH_KEYS = [
-  // written by packages/pool-state/src/legacy.ts
   'stealth.utxos',
-
-  // possible older CLI key(s)
   'stealthUtxos',
 ] as const;
 
@@ -46,14 +35,6 @@ function toOutpointKey(txid: unknown, vout: unknown): string | null {
   return `${txid.toLowerCase()}:${n}`;
 }
 
-/**
- * Merge legacy stealth-utxo arrays (stored under separate store keys)
- * into canonical `pool.state.stealthUtxos`, deduping by txid:vout.
- *
- * - Prefers canonical list if duplicates exist
- * - Normalizes entries via pool-state helper upsertStealthUtxo()
- * - Returns diagnostic counts
- */
 function mergeLegacyStealthUtxosIntoPoolState(args: {
   store: PoolStateStore;
   poolState: PoolState;
@@ -61,10 +42,8 @@ function mergeLegacyStealthUtxosIntoPoolState(args: {
   const { store } = args;
   const st = ensurePoolStateDefaults(args.poolState);
 
-  // ensure canonical list exists
   st.stealthUtxos ??= [];
 
-  // index existing canonical outpoints
   const have = new Set<string>();
   for (const r of st.stealthUtxos) {
     const k = toOutpointKey((r as any)?.txid, (r as any)?.vout);
@@ -83,8 +62,6 @@ function mergeLegacyStealthUtxosIntoPoolState(args: {
     for (const rec of legacy) {
       const k = toOutpointKey(rec?.txid, rec?.vout);
       if (!k) continue;
-
-      // canonical wins
       if (have.has(k)) continue;
 
       try {
@@ -107,10 +84,6 @@ function deleteLegacyStealthKeys(store: PoolStateStore): void {
   for (const key of LEGACY_STEALTH_KEYS) store.delete(key);
 }
 
-/**
- * Create an empty PoolState shell.
- * Keep callable with no args for backwards-compat with older CLI call sites.
- */
 export function emptyPoolState(networkDefault: string = 'chipnet'): PoolState {
   return ensurePoolStateDefaults({
     schemaVersion: 1,
@@ -119,14 +92,6 @@ export function emptyPoolState(networkDefault: string = 'chipnet'): PoolState {
   } as any);
 }
 
-/**
- * Load state via pool-state store helpers; return an empty state if missing.
- *
- * SINGLE SOURCE OF TRUTH:
- * - Reads canonical pool.state (via readPoolState)
- * - Merges legacy stealth keys into st.stealthUtxos IN-MEMORY
- * - Does not flush on load (saveState is responsible for canonical-only writes)
- */
 export async function loadStateOrEmpty(args: {
   store: FileBackedPoolStateStore;
   networkDefault: string;
@@ -136,23 +101,11 @@ export async function loadStateOrEmpty(args: {
   const st0 = await readPoolState({ store, networkDefault });
   const st = ensurePoolStateDefaults(st0 ?? emptyPoolState(networkDefault));
 
-  // store is loaded by readPoolState; we can safely read legacy keys now
-  const { mergedCount } = mergeLegacyStealthUtxosIntoPoolState({ store, poolState: st });
-
-  // keep canonical-only in memory; legacy keys are removed on save
-  if (mergedCount > 0) {
-    // nothing else needed here; saveState will delete legacy keys
-  }
+  mergeLegacyStealthUtxosIntoPoolState({ store, poolState: st });
 
   return ensurePoolStateDefaults(st);
 }
 
-/**
- * Save state canonically:
- * - Writes only POOL_STATE_STORE_KEY (pool.state)
- * - Deletes legacy stealth keys in the store (to prevent split-brain)
- * - Flushes once
- */
 export async function saveState(args: {
   store: FileBackedPoolStateStore;
   state: PoolState;
@@ -162,20 +115,14 @@ export async function saveState(args: {
 
   const st = ensurePoolStateDefaults(state, networkDefault);
 
-  // Ensure store loaded (writePoolState would do this too, but we need to delete legacy keys pre-flush)
   await store.load();
-
-  // Canonical write
   store.set(POOL_STATE_STORE_KEY, ensurePoolStateDefaults(st, networkDefault));
-
-  // Legacy cleanup (single source of truth)
   deleteLegacyStealthKeys(store);
-
   await store.flush();
 }
 
 // -------------------------------------------------------------------------------------
-// Funding selection helper (moved from index.ts)
+// Funding selection helper
 // -------------------------------------------------------------------------------------
 
 function parseP2pkhHash160(scriptPubKey: Uint8Array | string): Uint8Array | null {
@@ -209,27 +156,30 @@ function errToString(e: unknown): string {
   }
 }
 
-/**
- * PATCH: selectFundingUtxo()
- * - Stealth: skip locally-marked spent records BEFORE chain calls.
- * - Base: iterate candidates largest-first; validate prevout and isP2pkhOutpointUnspent to avoid stale UTXO lists.
- */
 export async function selectFundingUtxo(args: {
   mode: 'wallet-send' | 'pool-op';
   prefer?: Array<'base' | 'stealth'>;
+
+  // NEW: some operations (pool init) must spend a vout=0 outpoint (CashTokens category genesis)
+  requireVout0?: boolean;
+
   minConfirmations?: number;
   includeUnconfirmed?: boolean;
   markStaleStealthRecords?: boolean;
   allowTokens?: boolean;
+
   state?: PoolState | null;
   wallet: WalletLike;
   ownerTag: string;
+
   minSats?: bigint;
+
   chainIO: {
     isP2pkhOutpointUnspent: (o: { txid: string; vout: number; hash160Hex: string }) => Promise<boolean>;
     getPrevOutput: (txid: string, vout: number) => Promise<any>;
     getTipHeight?: () => Promise<number>;
   };
+
   getUtxos: (...a: any[]) => Promise<any[]>;
   network: string;
   dustSats: bigint;
@@ -248,6 +198,7 @@ export async function selectFundingUtxo(args: {
     includeUnconfirmed = true,
     markStaleStealthRecords = false,
     allowTokens = false,
+    requireVout0 = false,
     state,
     wallet,
     ownerTag,
@@ -306,7 +257,6 @@ export async function selectFundingUtxo(args: {
     return confirmationsFrom(utxo, tipHeight) >= minConfirmations;
   }
 
-  // --- local spent markers (forward/backward compatible) ---
   function isLocallySpentStealth(r: any): boolean {
     return Boolean(
       r?.spent === true ||
@@ -324,7 +274,7 @@ export async function selectFundingUtxo(args: {
         (r as any).spent = true;
         (r as any).spentAt = new Date().toISOString();
         (r as any).spentByTxid = String(spentByTxid);
-        (r as any).spentInTxid = String(spentByTxid); // backward compat
+        (r as any).spentInTxid = String(spentByTxid);
         return true;
       }
     }
@@ -365,25 +315,38 @@ export async function selectFundingUtxo(args: {
     const stealthRecs = (st?.stealthUtxos ?? [])
       .filter((r) => r && r.owner === ownerTag)
       .filter((r) => !isLocallySpentStealth(r))
+      .filter((r) => (requireVout0 ? Number((r as any)?.vout ?? -1) === 0 : true)) // NEW
       .sort((a, b) =>
         toBigIntSats((b as any).valueSats ?? (b as any).value ?? 0) > toBigIntSats((a as any).valueSats ?? (a as any).value ?? 0)
           ? 1
           : -1
       );
 
-    dlog({ mode, stage: 'stealth', records: stealthRecs.length, minSats: minSats.toString() });
+    dlog({
+      mode,
+      stage: 'stealth',
+      records: stealthRecs.length,
+      minSats: minSats.toString(),
+      requireVout0,
+    });
 
     function rejectStealth(r: StealthUtxoRecord, reason: string, extra?: any) {
       stale.push({ source: 'stealth', txid: r.txid, vout: r.vout, reason });
       dlog({
         mode,
         stage: 'stealth',
-        reject: { outpoint: `${r.txid}:${r.vout}`, reason, valueSats: r.valueSats, hash160Hex: (r as any).hash160Hex },
+        reject: { outpoint: `${r.txid}:${r.vout}`, reason, valueSats: (r as any).valueSats, hash160Hex: (r as any).hash160Hex },
         ...(extra ? { extra } : {}),
       });
     }
 
     for (const r of stealthRecs) {
+      // require vout=0 at selection time (defense in depth)
+      if (requireVout0 && Number(r.vout) !== 0) {
+        rejectStealth(r, 'require-vout0');
+        continue;
+      }
+
       const unspent = await chainIO.isP2pkhOutpointUnspent({
         txid: r.txid,
         vout: r.vout,
@@ -505,6 +468,7 @@ export async function selectFundingUtxo(args: {
       .filter((u) => u && (allowTokens ? true : !u.token_data && !isTokenUtxo(u)))
       .filter((u) => confirmedEnough(u, tipHeight))
       .filter((u) => toValueSats(u) >= minSats)
+      .filter((u) => (requireVout0 ? Number(u?.vout ?? -1) === 0 : true)) // NEW (best-effort for getUtxos shape)
       .sort((a, b) => (toValueSats(b) > toValueSats(a) ? 1 : -1));
 
     dlog({
@@ -516,51 +480,59 @@ export async function selectFundingUtxo(args: {
       minConfirmations,
       includeUnconfirmed,
       allowTokens,
+      requireVout0,
     });
 
     for (const cand of candidates) {
-      const prev = await chainIO.getPrevOutput(cand.txid, cand.vout);
+      // enforce vout=0 even if getUtxos uses different field names
+      const candVout = Number((cand as any)?.vout ?? (cand as any)?.tx_pos ?? -1);
+      if (requireVout0 && candVout !== 0) {
+        stale.push({ source: 'base', txid: cand.txid, vout: candVout, reason: 'require-vout0' });
+        continue;
+      }
+
+      const prev = await chainIO.getPrevOutput(cand.txid, candVout);
 
       if (!allowTokens && isTokenUtxo(prev)) {
-        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'token-utxo-excluded' });
+        stale.push({ source: 'base', txid: cand.txid, vout: candVout, reason: 'token-utxo-excluded' });
         continue;
       }
 
       if (!confirmedEnough(prev, tipHeight)) {
-        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'unconfirmed' });
+        stale.push({ source: 'base', txid: cand.txid, vout: candVout, reason: 'unconfirmed' });
         continue;
       }
 
       const value = toBigIntSats(prev.value);
       if (value < minSats) {
-        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'below-min-sats' });
+        stale.push({ source: 'base', txid: cand.txid, vout: candVout, reason: 'below-min-sats' });
         continue;
       }
 
       const h160 = parseP2pkhHash160(prev.scriptPubKey);
       if (!h160) {
-        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'non-p2pkh' });
+        stale.push({ source: 'base', txid: cand.txid, vout: candVout, reason: 'non-p2pkh' });
         continue;
       }
 
       const unspent = await chainIO.isP2pkhOutpointUnspent({
         txid: cand.txid,
-        vout: cand.vout,
+        vout: candVout,
         hash160Hex: bytesToHex(h160),
       });
 
       if (!unspent) {
-        stale.push({ source: 'base', txid: cand.txid, vout: cand.vout, reason: 'spent' });
+        stale.push({ source: 'base', txid: cand.txid, vout: candVout, reason: 'spent' });
         continue;
       }
 
-      return { txid: cand.txid, vout: cand.vout, prevOut: prev, signPrivBytes: wallet.privBytes, source: 'base' };
+      return { txid: cand.txid, vout: candVout, prevOut: prev, signPrivBytes: wallet.privBytes, source: 'base' };
     }
 
     return null;
   }
 
-  dlog({ mode, prefer, ownerTag, network });
+  dlog({ mode, prefer, ownerTag, network, requireVout0 });
 
   for (const src of prefer) {
     if (src === 'base') {
@@ -576,9 +548,12 @@ export async function selectFundingUtxo(args: {
     console.log(`[funding] stale: ${JSON.stringify(stale, null, 2)}`);
   }
 
+  const hint = requireVout0
+    ? `\nTip: pool init requires a funding outpoint at vout=0. Create a self-send where the intended funding output is vout=0, then re-run.`
+    : '';
+
   throw new Error(
-    `No funding UTXO available for ${ownerTag}. Fund ${wallet.address} on chipnet. (mode=${mode}, prefer=${prefer.join(
-      ','
-    )})`
+    `No funding UTXO available for ${ownerTag}. Fund ${wallet.address} on chipnet. (mode=${mode}, prefer=${prefer.join(',')})` +
+      hint
   );
 }

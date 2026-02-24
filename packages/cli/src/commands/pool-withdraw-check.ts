@@ -21,6 +21,9 @@ import type { Network } from '@bch-stealth/electrum';
 import { connectElectrum } from '@bch-stealth/electrum';
 import { outpointIsUnspentViaVerboseTx } from '../pool/electrum-unspent.js';
 
+import { deriveStealthP2pkhLock } from '../pool/stealth.js';
+import { extractPubKeyFromPaycode } from '../paycodes.js';
+
 function normalizeMode(mode: unknown): string | null {
   if (mode == null) return null;
   const s = String(mode).trim();
@@ -29,20 +32,6 @@ function normalizeMode(mode: unknown): string | null {
 
 function debugHeader(title: string) {
   console.log(`\n==================== ${title} ====================`);
-}
-
-function parseP2pkhHash160(scriptPubKey: Uint8Array): Uint8Array | null {
-  if (
-    scriptPubKey.length === 25 &&
-    scriptPubKey[0] === 0x76 &&
-    scriptPubKey[1] === 0xa9 &&
-    scriptPubKey[2] === 0x14 &&
-    scriptPubKey[23] === 0x88 &&
-    scriptPubKey[24] === 0xac
-  ) {
-    return scriptPubKey.slice(3, 23);
-  }
-  return null;
 }
 
 function getCommitment32FromShardPrevoutScript(scriptPubKey: Uint8Array): Uint8Array {
@@ -61,27 +50,39 @@ function envFeeMode(): 'from-shard' | 'external' {
   return v === 'external' ? 'external' : 'from-shard';
 }
 
+function parseDestToPub33OrH160(dest: string): { paycodePub33?: Uint8Array; p2pkhH160?: Uint8Array } {
+  const s = String(dest ?? '').trim();
+  if (!s) throw new Error('withdraw-check dest is required');
+
+  if (s.startsWith('PM')) return { paycodePub33: extractPubKeyFromPaycode(s) };
+  return { p2pkhH160: decodeCashAddrToHash160(s) };
+}
+
 export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<PoolOpContext>) {
   cmd
     .command('withdraw-check')
     .description(
       'Preflight covenant withdraw: prints shard token prefix + unlock stack. Supports fee-from-shard (default) or external fee input.'
     )
-    .argument('<dest>', 'destination cashaddr (P2PKH)')
+    .argument('<dest>', 'destination: paycode (PM...) or cashaddr (P2PKH)')
     .argument('<amountSats>', 'amount in sats')
     .option('--shard <n>', 'shard index', (v) => Number(v))
-    .option('--broadcast', 'broadcast if preflight passes', false)
+    .option('--broadcast', 'broadcast if preflight passes (default: false)', false)
     .option('--category-mode <mode>', 'override category mode (e.g. reverse, direct)')
     .action(async (dest: string, amountSats: string, opts: any) => {
       const ctx = await getCtx();
       console.log(`[cfg] DUST=${ctx.config.DUST} DEFAULT_FEE=${ctx.config.DEFAULT_FEE}`);
+
+      // Must match scan/update-state which records stealthUtxos.owner = <profile>
       const ownerTag = String((ctx as any)?.profile ?? (ctx as any)?.ownerTag ?? '').trim();
       if (!ownerTag) throw new Error('withdraw-check: missing active profile (ownerTag)');
 
       const st0 = await loadStateOrEmpty({ store: ctx.store, networkDefault: ctx.network });
       const st = ensurePoolStateDefaults(st0);
 
-      if (!st.categoryHex || !st.redeemScriptHex) throw new Error('State missing redeemScriptHex/categoryHex. Run pool init first.');
+      if (!st.categoryHex || !st.redeemScriptHex) {
+        throw new Error('State missing redeemScriptHex/categoryHex. Run pool init first.');
+      }
 
       const shardIndex = typeof opts.shard === 'number' && Number.isFinite(opts.shard) ? opts.shard : 0;
       const shard = st.shards?.[shardIndex];
@@ -156,7 +157,6 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
         if (!/^\d+$/.test(s)) throw new Error(`withdraw-check: invalid amountSats "${amountSats}" (expected integer)`);
         return BigInt(s);
       })();
-      const receiverH160 = decodeCashAddrToHash160(dest);
 
       const feeMode = envFeeMode();
       const useExternalFee = feeMode === 'external';
@@ -169,6 +169,9 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
 
       let selfChange: any | null = null;
 
+      // Anchor used for paycode derivations (matches runWithdraw):
+      // - fee-from-shard: shard outpoint
+      // - external fee: fee outpoint
       let anchorTxidHex = shardPrevout.txid;
       let anchorVout = shardPrevout.vout;
 
@@ -181,7 +184,7 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
           state: st,
           wallet: ctx.me.wallet,
           ownerTag,
-          minSats: feeSats, // ✅ aligned: allow fee-sized UTXOs; dust remainder (if any) can be burned
+          minSats: feeSats, // allow fee-sized UTXOs; dust remainder can be burned
           chainIO: ctx.chainIO,
           getUtxos: ctx.getUtxos,
           network: ctx.network,
@@ -198,9 +201,6 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
         anchorTxidHex = feePrevout.txid;
         anchorVout = feePrevout.vout;
 
-        // We can only/need to derive stealth change if a change output exists.
-        // But we don't know that until builder runs; derive anyway (cheap),
-        // and only record if built.changeVout != null.
         debugHeader('WITHDRAW CHECK: DERIVE SELF-STEALTH CHANGE (EXTERNAL FEE MODE)');
         if (!(ctx.me.paycodePub33 instanceof Uint8Array) || ctx.me.paycodePub33.length !== 33) {
           throw new Error('withdraw-check: ctx.me.paycodePub33 missing/invalid (expected 33 bytes)');
@@ -230,6 +230,51 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
         console.log(`anchor(for paycode derivations, if any)=${anchorTxidHex}:${anchorVout}`);
       }
 
+      // -------- destination parsing (PAYCODE OR CASHADDR) --------
+      const { paycodePub33, p2pkhH160 } = parseDestToPub33OrH160(dest);
+
+      let receiverH160: Uint8Array | null = null;
+      let receiverLockingScript: Uint8Array | undefined;
+      let payContext: any = null;
+
+      if (paycodePub33) {
+        // Match runWithdraw: use anchor outpoint (fee or shard) for derivation.
+        const { intent: payIntent, rpaContext } = deriveStealthP2pkhLock({
+          senderWallet: ctx.me.wallet as any,
+          receiverPaycodePub33: paycodePub33,
+          prevoutTxidHex: anchorTxidHex,
+          prevoutN: anchorVout,
+          index: 0,
+        });
+
+        if (payIntent?.scriptPubKey instanceof Uint8Array) {
+          receiverLockingScript = payIntent.scriptPubKey;
+          receiverH160 = null;
+        } else {
+          receiverH160 = payIntent.childHash160;
+          receiverLockingScript = undefined;
+        }
+
+        payContext = rpaContext;
+      } else if (p2pkhH160) {
+        receiverH160 = p2pkhH160;
+      } else {
+        throw new Error('withdraw-check: unable to parse dest (expected paycode or cashaddr)');
+      }
+
+      debugHeader('WITHDRAW CHECK: DESTINATION');
+      if (paycodePub33) {
+        console.log(`destType=paycode`);
+        console.log(`receiverPaycodePub33Hex=${bytesToHex(paycodePub33)}`);
+        console.log(`anchor=${anchorTxidHex}:${anchorVout}`);
+        if (receiverLockingScript) console.log(`receiverLockingScript[0..24]=${bytesToHex(receiverLockingScript).slice(0, 50)}…`);
+        if (receiverH160) console.log(`receiverHash160Hex=${bytesToHex(receiverH160)}`);
+        if (payContext) console.log(`rpaContext=${JSON.stringify(payContext)}`);
+      } else {
+        console.log(`destType=cashaddr`);
+        console.log(`receiverHash160Hex=${bytesToHex(receiverH160!)}`);
+      }
+
       debugHeader('WITHDRAW CHECK: BUILD TX (NO BROADCAST YET)');
       const built: any = PoolShards.withdrawFromShard({
         pool,
@@ -243,7 +288,7 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
                 signPrivBytes: feeUtxo.signPrivBytes,
                 pubkeyHash160Hex: bytesToHex(ctx.me.wallet.hash160),
               },
-              changeP2pkhHash160Hex: selfChange!.changeHash160Hex, // OK even if change burns/omits
+              changeP2pkhHash160Hex: selfChange!.changeHash160Hex, // ok even if change burns/omits
             }
           : {}),
 
@@ -252,11 +297,12 @@ export function registerPoolWithdrawCheck(cmd: Command, getCtx: () => Promise<Po
           pubkeyHash160Hex: bytesToHex(ctx.me.wallet.hash160),
         },
 
-        receiverP2pkhHash160Hex: bytesToHex(receiverH160),
+        ...(receiverLockingScript ? { receiverLockingScript } : { receiverP2pkhHash160Hex: bytesToHex(receiverH160!) }),
+
         amountSats: payment,
         feeSats,
         categoryMode: forcedMode ?? undefined,
-      });
+      } as any);
 
       console.log(`txBytes=${built.rawTx?.length ?? 0}`);
       console.log(`categoryMode=${forcedMode ?? '<default>'}`);
