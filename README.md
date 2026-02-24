@@ -4,115 +4,90 @@
 > **Focus:** Paycode/RPA-style stealth sends + local sharded state pool (deposit/import/withdraw) + covenant tooling.  
 > **Audience:** Wallet devs and protocol tinkerers who want a working end-to-end demo they can run locally.
 
----
-
 ## What this repo is
 
 This repository is a **monorepo** (Yarn workspaces) containing:
 
 - **CLI (`bchctl`)**: initialize wallets, send via paycode, scan for inbound stealth outputs, stage deposits, import into the sharded pool, and withdraw.
-- **Electron GUI**: a UX wrapper over the CLI to demonstrate Phase 2 flows.
-- **Libraries**: reusable packages for RPA derivation/scanning, Electrum/Fulcrum IO, pool-shard covenant logic, and on-chain script building.
+- **Electron GUI**: a UX wrapper over the CLI to demonstrate the Phase 2 flows.
+- **Libraries**: reusable packages for RPA derivation, scanning, Electrum/Fulcrum IO, pool-shard covenant logic, and on-chain script building.
 
-### What “stealth” means here
+## Why a “local pool” exists in Phase 2
 
-- A **paycode send** creates a **paycode-derived P2PKH output** (“RPA-style stealth output”).
-- The receiver uses **scan** (via Fulcrum’s RPA index) to discover and record those outputs into their local `state.json`.
-- The pool is a **local, wallet-owned sharded state machine**: shards are covenant UTXOs (CashTokens + commitment) controlled by the wallet. Funding the pool from stealth helps avoid linking the owner’s transparent wallet to pool genesis.
+Phase 2 introduces a **wallet-owned sharded pool** (a local state machine enforced by on-chain covenants):
 
----
+- **Ingress policy**: the wallet can insist that inbound value is first received to a **paycode-derived** P2PKH output (stealth), then *optionally* promoted into the pool.
+- **Internal routing**: once value is in the pool, the wallet can move it through a predictable state machine (shards + commitments) without a third-party mixer or custodian.
+- **Stable anchors**: each shard’s **32-byte commitment** becomes a stable anchor for later features (proofs, policies, notes, etc.).
+
+### How it expands in Phase 3
+
+Phase 3 builds on the same shard commitments:
+
+- **Multi-shard withdrawals / consolidation** (spend multiple shards in one tx, or consolidate shards to support larger withdrawals).
+- **Richer state transitions** (more than “deposit/import/withdraw”).
+- **Confidential proofs** (commitments act as anchors for amount/privacy proofs and policy enforcement).
+
+## Why this matters for preserving Bitcoin as cash
+
+“Cash” isn’t just fast settlement — it’s **permissionless and fungible**.
+
+- **Fungibility requires privacy.** If observers can reliably link who paid whom (or build “taint” histories), coins become less interchangeable, businesses start risk-scoring UTXOs, and everyday payments get harder.
+- **Surveillance becomes soft censorship.** Once identities and transaction graphs are easy to follow, it’s trivial to blacklist counterparties, discriminate by geography/industry, or pressure intermediaries to block payments.
+- **Self-custody must stay usable.** The more privacy requires “special services” (mixing servers, custodians, trusted coordinators), the easier it is to regulate, degrade, or capture.
+
+This Phase 2 demo targets wallet-native primitives:
+
+- **Paycodes/RPA-style sends** keep receives **unlinkable** while remaining standard P2PKH outputs.
+- A **local, wallet-owned sharded pool** lets wallets apply policy (what to accept, how to route/change) without asking users to “hand funds to a mixer”.
+- The covenant + commitment model is designed to scale into Phase 3 privacy proofs while keeping the base layer auditable and compatible with everyday payments.
+
+The goal is simple: keep Bitcoin Cash usable as **peer-to-peer electronic cash** — private enough to be fungible, and practical enough to be routine.
 
 ## Repo layout
 
 - `packages/*` contains all workspaces (see per-package READMEs).
-- `.bch-stealth/` is created locally and stores config + per-profile state files:
-  - `.bch-stealth/config.json`
-  - `.bch-stealth/profiles/<profile>/state.json`
-  - `.bch-stealth/profiles/<profile>/events.ndjson`
-
----
+- `.bch-stealth/` is created locally and stores config + per-profile state files.
 
 ## Prerequisites
 
 - Node.js (LTS recommended)
-- Yarn
-- Chipnet Electrum/Fulcrum endpoint (repo defaults are set for Chipnet)
+- Corepack (ships with modern Node)
+- Yarn via Corepack (repo-tested on Yarn 4)
+- A running **Chipnet Fulcrum/Electrum** endpoint (or whatever the repo defaults to)
 - Chipnet test coins (faucet)
 
-> If you see errors about **“No funding UTXO available”**, fund the printed **base P2PKH cashaddr** for that profile.
-
----
+> If you see errors about “No funding UTXO available”, fund the printed **base P2PKH cashaddr** for that profile.
 
 ## Install
 
 ```bash
+corepack enable
 yarn install
 yarn build
 ```
 
----
+## Funding wallets (Chipnet faucet)
 
-## IMPORTANT limitations (current phase)
+Use the Googol TBCH faucet:
 
-### 1) Pool withdraw is currently single-shard only
-**Withdraw currently spends from a single shard input only.**  
-That means:
-
-- If your pool value is spread across shards, you **cannot withdraw an arbitrary amount** unless **one shard** contains enough to cover:
-  - `payment` + (fee if fee-from-shard mode), or
-  - `payment` (if external fee mode), plus shard remainder rules.
-
-**User guidance:**
-- Keep shard values large enough for your intended demo withdrawals.
-- Default demo configuration uses **8 shards × 100,000 sats = 800,000 sats total**.
-- Recommended withdrawal size: **≤ 50,000 sats** (comfortably within a single 100k shard).
-
-**Next phase work:** implement either
-- multi-shard withdrawals (aggregate multiple shard inputs), or
-- a safe “consolidator” transaction that merges shards.
-
-### 2) Pool init requires a vout=0 funding UTXO (CashTokens category genesis rule)
-Pool init **must** spend a UTXO where `vout=0`. If your funding UTXO is at `vout=1` (common for change), init will fail with:
-
-> “CashTokens category genesis requires spending a UTXO at vout=0…”
-
-**Fix:** create a fresh funding UTXO that is unspent at `vout=0` (stealth or base), then retry.
-
-### 3) GUI wallet creation (current status)
-If your GUI build does not expose “Init wallet”, you must create wallets via the CLI first:
-```bash
-yarn bchctl --profile alice wallet init
-yarn bchctl --profile bob wallet init
-```
-
----
-
-## CLI: create/init profiles and wallet
-
-List profiles:
-```bash
-yarn bchctl profiles
-```
-
-Initialize wallets:
-```bash
-yarn bchctl --profile alice wallet init
-yarn bchctl --profile bob wallet init
-```
-
-Show wallet info:
-```bash
-yarn bchctl --profile alice wallet show --json
-yarn bchctl --profile bob wallet show --json
-```
-Fund wallet:
-```bash
-This demo runs on Chipnet, so you’ll need some test BCH (tBCH) to pay fees and bootstrap pool operations.
-- Open the faucet:
 - https://tbch.googol.cash/
-- In the GUI (or CLI), copy the profile’s base P2PKH cashaddr:
+
+Steps:
+
+1. Set **Network** to **chipnet**.
+2. Paste a **Chipnet P2PKH cashaddr** (the address printed by `bchctl addr`).
+3. Solve the captcha and submit.
+
+Get the address to paste:
+
+```bash
+yarn bchctl --profile alice addr
+yarn bchctl --profile bob addr
 ```
-Confirm Funds:
+
+Confirm funds arrived:
+
 ```bash
 yarn bchctl --profile alice wallet utxos --json --include-unconfirmed
 yarn bchctl --profile bob wallet utxos --json --include-unconfirmed
@@ -120,145 +95,230 @@ yarn bchctl --profile bob wallet utxos --json --include-unconfirmed
 
 ---
 
-## CLI: validated end-to-end flow (Alice funds Bob stealth → Bob pool init → Bob withdraw → Alice receives)
+## CLI: create/init profiles and wallets
 
-This is the “known good” demo path on Chipnet with shard defaults:
-- `SHARD_VALUE = 100000 sats`
-- `DEFAULT_FEE = 2000 sats`
-- `shards = 8` (total ≈ 800,000 sats)
+List profiles:
 
-### 1) Alice sends Bob a stealth payment (for pool funding)
 ```bash
-BOB_PAYCODE="$(yarn bchctl --profile bob wallet paycode)"
-yarn bchctl --profile alice send "$BOB_PAYCODE" 900000 --all
+yarn bchctl profiles
 ```
 
-### 2) Bob scans inbound and records stealth UTXOs to state
+Initialize wallets:
+
 ```bash
-yarn bchctl --profile bob scan --include-mempool --update-state
-yarn bchctl --profile bob wallet rpa-utxos --check-chain
+yarn bchctl --profile alice wallet init
+yarn bchctl --profile bob wallet init
 ```
 
-### 3) Bob initializes pool from stealth (fresh pool instance)
+Show wallet addresses:
+
+```bash
+yarn bchctl --profile alice wallet show --json
+yarn bchctl --profile bob wallet show --json
+```
+
+> **GUI note:** today, **wallet creation is CLI-only**. The GUI assumes the profile already has a wallet.
+
+---
+
+## CLI usability (end-to-end, validated on chipnet)
+
+This section demonstrates the **Phase 2 “pool as a policy layer”** flow:
+
+1) Alice funds and sends Bob a **stealth (paycode)** payment  
+2) Bob scans inbound and records it  
+3) Bob **imports to pool** and **withdraws to Alice paycode**  
+4) Alice scans inbound and **imports to her pool**  
+
+### 0) One-time: initialize pools for both profiles
+
+`pool init` creates a *new pool instance* with **8 shards × 100,000 sats** (800k total).  
+It is designed to be funded from a **vout=0** P2PKH outpoint (CashTokens category genesis requirement).
+
+Initialize Bob’s pool:
+
 ```bash
 yarn bchctl --profile bob pool init --fresh
 yarn bchctl --profile bob pool shards
 ```
 
-You should see ~800,000 sats across 8 shards (100,000 each).
+Initialize Alice’s pool:
 
-### 4) Bob withdraws from pool back to Alice paycode
-> **Note:** withdraw is single-shard only. Use a value that comfortably fits within one shard (e.g. 50,000 sats).
+```bash
+yarn bchctl --profile alice pool init --fresh
+yarn bchctl --profile alice pool shards
+```
+
+If init fails with a message like “requires spending a UTXO at vout=0”, create a new self-send (which produces a vout=0 payment output), scan it, and re-run init:
+
+```bash
+ALICE_PAYCODE="$(yarn bchctl --profile alice wallet paycode)"
+yarn bchctl --profile alice send "$ALICE_PAYCODE" 900000 --all
+yarn bchctl --profile alice scan --include-mempool --update-state
+yarn bchctl --profile alice pool init --fresh
+```
+
+### 1) Alice → Bob: stealth send (pool bootstrap payment)
+
+Recommended amount: **900,000 sats**.
+
+```bash
+BOB_PAYCODE="$(yarn bchctl --profile bob wallet paycode)"
+yarn bchctl --profile alice send "$BOB_PAYCODE" 900000 --all
+```
+
+### 2) Bob scans inbound (records stealth UTXOs)
+
+```bash
+yarn bchctl --profile bob scan --include-mempool --update-state
+yarn bchctl --profile bob wallet rpa-utxos --check-chain
+```
+
+### 3) Bob imports the received outpoint into his pool
+
+Promote the discovered outpoint into staged deposits, then import it into a shard:
+
+```bash
+# pick an unspent outpoint from:
+yarn bchctl --profile bob wallet rpa-utxos --check-chain
+
+# stage it (replace <TXID:VOUT>)
+yarn bchctl --profile bob pool stage-from <TXID:VOUT>
+
+# import the latest staged deposit into the pool
+yarn bchctl --profile bob pool import --latest
+yarn bchctl --profile bob pool shards
+```
+
+> If you prefer an explicit outpoint, you can also pass `<txid:vout>` directly to `pool import` (see `pool import --help`).
+
+### 4) Bob withdraws from pool → Alice paycode (stealth)
+
+Optional (recommended for demos): use an external fee input so shard value isn’t reduced by fees:
+
+```bash
+export BCH_STEALTH_WITHDRAW_FEE_MODE=external
+```
+
+Preflight (no broadcast):
 
 ```bash
 ALICE_PAYCODE="$(yarn bchctl --profile alice wallet paycode)"
 yarn bchctl --profile bob pool withdraw-check "$ALICE_PAYCODE" 50000
+```
+
+Broadcast:
+
+```bash
 yarn bchctl --profile bob pool withdraw "$ALICE_PAYCODE" 50000
 ```
 
-### 5) Alice scans inbound to receive the withdrawal stealth output
+### 5) Alice scans inbound and imports the withdrawal into her pool
+
 ```bash
 yarn bchctl --profile alice scan --include-mempool --update-state
 yarn bchctl --profile alice wallet rpa-utxos --check-chain
 ```
+
+Then stage and import the new unspent outpoint:
+
+```bash
+# pick the new unspent outpoint from:
+yarn bchctl --profile alice wallet rpa-utxos --check-chain
+
+yarn bchctl --profile alice pool stage-from <TXID:VOUT>
+yarn bchctl --profile alice pool import --latest
+yarn bchctl --profile alice pool shards
+```
+
+---
+
+## Withdrawal limitations (important)
+
+### Current limitation: **single-shard withdrawals**
+
+Withdrawals currently spend **one shard**. If your value is spread across multiple shards, a single withdrawal may fail even if your pool total is high.
+
+What this means for users:
+
+- To withdraw `X` sats, you need **one shard** with at least `X + fee` (if fee-from-shard) or at least `X` (if using an external fee input).
+- Default shards are **100,000 sats**, so keep withdrawals ≤ ~98,000 sats per shard unless using an external fee mode.
+
+Planned next phase improvements:
+
+- **Multi-shard withdraw** (aggregate multiple shard inputs into one tx)
+- **Shard consolidation** (merge shards so larger withdrawals are possible)
 
 ---
 
 ## GUI: run the Electron app
 
 Dev mode:
+
 ```bash
 yarn workspace @bch-stealth/gui dev
 ```
 
 Build:
+
 ```bash
 yarn workspace @bch-stealth/gui build
 ```
 
----
+## GUI walkthrough (mirrors the CLI flow)
 
-## GUI walkthrough (recommended)
+> The GUI does **not** currently create wallets. Do `wallet init` for each profile using the CLI first.
 
-> If the GUI build you’re using doesn’t have “Init wallet”, do wallet init via CLI first (see above).
+### 0) Prepare
+- Use the CLI to initialize wallets for `alice` and `bob`
+- Fund base addresses using the Chipnet faucet
 
-### 1) Profiles
-- Create/select profiles `alice` and `bob` (top dropdown).
+### 1) RPA Send tab (Alice)
+- Paste Bob paycode
+- Send **900000 sats**
 
-### 2) Fund Alice base address
-- Select `alice`
-- Copy base P2PKH address from Gauges
-- Fund via Chipnet faucet
-- Refresh gauges until UTXO appears
+### 2) RPA Scan tab (Bob)
+- Click **Scan inbound** (writes discovered stealth UTXOs into Bob state)
 
-### 3) Alice → Bob (RPA send)
-- Select `bob`, copy Bob paycode (PM…)
-- Select `alice` → **RPA send**
-  - Paste Bob paycode
-  - Send **900,000 sats**
-  - Confirm tx appears in Log
+### 3) Pool Init tab (Bob)
+- Click **Init pool (fresh)**
 
-### 4) Bob scan inbound
-- Select `bob` → **RPA scan**
-  - Enable **include mempool**
-  - Enable **update state**
-  - Scan inbound
-  - Confirm stealth UTXOs increase
+### 4) Pool Import tab (Bob)
+- Promote the inbound outpoint into deposits (**stage-from**)
+- Import the staged deposit into a shard
 
-### 5) Bob pool init (fresh)
-- Select `bob` → **Pool init**
-  - Click **Init pool (fresh)** (or equivalent)
-  - If you hit the vout=0 error:
-    - Create a fresh vout=0 funding UTXO (self-send), scan, then retry init (or do it via CLI)
+### 5) Pool Withdraw tab (Bob)
+- Withdraw to Alice paycode (default stealth)
 
-### 6) Verify shards
-- Select `bob` → **Pool init**
-  - Refresh shards
-  - Confirm 8 shards and total ~800,000 sats
+### 6) RPA Scan tab (Alice)
+- Scan inbound and confirm receipt
 
-### 7) Withdraw from pool → Alice paycode
-- Select `alice`, copy Alice paycode
-- Select `bob` → **Pool withdraw**
-  - Paste Alice paycode
-  - Withdraw-check 50,000 sats
-  - Withdraw 50,000 sats
-
-### 8) Alice scans inbound to receive
-- Select `alice` → **RPA scan**
-  - include mempool + update state
-  - scan inbound
-  - confirm receipt recorded
+### 7) Pool Import tab (Alice)
+- Promote the received outpoint into deposits (**stage-from**)
+- Import into Alice’s pool
 
 ---
 
 ## Notes: state files
 
-Each profile stores state at:
+Each profile has its own state file at:
+
 ```
 .bch-stealth/profiles/<profile>/state.json
 ```
 
-Key state sections:
-- `stealthUtxos`: discovered/recorded paycode-derived outputs
-- `deposits`: staged deposits
-- `shards`: the pool shard outpoints + commitments
-- `withdrawals`: recorded withdrawals + rpa context
+- `scan --update-state` populates `stealthUtxos` (discovery)
+- `pool stage-from <outpoint>` promotes an already-discovered stealth UTXO into `deposits`
+- `pool deposits` reads staged deposits from state
+- `pool import` spends a staged deposit into a covenant shard
+- `pool shards --json` prints canonical shard pointers + values + commitments
 
----
+## Developer docs
 
-## Next phase roadmap (high priority)
-
-### A) Multi-shard withdraw / consolidation
-Fix the current usability limitation where withdraw requires a single shard to have enough value.
-
-Approaches:
-- **Multi-input withdraw:** select multiple shard inputs, aggregate value, update multiple shard commitments.
-- **Consolidator tx:** spend multiple shards → one shard (or fewer shards), then withdraw from the consolidated shard.
-
-### B) Make pool init smoother in GUI
-- Automatically create/ensure a vout=0 funding UTXO when init fails (guided flow).
-
----
+- **ProofBlob32 ABI (revised):** `proofblob32-abi-revised.md` (in this repo’s release artifacts)
+- **Sharded pool state machine spec:** `sharded-pool-state-machine-spec.md` (release artifacts)
+- **Public release checklist:** `docs/release/public-release-checklist.md`
 
 ## License
-MIT License
+
+See `LICENSE`.
