@@ -1,0 +1,13 @@
+# .github/CODEOWNERS
+* @bastiancarmy
+
+/.github/ @bastiancarmy
+/docs/ @bastiancarmy
+/packages/ @bastiancarmy
+/scripts/ @bastiancarmy
+
+/package.json @bastiancarmy
+/yarn.lock @bastiancarmy
+/.yarn/ @bastiancarmy
+/.yarnrc.yml @bastiancarmy
+/.pnp.cjs @bastiancarmy
